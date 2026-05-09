@@ -1,0 +1,15 @@
+betl: 1
+name: connection-without-dsn
+
+connections:
+  warehouse:
+    type: postgres
+    # dsn intentionally missing — must be a parse error
+
+pipeline:
+  - id: stage_one
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1

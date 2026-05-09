@@ -1,0 +1,771 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://betl.dev/schemas/v0.1/pipeline.schema.json",
+  "title": "betl pipeline (v0.1)",
+  "description": "Schema for a betl pipeline file. Discriminator key is `betl: 1` at the top level. See SPEC.md for the canonical reference.",
+
+  "type": "object",
+  "required": ["betl"],
+  "unevaluatedProperties": false,
+
+  "properties": {
+    "betl": {
+      "const": 1,
+      "description": "Document-kind discriminator. Must be `1` for v0.1 pipelines."
+    },
+
+    "name": {
+      "type": "string",
+      "description": "Human-readable pipeline name. Surfaced by `betl plan` and the run manifest."
+    },
+
+    "description": {
+      "type": "string",
+      "description": "Free-text description of what this pipeline does."
+    },
+
+    "include": {
+      "type": "array",
+      "description": "Other betl files to merge into this one. Paths are resolved relative to this file. See SPEC §5.4.",
+      "items": { "type": "string" }
+    },
+
+    "parameters": {
+      "type": "object",
+      "description": "Typed parameters. Values are supplied by `--param name=value` on the CLI, or fall back to defaults. Reference as `${params.<name>}`. See SPEC §5.2.",
+      "additionalProperties": { "$ref": "#/$defs/parameter" }
+    },
+
+    "connections": {
+      "type": "object",
+      "description": "Named connections to data systems. Reference from steps as `connection: <name>`. See SPEC §5.3.",
+      "additionalProperties": { "$ref": "#/$defs/connection" }
+    },
+
+    "lua_init": {
+      "type": "string",
+      "description": "Lua code executed once per worker before any `lua.map` step runs. Use to register helpers like fx_rate(). See SPEC §6.2."
+    },
+
+    "runtime": { "$ref": "#/$defs/runtime" },
+
+    "pipeline": {
+      "type": "array",
+      "description": "Ordered list of top-level steps (data flows and tasks). Edges between steps are declared via `after:`.",
+      "items": { "$ref": "#/$defs/step" }
+    }
+  },
+
+  "$defs": {
+
+    "parameter": {
+      "type": "object",
+      "description": "A single parameter declaration.",
+      "required": ["type"],
+      "properties": {
+        "type": { "$ref": "#/$defs/parameter_type" },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, the runtime errors out when no value is supplied."
+        },
+        "default": {
+          "description": "Default value. Type must match `type`. Sentinel literals `today` (date) and `now` (timestamp) are recognized."
+        },
+        "doc": { "type": "string" },
+        "enum": {
+          "type": "array",
+          "description": "Optional list of allowed values; mismatch is a validate-time error."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "parameter_type": {
+      "description": "Parameter type. Accepts an Arrow logical type or a friendly alias.",
+      "oneOf": [
+        {
+          "enum": [
+            "bool", "int32", "int64", "uint32", "uint64",
+            "float32", "float64", "string", "bytes",
+            "date", "date32", "date64", "timestamp"
+          ]
+        },
+        {
+          "type": "string",
+          "pattern": "^decimal(128|256)\\([0-9]+,\\s*[0-9]+\\)$",
+          "description": "e.g. `decimal128(12,2)`"
+        },
+        {
+          "type": "string",
+          "pattern": "^timestamp\\[(s|ms|us|ns)(,\\s*[A-Za-z0-9_/+-]+)?\\]$",
+          "description": "e.g. `timestamp[us]`, `timestamp[us, UTC]`"
+        }
+      ]
+    },
+
+    "arrow_type": {
+      "description": "Apache Arrow logical type. Quote in YAML flow mappings if it contains `[`, `<`, `,`, or `>`.",
+      "oneOf": [
+        {
+          "enum": [
+            "bool",
+            "int8", "int16", "int32", "int64",
+            "uint8", "uint16", "uint32", "uint64",
+            "float16", "float32", "float64",
+            "string", "large_string", "bytes", "large_bytes",
+            "date32", "date64"
+          ]
+        },
+        { "type": "string", "pattern": "^decimal(128|256)\\([0-9]+,\\s*[0-9]+\\)$" },
+        { "type": "string", "pattern": "^timestamp\\[(s|ms|us|ns)(,\\s*[A-Za-z0-9_/+-]+)?\\]$" },
+        { "type": "string", "pattern": "^time(32|64)\\[(s|ms|us|ns)\\]$" },
+        { "type": "string", "pattern": "^list<.+>$" },
+        { "type": "string", "pattern": "^fixed_size_list<.+,\\s*[0-9]+>$" },
+        { "type": "string", "pattern": "^struct<.+>$" },
+        { "type": "string", "pattern": "^map<.+,.+>$" },
+        { "type": "string", "pattern": "^dictionary<.+,.+>$" }
+      ]
+    },
+
+    "schema_entry": {
+      "type": "object",
+      "description": "One column in a row schema.",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$" },
+        "type": { "$ref": "#/$defs/arrow_type" },
+        "nullable": { "type": "boolean", "default": true },
+        "doc": { "type": "string" }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "schema": {
+      "type": "array",
+      "description": "Ordered list of column declarations.",
+      "items": { "$ref": "#/$defs/schema_entry" }
+    },
+
+    "connection": {
+      "type": "object",
+      "description": "A connection to an external system. `type` and `dsn` are universal; other keys are provider-specific.",
+      "required": ["type", "dsn"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "examples": ["postgres", "mssql", "mysql", "sqlite", "kafka", "s3", "http"]
+        },
+        "dsn": {
+          "type": "string",
+          "description": "Connection string. MUST be a substitution (`${env.X}`, `${secret.X}`, or a file-path indirection); inline literals are a lint error."
+        }
+      }
+    },
+
+    "runtime": {
+      "type": "object",
+      "description": "Per-pipeline runtime hints. All optional; defaults are picked at run time.",
+      "properties": {
+        "concurrency": {
+          "type": "object",
+          "properties": {
+            "control_workers":   { "$ref": "#/$defs/concurrency_lever" },
+            "dataflow_workers":  { "$ref": "#/$defs/concurrency_lever" },
+            "component_threads": { "$ref": "#/$defs/concurrency_lever" }
+          },
+          "unevaluatedProperties": false
+        },
+        "batch_size": {
+          "oneOf": [
+            { "const": "auto" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "concurrency_lever": {
+      "oneOf": [
+        { "const": "auto" },
+        { "type": "integer", "minimum": 1 }
+      ]
+    },
+
+    "expr": {
+      "description": "An expression. Three forms: shorthand string (lua), `{lang, expr}`, or `{lang: literal, value}`. See SPEC §7.",
+      "oneOf": [
+        { "type": "string", "description": "Lua expression (default engine)" },
+        {
+          "type": "object",
+          "required": ["expr"],
+          "properties": {
+            "lang": { "enum": ["lua", "python"], "default": "lua" },
+            "expr": { "type": "string" }
+          },
+          "unevaluatedProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["lang", "value"],
+          "properties": {
+            "lang":  { "const": "literal" },
+            "value": {}
+          },
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+
+    "step_common": {
+      "type": "object",
+      "description": "Properties shared by every step (data-flow and control-flow). See SPEC §4.5.",
+      "required": ["id", "type"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Unique identifier within the pipeline. Lowercase snake_case."
+        },
+        "type":          { "type": "string" },
+        "after":         { "type": "array", "items": { "type": "string" } },
+        "on_failure": {
+          "enum": ["stop", "continue", "retry"],
+          "default": "stop"
+        },
+        "retries":       { "type": "integer", "minimum": 0 },
+        "retry_backoff": { "type": "string" },
+        "timeout":       { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+        "condition":     { "$ref": "#/$defs/expr" },
+        "description":   { "type": "string" }
+      }
+    },
+
+    "step": {
+      "description": "A pipeline step. The `type` field discriminates between built-in components, tasks, and provider-defined components.",
+      "oneOf": [
+        { "$ref": "#/$defs/step_dataflow" },
+        { "$ref": "#/$defs/step_filter" },
+        { "$ref": "#/$defs/step_map" },
+        { "$ref": "#/$defs/step_lookup" },
+        { "$ref": "#/$defs/step_join" },
+        { "$ref": "#/$defs/step_aggregate" },
+        { "$ref": "#/$defs/step_union" },
+        { "$ref": "#/$defs/step_sort" },
+        { "$ref": "#/$defs/step_sql_execute" },
+        { "$ref": "#/$defs/step_shell" },
+        { "$ref": "#/$defs/step_http" },
+        { "$ref": "#/$defs/step_file_op" },
+        { "$ref": "#/$defs/step_lua_map" },
+        { "$ref": "#/$defs/step_python_transform" },
+        { "$ref": "#/$defs/step_csv_read" },
+        { "$ref": "#/$defs/step_csv_write" },
+        { "$ref": "#/$defs/step_query_convention" },
+        { "$ref": "#/$defs/step_upsert_convention" },
+        { "$ref": "#/$defs/step_provider_generic" }
+      ]
+    },
+
+    "step_dataflow": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["steps"],
+      "properties": {
+        "type":  { "const": "dataflow" },
+        "steps": {
+          "type": "array",
+          "description": "Inner data-flow steps wired together by `from:` edges.",
+          "items": { "$ref": "#/$defs/step" }
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_filter": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from", "where"],
+      "properties": {
+        "type":  { "const": "filter" },
+        "from":  { "type": "string" },
+        "where": { "$ref": "#/$defs/expr" }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_map": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from"],
+      "properties": {
+        "type": { "const": "map" },
+        "from": { "type": "string" },
+        "add": {
+          "type": "object",
+          "description": "Additive: keep all input columns, append these. Uses `add:` xor `select:`.",
+          "additionalProperties": { "$ref": "#/$defs/expr" }
+        },
+        "select": {
+          "type": "array",
+          "description": "Replacing: output schema is exactly these columns. Uses `add:` xor `select:`.",
+          "items": { "$ref": "#/$defs/select_column_spec" }
+        }
+      },
+      "oneOf": [
+        { "required": ["add"],    "not": { "required": ["select"] } },
+        { "required": ["select"], "not": { "required": ["add"] } }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "select_column_spec": {
+      "description": "A single column in a `map.select:` projection. Pass-through, rename, or computed.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Pass-through: name of an input column"
+        },
+        {
+          "type": "object",
+          "description": "Rename: take `from` from the input, output as `name`",
+          "required": ["name", "from"],
+          "properties": {
+            "name": { "type": "string" },
+            "from": { "type": "string" }
+          },
+          "unevaluatedProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Computed: evaluate `expr` (default lang: lua)",
+          "required": ["name", "expr"],
+          "properties": {
+            "name": { "type": "string" },
+            "lang": { "enum": ["lua", "python"], "default": "lua" },
+            "expr": { "type": "string" }
+          },
+          "unevaluatedProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Literal: substitute `value` directly",
+          "required": ["name", "value"],
+          "properties": {
+            "name":  { "type": "string" },
+            "lang":  { "const": "literal" },
+            "value": {}
+          },
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+
+    "step_lookup": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from", "connection", "table", "match", "select"],
+      "properties": {
+        "type":       { "const": "lookup" },
+        "from":       { "type": "string" },
+        "connection": { "type": "string" },
+        "table":      { "type": "string" },
+        "match": {
+          "type": "object",
+          "description": "Map of input column → lookup column. Together they form the equality predicate.",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string" }
+        },
+        "select": {
+          "type": "object",
+          "description": "Map of output column → lookup column.",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string" }
+        },
+        "on_miss": {
+          "enum": ["error", "null", "drop"],
+          "default": "error"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_join": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["left", "right", "on"],
+      "properties": {
+        "type":  { "const": "join" },
+        "left":  { "type": "string" },
+        "right": { "type": "string" },
+        "on": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string" }
+        },
+        "kind": {
+          "enum": ["inner", "left", "right", "full"],
+          "default": "inner"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_aggregate": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from", "group_by", "compute"],
+      "properties": {
+        "type":     { "const": "aggregate" },
+        "from":     { "type": "string" },
+        "group_by": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 0
+        },
+        "compute": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/aggregate_compute_spec" }
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "aggregate_compute_spec": {
+      "type": "object",
+      "required": ["agg"],
+      "properties": {
+        "agg": {
+          "enum": ["sum", "count", "count_distinct", "min", "max", "avg", "first", "last"]
+        },
+        "over": {
+          "type": "string",
+          "description": "Input column name. Required for every agg except `count`."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "agg": { "const": "count" } } },
+          "then": true,
+          "else": { "required": ["over"] }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "step_union": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from"],
+      "properties": {
+        "type": { "const": "union" },
+        "from": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 2
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_sort": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from", "by"],
+      "properties": {
+        "type": { "const": "sort" },
+        "from": { "type": "string" },
+        "by": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["col"],
+                "properties": {
+                  "col": { "type": "string" },
+                  "dir": { "enum": ["asc", "desc"], "default": "asc" }
+                },
+                "unevaluatedProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_sql_execute": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["connection"],
+      "properties": {
+        "type":       { "const": "sql.execute" },
+        "connection": { "type": "string" },
+        "sql":        { "type": "string" },
+        "file":       { "type": "string" },
+        "params": {
+          "type": "object",
+          "description": "Map of `:name` placeholder → value. Bound by name; never concatenated.",
+          "additionalProperties": true
+        },
+        "expect": {
+          "type": "object",
+          "description": "Post-condition guard. Each key is a column from the first row of the result; the value is an expectation.",
+          "additionalProperties": { "$ref": "#/$defs/expect_predicate" }
+        },
+        "expect_row": {
+          "enum": ["first", "all"],
+          "default": "first"
+        }
+      },
+      "oneOf": [
+        { "required": ["sql"],  "not": { "required": ["file"] } },
+        { "required": ["file"], "not": { "required": ["sql"] } }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "expect_predicate": {
+      "description": "Either a scalar (= equality) or a constraint object.",
+      "oneOf": [
+        { "type": ["string", "number", "boolean", "null"] },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "properties": {
+            "min":      { "type": "number" },
+            "max":      { "type": "number" },
+            "between": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "not_null": { "type": "boolean" },
+            "one_of":   { "type": "array" }
+          },
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+
+    "step_shell": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["argv"],
+      "properties": {
+        "type": { "const": "shell" },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "stdout": { "enum": ["capture", "discard", "inherit"], "default": "capture" },
+        "stderr": { "enum": ["capture", "discard", "inherit"], "default": "capture" }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_http": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["url"],
+      "properties": {
+        "type":   { "const": "http" },
+        "url":    { "type": "string" },
+        "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "body":      { "type": "string" },
+        "body_json": {},
+        "expect_status": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "array", "items": { "type": "integer" } }
+          ]
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_file_op": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "properties": {
+        "type": { "enum": ["file.copy", "file.move", "file.delete"] },
+        "src":  { "type": "string" },
+        "dst":  { "type": "string" },
+        "path": { "type": "string" }
+      },
+      "oneOf": [
+        {
+          "properties": { "type": { "enum": ["file.copy", "file.move"] } },
+          "required": ["src", "dst"]
+        },
+        {
+          "properties": { "type": { "const": "file.delete" } },
+          "required": ["path"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "step_lua_map": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from", "script"],
+      "properties": {
+        "type":   { "const": "lua.map" },
+        "from":   { "type": "string" },
+        "script": { "type": "string", "description": "Lua function body. `row` is a mutable table; return it (or nil to drop)." }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_python_transform": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from"],
+      "properties": {
+        "type":     { "const": "python.transform" },
+        "from":     { "type": "string" },
+        "module":   { "type": "string" },
+        "function": { "type": "string" },
+        "script":   { "type": "string" }
+      },
+      "oneOf": [
+        { "required": ["module", "function"], "not": { "required": ["script"] } },
+        { "required": ["script"], "not": { "required": ["module"] } }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "step_csv_read": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["path", "schema"],
+      "properties": {
+        "type":      { "const": "csv.read" },
+        "path":      { "type": "string" },
+        "delimiter": { "type": "string", "default": "," },
+        "header":    { "type": "boolean", "default": true },
+        "encoding":  { "type": "string", "default": "utf-8" },
+        "schema":    { "$ref": "#/$defs/schema" }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_csv_write": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "required": ["from", "path"],
+      "properties": {
+        "type":      { "const": "csv.write" },
+        "from":      { "type": "string" },
+        "path":      { "type": "string" },
+        "delimiter": { "type": "string", "default": "," },
+        "header":    { "type": "boolean", "default": true }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_query_convention": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Matches the `*.query` source convention (postgres.query, mssql.query, mysql.query, ...). See SPEC §6.4.",
+      "required": ["connection"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*\\.query$"
+        },
+        "connection": { "type": "string" },
+        "sql":        { "type": "string" },
+        "file":       { "type": "string" },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "schema": { "$ref": "#/$defs/schema" }
+      },
+      "oneOf": [
+        { "required": ["sql"],  "not": { "required": ["file"] } },
+        { "required": ["file"], "not": { "required": ["sql"] } }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "step_upsert_convention": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Matches the `*.upsert` sink convention (postgres.upsert, mssql.upsert, ...). See SPEC §6.4.",
+      "required": ["from", "connection", "table", "key"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*\\.upsert$"
+        },
+        "from":       { "type": "string" },
+        "connection": { "type": "string" },
+        "table":      { "type": "string" },
+        "key": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "on_conflict": {
+          "enum": ["update", "update_if_changed", "ignore", "error"],
+          "default": "update"
+        },
+        "columns": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "batch_size": {
+          "oneOf": [
+            { "const": "auto" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_provider_generic": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Fallback for provider-defined components not described elsewhere in this schema. Validates only the common control-flow keys; the rest is provider-specific.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "not": {
+            "anyOf": [
+              {
+                "enum": [
+                  "dataflow", "filter", "map", "lookup", "join",
+                  "aggregate", "union", "sort",
+                  "sql.execute", "shell", "http",
+                  "file.copy", "file.move", "file.delete",
+                  "lua.map", "python.transform",
+                  "csv.read", "csv.write"
+                ]
+              },
+              { "type": "string", "pattern": "^[a-z][a-z0-9_]*\\.query$" },
+              { "type": "string", "pattern": "^[a-z][a-z0-9_]*\\.upsert$" }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

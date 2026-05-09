@@ -1,0 +1,17 @@
+betl: 1
+name: cli-run-demo
+description: |
+  Tiny self-contained pipeline used by the `cli_run` ctest case.
+  Generates 3 rows and asserts the count matches.
+pipeline:
+  - id: only_stage
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 3
+        column: id
+      - id: sink
+        type: betl.count_rows
+        from: source
+        expect: 3

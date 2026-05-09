@@ -1,0 +1,190 @@
+# =============================================================================
+# Example 02 — Build a sales STAR schema in an OLAP database from a
+# transactional reporting database.
+#
+# Topology:
+#
+#   reporting (MSSQL)               olap (Postgres)
+#   --------------------            -----------------------
+#   dbo.customers      ----.        olap.dim_customer  (sk_customer)
+#   dbo.products       ----+--->    olap.dim_product   (sk_product)
+#   dbo.transactions   ----'   |
+#                              v
+#                              fact_sales (sk_date, sk_customer, sk_product)
+#                                                |
+#                                                v
+#                              olap.mart_*  (refresh_marts.sql)
+#
+# Demonstrates:
+#   - Two connections to two different DB engines.
+#   - Dimension upserts with surrogate keys assigned by the database.
+#   - Control-flow ordering (`after:`) so dimensions land before the fact.
+#   - Surrogate-key resolution via the `lookup` component.
+#   - Aggregation from transactional grain to daily fact grain.
+#   - A trailing sql.execute to refresh dependent marts.
+#
+# Setup (one-time):
+#   sqlcmd -i sql/ddl_source.sql        # in MSSQL: creates dbo.customers etc.
+#   sqlcmd -i sql/seed_source.sql       # optional: deterministic test data
+#   psql -f sql/ddl_target.sql          # in Postgres: creates olap.* + matviews
+#
+# Run:
+#   cp ../.env.example ../.env && edit DSN values
+#   export $(grep -v '^#' ../.env | xargs)
+#   betl run pipeline.betl.yml --param load_date=2026-05-04
+# =============================================================================
+
+betl: 1
+name: build-sales-star
+description: |
+  Refresh dim_customer, dim_product, and one day of fact_sales in the OLAP
+  warehouse. Idempotent — re-running for the same load_date replaces that
+  day's fact rows and re-checks the dimensions.
+
+parameters:
+  load_date:
+    type: date
+    required: true
+    doc: The day of transactions to refresh in fact_sales.
+
+connections:
+  reporting:
+    type: mssql                          # source: SQL Server reporting DB
+    dsn: ${env.REPORTING_DSN}
+  olap:
+    type: postgres                       # target: Postgres OLAP DB
+    dsn: ${env.OLAP_DSN}
+
+pipeline:
+
+  # =========================================================================
+  # Dimensions — load first; fact depends on them.
+  # =========================================================================
+
+  - id: load_dim_customer
+    type: dataflow
+    steps:
+      - id: read_customers
+        type: mssql.query
+        connection: reporting
+        sql: |
+          SELECT
+            customer_id     AS nk_customer,    -- natural key
+            full_name,
+            email,
+            country_code,
+            created_at,
+            updated_at
+          FROM dbo.customers
+
+      - id: write_dim
+        type: postgres.upsert
+        from: read_customers
+        connection: olap
+        table: olap.dim_customer
+        key: [nk_customer]
+        # Surrogate key (sk_customer SERIAL / IDENTITY) is assigned by the
+        # database on first insert and preserved on update. The natural key
+        # column nk_customer is the upsert key.
+        on_conflict: update_if_changed     # only writes when columns differ
+
+  - id: load_dim_product
+    type: dataflow
+    steps:
+      - id: read_products
+        type: mssql.query
+        connection: reporting
+        sql: |
+          SELECT
+            sku             AS nk_product,
+            UPPER(sku)      AS sku,
+            product_name,
+            category,
+            list_price,
+            updated_at
+          FROM dbo.products
+          WHERE is_discontinued = 0
+
+      - id: write_dim
+        type: postgres.upsert
+        from: read_products
+        connection: olap
+        table: olap.dim_product
+        key: [nk_product]
+        on_conflict: update_if_changed
+
+  # =========================================================================
+  # Fact — depends on the dimensions being current.
+  # =========================================================================
+
+  - id: load_fact_sales
+    type: dataflow
+    after: [load_dim_customer, load_dim_product]
+    steps:
+
+      - id: read_transactions
+        type: mssql.query
+        connection: reporting
+        # Pre-compute sk_date here in SQL — saves a per-row Lua call and
+        # keeps the date-key derivation in one place.
+        sql: |
+          SELECT
+            txn_id,
+            customer_id                                              AS nk_customer,
+            sku                                                      AS nk_product,
+            CAST(CONVERT(varchar(8), ordered_at, 112) AS INT)        AS sk_date,
+            quantity,
+            unit_price,
+            CAST(quantity AS DECIMAL(12,2)) * unit_price             AS line_total,
+            ordered_at
+          FROM dbo.transactions
+          WHERE CAST(ordered_at AS DATE) = :load_date
+        params:
+          load_date: ${params.load_date}
+
+      - id: lookup_customer_sk
+        type: lookup
+        from: read_transactions
+        connection: olap
+        table: olap.dim_customer
+        match:    { nk_customer: nk_customer }
+        select:   { sk_customer: sk_customer }
+        on_miss: error                  # error | null | drop
+
+      - id: lookup_product_sk
+        type: lookup
+        from: lookup_customer_sk
+        connection: olap
+        table: olap.dim_product
+        match:    { nk_product: nk_product }
+        select:   { sk_product: sk_product }
+        on_miss: error
+
+      - id: aggregate_to_daily_grain
+        type: aggregate
+        from: lookup_product_sk
+        group_by: [sk_date, sk_customer, sk_product]
+        compute:
+          units_sold:     { agg: sum,   over: quantity   }
+          gross_revenue:  { agg: sum,   over: line_total }
+          line_count:     { agg: count }
+
+      - id: write_fact
+        type: postgres.upsert
+        from: aggregate_to_daily_grain
+        connection: olap
+        table: olap.fact_sales
+        key: [sk_date, sk_customer, sk_product]
+        # `update` (not `update_if_changed`) — same load_date may legitimately
+        # be re-run after a late-arriving correction in `reporting`.
+        on_conflict: update
+
+  # =========================================================================
+  # Refresh dependent marts (materialized views, summary tables).
+  # =========================================================================
+  - id: refresh_marts
+    type: sql.execute
+    connection: olap
+    file: sql/refresh_marts.sql
+    after: [load_fact_sales]
+    on_failure: stop

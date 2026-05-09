@@ -1,0 +1,1361 @@
+#include "runtime/builtins.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "betl/provider.h"
+
+#include "runtime/literal_expr.h"
+#include "runtime/transforms.h"
+
+#ifdef BETL_HAVE_LIBPQ
+#include "runtime/postgres_upsert.h"
+#include "runtime/postgres_lookup.h"
+#endif
+
+/* ============================================================== *
+ *  Tiny JSON value extractor                                       *
+ *                                                                  *
+ *  The configs we need to read are flat objects with int / string  *
+ *  values. The YAML->JSON converter produces compact, well-formed  *
+ *  output, so the lookups can be done with substring + strtoll /   *
+ *  span-to-quote. Doesn't handle nested objects in lookups or      *
+ *  escaped quotes inside string values. Sufficient for v0.1; will  *
+ *  be replaced when we adopt a real JSON parser.                   *
+ * ============================================================== */
+
+static const char *json_value_after(const char *json, const char *key) {
+    if (!json || !key) return NULL;
+    char needle[64];
+    int n = snprintf(needle, sizeof needle, "\"%s\":", key);
+    if (n < 0 || (size_t)n >= sizeof needle) return NULL;
+    const char *p = strstr(json, needle);
+    if (!p) return NULL;
+    p += (size_t)n;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    return p;
+}
+
+static int json_int64(const char *json, const char *key, int64_t *out) {
+    const char *v = json_value_after(json, key);
+    if (!v) return -1;
+    char *end = NULL;
+    long long parsed = strtoll(v, &end, 10);
+    if (end == v) return -1;
+    *out = (int64_t)parsed;
+    return 0;
+}
+
+static int json_string(const char *json, const char *key, char **out) {
+    const char *v = json_value_after(json, key);
+    if (!v || *v != '"') return -1;
+    ++v;
+    const char *end = strchr(v, '"');
+    if (!end) return -1;
+    size_t len = (size_t)(end - v);
+    char *s = malloc(len + 1);
+    if (!s) return -1;
+    memcpy(s, v, len);
+    s[len] = '\0';
+    *out = s;
+    return 0;
+}
+
+/* ============================================================== *
+ *  Arrow release helpers                                           *
+ *                                                                  *
+ *  Each component owns the buffers it allocates for its emitted    *
+ *  arrays and schemas. The Arrow C Data / Stream Interface release *
+ *  callback is the standard way for the consumer to hand them      *
+ *  back. We allocate child structs with calloc and child pointer   *
+ *  arrays with malloc; the release callbacks free both.            *
+ * ============================================================== */
+
+static void release_schema_named(struct ArrowSchema *sch) {
+    /* Leaf schema with a strdup'd `name`; format is a static literal. */
+    free((void *)sch->name);
+    sch->release = NULL;
+}
+
+static void release_schema_struct(struct ArrowSchema *sch) {
+    for (int64_t i = 0; i < sch->n_children; ++i) {
+        if (sch->children[i] && sch->children[i]->release) {
+            sch->children[i]->release(sch->children[i]);
+        }
+        free(sch->children[i]);
+    }
+    free(sch->children);
+    sch->release = NULL;
+}
+
+static void release_array_int64_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static void release_array_utf8_leaf(struct ArrowArray *arr) {
+    /* utf8 leaf has 3 buffers: validity (may be NULL), int32 offsets,
+     * raw byte data. */
+    if (arr->n_buffers >= 3 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+        free((void *)arr->buffers[2]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static void release_array_struct(struct ArrowArray *arr) {
+    for (int64_t i = 0; i < arr->n_children; ++i) {
+        if (arr->children[i] && arr->children[i]->release) {
+            arr->children[i]->release(arr->children[i]);
+        }
+        free(arr->children[i]);
+    }
+    free(arr->children);
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+/* ============================================================== *
+ *  betl.gen_int64 — SOURCE                                         *
+ *                                                                  *
+ *  Config:                                                         *
+ *    row_count  (int, required)   number of rows to emit           *
+ *    column     (string, default "id")    column name              *
+ *    start      (int, default 0)         first emitted value       *
+ *                                                                  *
+ *  Output: struct array, single int64 child, all rows in one batch.*
+ * ============================================================== */
+
+typedef struct {
+    BetlContext *ctx;
+    int64_t      row_count;
+    int64_t      start;
+    char        *column;
+    int          emitted;       /* 0 = not yet, 1 = batch sent */
+    char         err[128];
+} GenState;
+
+static int gen_init(BetlContext *ctx, const char *cfg, void **state) {
+    GenState *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx = ctx;
+
+    if (json_int64(cfg, "row_count", &s->row_count) != 0 || s->row_count < 0) {
+        betl_set_error(ctx, "gen_int64: missing or invalid `row_count`");
+        free(s);
+        return BETL_ERR_INVALID;
+    }
+    int64_t start;
+    s->start = (json_int64(cfg, "start", &start) == 0) ? start : 0;
+
+    char *col = NULL;
+    if (json_string(cfg, "column", &col) == 0 && col) {
+        s->column = col;
+    } else {
+        s->column = strdup("id");
+        if (!s->column) { free(s); return BETL_ERR_INTERNAL; }
+    }
+    *state = s;
+    return BETL_OK;
+}
+
+static void gen_destroy(void *state) {
+    GenState *s = state;
+    if (!s) return;
+    free(s->column);
+    free(s);
+}
+
+/* Stream callbacks. The stream's private_data is the GenState. */
+
+static int gen_stream_get_schema(struct ArrowArrayStream *st,
+                                 struct ArrowSchema *out) {
+    GenState *s = st->private_data;
+    memset(out, 0, sizeof *out);
+
+    struct ArrowSchema *child = calloc(1, sizeof *child);
+    if (!child) return 1;
+
+    char *name = strdup(s->column);
+    if (!name) { free(child); return 1; }
+
+    child->format  = "l";   /* int64 */
+    child->name    = name;
+    child->flags   = ARROW_FLAG_NULLABLE;
+    child->release = release_schema_named;
+
+    struct ArrowSchema **kids = malloc(sizeof *kids);
+    if (!kids) {
+        if (child->release) child->release(child);
+        free(child);
+        return 1;
+    }
+    kids[0] = child;
+
+    out->format     = "+s";
+    out->n_children = 1;
+    out->children   = kids;
+    out->release    = release_schema_struct;
+    return 0;
+}
+
+static int gen_stream_get_next(struct ArrowArrayStream *st,
+                               struct ArrowArray *out) {
+    GenState *s = st->private_data;
+    memset(out, 0, sizeof *out);
+
+    if (s->emitted) {
+        /* Empty array signals end-of-stream: release == NULL. */
+        return 0;
+    }
+
+    int64_t  n   = s->row_count;
+    int64_t *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
+    if (!vals) return 1;
+    for (int64_t i = 0; i < n; ++i) vals[i] = s->start + i;
+
+    /* Inner int64 leaf array. */
+    struct ArrowArray *child = calloc(1, sizeof *child);
+    const void **child_bufs = malloc(2 * sizeof *child_bufs);
+    if (!child || !child_bufs) {
+        free(vals); free(child); free(child_bufs); return 1;
+    }
+    child_bufs[0] = NULL;          /* validity (no nulls) */
+    child_bufs[1] = vals;
+    child->length     = n;
+    child->null_count = 0;
+    child->offset     = 0;
+    child->n_buffers  = 2;
+    child->n_children = 0;
+    child->buffers    = child_bufs;
+    child->children   = NULL;
+    child->dictionary = NULL;
+    child->release    = release_array_int64_leaf;
+
+    /* Outer struct array. */
+    struct ArrowArray **kids = malloc(sizeof *kids);
+    const void **outer_bufs   = malloc(1 * sizeof *outer_bufs);
+    if (!kids || !outer_bufs) {
+        if (child->release) child->release(child);
+        free(child); free(kids); free(outer_bufs); return 1;
+    }
+    kids[0] = child;
+    outer_bufs[0] = NULL;          /* validity */
+
+    out->length     = n;
+    out->null_count = 0;
+    out->offset     = 0;
+    out->n_buffers  = 1;
+    out->n_children = 1;
+    out->buffers    = outer_bufs;
+    out->children   = kids;
+    out->dictionary = NULL;
+    out->release    = release_array_struct;
+    out->private_data = NULL;
+
+    s->emitted = 1;
+    return 0;
+}
+
+static const char *gen_stream_get_last_error(struct ArrowArrayStream *st) {
+    GenState *s = st->private_data;
+    return (s && s->err[0]) ? s->err : NULL;
+}
+
+static void gen_stream_release(struct ArrowArrayStream *st) {
+    /* State is owned by the component, freed in destroy. We just
+     * mark the stream as released. */
+    st->private_data = NULL;
+    st->release      = NULL;
+}
+
+static int gen_attach_output(void *state, int port,
+                             struct ArrowArrayStream *out) {
+    (void)port;
+    GenState *s = state;
+    out->get_schema     = gen_stream_get_schema;
+    out->get_next       = gen_stream_get_next;
+    out->get_last_error = gen_stream_get_last_error;
+    out->release        = gen_stream_release;
+    out->private_data   = s;
+    return BETL_OK;
+}
+
+static const BetlPortDef gen_outputs[] = {
+    { .name = "out", .schema_mode = BETL_SCHEMA_DERIVED, .doc = "int64 rows" },
+};
+
+static const BetlComponentDef gen_components[] = {
+    { .name               = "betl.gen_int64",
+      .kind               = BETL_KIND_SOURCE,
+      .config_schema_json = "{}",
+      .flags              = BETL_FLAG_DETERMINISTIC,
+      .outputs            = gen_outputs,
+      .output_count       = 1,
+      .init               = gen_init,
+      .destroy            = gen_destroy,
+      .attach_output      = gen_attach_output },
+};
+
+static const BetlProvider gen_provider = {
+    .abi_version     = BETL_ABI_VERSION,
+    .name            = "betl-builtins-gen",
+    .version         = "0.1.0",
+    .license         = "Apache-2.0",
+    .components      = gen_components,
+    .component_count = sizeof gen_components / sizeof gen_components[0],
+};
+
+/* ============================================================== *
+ *  betl.gen_strings — SOURCE                                       *
+ *                                                                  *
+ *  Two-column generator for testing utf8 paths end-to-end:          *
+ *    id    int64    (start + i)                                     *
+ *    name  utf8     (prefix .. i,  e.g. "row_0", "row_1", ...)     *
+ *                                                                  *
+ *  Config:                                                          *
+ *    row_count  (int,    required)                                  *
+ *    start      (int,    default 0)                                 *
+ *    prefix     (string, default "row_")                            *
+ *    id_column  (string, default "id")                              *
+ *    name_column(string, default "name")                            *
+ *                                                                  *
+ *  Emits one batch with all rows.                                   *
+ * ============================================================== */
+
+typedef struct {
+    BetlContext *ctx;
+    int64_t      row_count;
+    int64_t      start;
+    char        *prefix;
+    char        *id_col;
+    char        *name_col;
+    int          emitted;
+} GenStrState;
+
+static int gens_init(BetlContext *ctx, const char *cfg, void **state) {
+    GenStrState *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx = ctx;
+
+    if (json_int64(cfg, "row_count", &s->row_count) != 0 || s->row_count < 0) {
+        betl_set_error(ctx, "gen_strings: missing or invalid `row_count`");
+        free(s);
+        return BETL_ERR_INVALID;
+    }
+    int64_t start;
+    s->start = (json_int64(cfg, "start", &start) == 0) ? start : 0;
+
+    char *p = NULL;
+    s->prefix   = (json_string(cfg, "prefix",      &p) == 0 && p) ? p : strdup("row_");
+    p = NULL;
+    s->id_col   = (json_string(cfg, "id_column",   &p) == 0 && p) ? p : strdup("id");
+    p = NULL;
+    s->name_col = (json_string(cfg, "name_column", &p) == 0 && p) ? p : strdup("name");
+
+    if (!s->prefix || !s->id_col || !s->name_col) {
+        free(s->prefix); free(s->id_col); free(s->name_col); free(s);
+        return BETL_ERR_INTERNAL;
+    }
+    *state = s;
+    return BETL_OK;
+}
+
+static void gens_destroy(void *state) {
+    GenStrState *s = state;
+    if (!s) return;
+    free(s->prefix); free(s->id_col); free(s->name_col);
+    free(s);
+}
+
+static int gens_stream_get_schema(struct ArrowArrayStream *st,
+                                  struct ArrowSchema *out) {
+    GenStrState *s = st->private_data;
+    memset(out, 0, sizeof *out);
+
+    struct ArrowSchema **kids = malloc(2 * sizeof *kids);
+    if (!kids) return 1;
+    kids[0] = NULL; kids[1] = NULL;
+
+    /* int64 child */
+    struct ArrowSchema *id = calloc(1, sizeof *id);
+    char *id_name = strdup(s->id_col);
+    if (!id || !id_name) { free(id); free(id_name); free(kids); return 1; }
+    id->format  = "l";
+    id->name    = id_name;
+    id->flags   = ARROW_FLAG_NULLABLE;
+    id->release = release_schema_named;
+    kids[0] = id;
+
+    /* utf8 child */
+    struct ArrowSchema *nm = calloc(1, sizeof *nm);
+    char *nm_name = strdup(s->name_col);
+    if (!nm || !nm_name) {
+        free(nm); free(nm_name);
+        if (kids[0]->release) kids[0]->release(kids[0]);
+        free(kids[0]); free(kids); return 1;
+    }
+    nm->format  = "u";
+    nm->name    = nm_name;
+    nm->flags   = ARROW_FLAG_NULLABLE;
+    nm->release = release_schema_named;
+    kids[1] = nm;
+
+    out->format     = "+s";
+    out->n_children = 2;
+    out->children   = kids;
+    out->release    = release_schema_struct;
+    return 0;
+}
+
+static int gens_stream_get_next(struct ArrowArrayStream *st,
+                                struct ArrowArray *out) {
+    GenStrState *s = st->private_data;
+    memset(out, 0, sizeof *out);
+    if (s->emitted) return 0;
+
+    int64_t  n   = s->row_count;
+    size_t   N   = (size_t)(n > 0 ? n : 0);
+
+    /* int64 column */
+    int64_t *id_vals = malloc((N ? N : 1) * sizeof *id_vals);
+    if (!id_vals) return 1;
+    for (size_t i = 0; i < N; ++i) id_vals[i] = s->start + (int64_t)i;
+
+    /* utf8 column: build offsets + concatenated data buffer. */
+    int32_t *offsets = malloc((N + 1) * sizeof *offsets);
+    if (!offsets) { free(id_vals); return 1; }
+    /* Conservative initial cap: prefix_len * N + 16 * N (digits) + 1. */
+    size_t prefix_len = strlen(s->prefix);
+    size_t cap = prefix_len * (N ? N : 1) + 16 * (N ? N : 1) + 1;
+    char *data = malloc(cap);
+    if (!data) { free(id_vals); free(offsets); return 1; }
+    size_t pos = 0;
+    offsets[0] = 0;
+    for (size_t i = 0; i < N; ++i) {
+        char idx[32];
+        int idl = snprintf(idx, sizeof idx, "%lld", (long long)(s->start + (int64_t)i));
+        if (idl < 0) { free(id_vals); free(offsets); free(data); return 1; }
+        size_t need = pos + prefix_len + (size_t)idl;
+        if (need > cap) {
+            size_t nc = cap * 2;
+            while (nc < need) nc *= 2;
+            char *nd = realloc(data, nc);
+            if (!nd) { free(id_vals); free(offsets); free(data); return 1; }
+            data = nd; cap = nc;
+        }
+        memcpy(data + pos,             s->prefix, prefix_len);
+        memcpy(data + pos + prefix_len, idx,      (size_t)idl);
+        pos += prefix_len + (size_t)idl;
+        offsets[i + 1] = (int32_t)pos;
+    }
+
+    /* Build int64 leaf. */
+    struct ArrowArray *id_arr = calloc(1, sizeof *id_arr);
+    const void **id_bufs = malloc(2 * sizeof *id_bufs);
+    if (!id_arr || !id_bufs) {
+        free(id_arr); free(id_bufs);
+        free(id_vals); free(offsets); free(data); return 1;
+    }
+    id_bufs[0] = NULL;
+    id_bufs[1] = id_vals;
+    id_arr->length     = n;
+    id_arr->null_count = 0;
+    id_arr->n_buffers  = 2;
+    id_arr->buffers    = id_bufs;
+    id_arr->release    = release_array_int64_leaf;
+
+    /* Build utf8 leaf. */
+    struct ArrowArray *nm_arr = calloc(1, sizeof *nm_arr);
+    const void **nm_bufs = malloc(3 * sizeof *nm_bufs);
+    if (!nm_arr || !nm_bufs) {
+        if (id_arr->release) id_arr->release(id_arr);
+        free(id_arr); free(nm_arr); free(nm_bufs);
+        free(offsets); free(data); return 1;
+    }
+    nm_bufs[0] = NULL;       /* validity */
+    nm_bufs[1] = offsets;
+    nm_bufs[2] = data;
+    nm_arr->length     = n;
+    nm_arr->null_count = 0;
+    nm_arr->n_buffers  = 3;
+    nm_arr->buffers    = nm_bufs;
+    nm_arr->release    = release_array_utf8_leaf;
+
+    /* Outer struct array. */
+    struct ArrowArray **kids = malloc(2 * sizeof *kids);
+    const void **outer_bufs   = malloc(1 * sizeof *outer_bufs);
+    if (!kids || !outer_bufs) {
+        if (id_arr->release) id_arr->release(id_arr);
+        if (nm_arr->release) nm_arr->release(nm_arr);
+        free(id_arr); free(nm_arr); free(kids); free(outer_bufs);
+        return 1;
+    }
+    kids[0] = id_arr;
+    kids[1] = nm_arr;
+    outer_bufs[0] = NULL;
+
+    out->length     = n;
+    out->null_count = 0;
+    out->n_buffers  = 1;
+    out->n_children = 2;
+    out->buffers    = outer_bufs;
+    out->children   = kids;
+    out->release    = release_array_struct;
+
+    s->emitted = 1;
+    return 0;
+}
+
+static const char *gens_stream_get_last_error(struct ArrowArrayStream *st) {
+    (void)st; return NULL;
+}
+
+static void gens_stream_release(struct ArrowArrayStream *st) {
+    st->private_data = NULL;
+    st->release      = NULL;
+}
+
+static int gens_attach_output(void *state, int port,
+                              struct ArrowArrayStream *out) {
+    (void)port;
+    out->get_schema     = gens_stream_get_schema;
+    out->get_next       = gens_stream_get_next;
+    out->get_last_error = gens_stream_get_last_error;
+    out->release        = gens_stream_release;
+    out->private_data   = state;
+    return BETL_OK;
+}
+
+static const BetlPortDef gens_outputs[] = {
+    { .name = "out", .schema_mode = BETL_SCHEMA_DERIVED,
+      .doc = "(id int64, name utf8)" },
+};
+
+static const BetlComponentDef gens_components[] = {
+    { .name               = "betl.gen_strings",
+      .kind               = BETL_KIND_SOURCE,
+      .config_schema_json = "{}",
+      .flags              = BETL_FLAG_DETERMINISTIC,
+      .outputs            = gens_outputs,
+      .output_count       = 1,
+      .init               = gens_init,
+      .destroy            = gens_destroy,
+      .attach_output      = gens_attach_output },
+};
+
+static const BetlProvider gens_provider = {
+    .abi_version     = BETL_ABI_VERSION,
+    .name            = "betl-builtins-gen-strings",
+    .version         = "0.1.0",
+    .license         = "Apache-2.0",
+    .components      = gens_components,
+    .component_count = sizeof gens_components / sizeof gens_components[0],
+};
+
+/* ============================================================== *
+ *  betl.count_rows — SINK                                          *
+ *                                                                  *
+ *  Config:                                                         *
+ *    expect (int, optional) — fail if total counted != expect      *
+ *                                                                  *
+ *  Side effect: logs the final total at INFO. The final count is   *
+ *  written into ctx->last_error (via betl_set_error) so a host     *
+ *  with no log-stream access can still observe it.                 *
+ * ============================================================== */
+
+typedef struct {
+    BetlContext           *ctx;
+    int                    have_expect;
+    int64_t                expect;
+    struct ArrowArrayStream input;
+    int                    have_input;
+    int64_t                total_rows;
+} CountState;
+
+static int count_init(BetlContext *ctx, const char *cfg, void **state) {
+    CountState *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx = ctx;
+    int64_t v;
+    if (json_int64(cfg, "expect", &v) == 0) {
+        s->expect      = v;
+        s->have_expect = 1;
+    }
+    *state = s;
+    return BETL_OK;
+}
+
+static int count_attach_input(void *state, int port,
+                              struct ArrowArrayStream *in) {
+    (void)port;
+    CountState *s = state;
+    /* Take ownership: copy the stream struct, then zero the source so
+     * it can't be released twice. */
+    s->input      = *in;
+    s->have_input = 1;
+    memset(in, 0, sizeof *in);
+    return BETL_OK;
+}
+
+static int count_sink_run(void *state) {
+    CountState *s = state;
+    if (!s->have_input) {
+        betl_set_error(s->ctx, "count_rows: sink_run without attached input");
+        return BETL_ERR_INVALID;
+    }
+    /* Pull schema once. We don't validate the shape — any schema is fine.
+     * On failure surface the upstream's get_last_error() if it has one
+     * so callers can see the underlying cause (e.g. an unknown column
+     * in a map step) rather than a generic message. */
+    struct ArrowSchema schema = {0};
+    if (s->input.get_schema && s->input.get_schema(&s->input, &schema) != 0) {
+        const char *e = s->input.get_last_error
+                            ? s->input.get_last_error(&s->input) : NULL;
+        betl_set_error(s->ctx, "count_rows: get_schema failed: %s",
+                       e ? e : "(no detail)");
+        return BETL_ERR_IO;
+    }
+    if (schema.release) schema.release(&schema);
+
+    for (;;) {
+        if (betl_should_cancel(s->ctx)) {
+            betl_set_error(s->ctx, "count_rows: cancelled by host");
+            return BETL_ERR_CANCELLED;
+        }
+        struct ArrowArray arr = {0};
+        if (s->input.get_next(&s->input, &arr) != 0) {
+            betl_set_error(s->ctx, "count_rows: get_next failed: %s",
+                           s->input.get_last_error
+                               ? s->input.get_last_error(&s->input)
+                               : "(no detail)");
+            return BETL_ERR_IO;
+        }
+        if (!arr.release) break;     /* end of stream */
+        s->total_rows += arr.length;
+        arr.release(&arr);
+    }
+
+    betl_log(s->ctx, BETL_LOG_INFO, "count_rows: %lld rows",
+             (long long)s->total_rows);
+    /* Always record the count so the host can introspect it. */
+    betl_set_error(s->ctx, "count_rows: counted %lld rows",
+                   (long long)s->total_rows);
+
+    if (s->have_expect && s->expect != s->total_rows) {
+        betl_set_error(s->ctx,
+            "count_rows: expected %lld rows but counted %lld",
+            (long long)s->expect, (long long)s->total_rows);
+        return BETL_ERR_INTERNAL;
+    }
+    return BETL_OK;
+}
+
+static void count_destroy(void *state) {
+    CountState *s = state;
+    if (!s) return;
+    if (s->have_input && s->input.release) {
+        s->input.release(&s->input);
+    }
+    free(s);
+}
+
+static const BetlPortDef count_inputs[] = {
+    { .name = "in", .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "any rows" },
+};
+
+static const BetlComponentDef count_components[] = {
+    { .name               = "betl.count_rows",
+      .kind               = BETL_KIND_SINK,
+      .config_schema_json = "{}",
+      .flags              = BETL_FLAG_DETERMINISTIC,
+      .inputs             = count_inputs,
+      .input_count        = 1,
+      .init               = count_init,
+      .destroy            = count_destroy,
+      .attach_input       = count_attach_input,
+      .sink_run           = count_sink_run },
+};
+
+static const BetlProvider count_provider = {
+    .abi_version     = BETL_ABI_VERSION,
+    .name            = "betl-builtins-count",
+    .version         = "0.1.0",
+    .license         = "Apache-2.0",
+    .components      = count_components,
+    .component_count = sizeof count_components / sizeof count_components[0],
+};
+
+/* ============================================================== *
+ *  csv.read — SOURCE                                               *
+ *                                                                  *
+ *  v0.1 capabilities:                                              *
+ *    - reads the entire file at init time (no streaming yet)       *
+ *    - emits the data as a single Arrow batch                      *
+ *    - column types: int64 and utf8 (set per column via `schema:`) *
+ *    - if `schema:` is omitted, every column defaults to int64 —   *
+ *      same behavior as the original v0.0.x csv.read               *
+ *    - delimiter: single char, default ','                         *
+ *    - header: bool, default true. When true, the first line       *
+ *      provides column names (schema may override). When false,    *
+ *      a schema is required.                                       *
+ *    - no field quoting yet (RFC 4180 escapes deferred — strings   *
+ *      cannot contain the delimiter or a newline)                  *
+ *                                                                  *
+ *  Config:                                                         *
+ *    path       (string, required)                                 *
+ *    delimiter  (string, optional, default ",")                    *
+ *    header     (bool,   optional, default true)                   *
+ *    schema:                                                       *
+ *      columns:                                                    *
+ *        - { name: id,    type: int64 }                            *
+ *        - { name: name,  type: utf8  }                            *
+ * ============================================================== */
+
+typedef enum {
+    CSV_T_INT64 = 1,
+    CSV_T_UTF8  = 2,
+} CsvType;
+
+/* Per-column staging: one of i64_vals or u8_strs is populated based on
+ * type. row_cap is shared across the whole CsvState. */
+typedef struct {
+    char    *name;
+    CsvType  type;
+    int64_t *i64_vals;     /* [row_cap] */
+    char   **u8_strs;      /* [row_cap] heap strings (NUL-terminated) */
+    size_t  *u8_lens;      /* [row_cap] cached string lengths */
+} CsvCol;
+
+typedef struct {
+    BetlContext *ctx;
+    char        *path;
+    char         delim;
+    int          header;
+    int          emitted;
+
+    CsvCol *cols;
+    size_t  n_cols;
+    size_t  n_rows;
+    size_t  row_cap;
+} CsvState;
+
+static int csv_grow_rows(CsvState *s) {
+    size_t nc = s->row_cap ? s->row_cap * 2 : 64;
+    for (size_t c = 0; c < s->n_cols; ++c) {
+        CsvCol *col = &s->cols[c];
+        if (col->type == CSV_T_INT64) {
+            int64_t *p = realloc(col->i64_vals, nc * sizeof *p);
+            if (!p) return -1;
+            col->i64_vals = p;
+        } else { /* CSV_T_UTF8 */
+            char **sp = realloc(col->u8_strs, nc * sizeof *sp);
+            if (!sp) return -1;
+            col->u8_strs = sp;
+            size_t *lp = realloc(col->u8_lens, nc * sizeof *lp);
+            if (!lp) return -1;
+            col->u8_lens = lp;
+        }
+    }
+    s->row_cap = nc;
+    return 0;
+}
+
+/* Split a raw line into column-name strings; returns count, fills
+ * out[] with strdup'd names. Caller frees on failure. */
+static int csv_split_names(const char *line, char delim, char ***out) {
+    size_t cap = 0, n = 0;
+    char **arr = NULL;
+    const char *p = line;
+    while (1) {
+        const char *start = p;
+        while (*p && *p != delim && *p != '\n' && *p != '\r') ++p;
+        size_t len = (size_t)(p - start);
+        char *name = malloc(len + 1);
+        if (!name) goto oom;
+        memcpy(name, start, len);
+        name[len] = '\0';
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 4;
+            char **np = realloc(arr, nc * sizeof *np);
+            if (!np) { free(name); goto oom; }
+            arr = np;
+            cap = nc;
+        }
+        arr[n++] = name;
+        if (*p == delim) ++p;
+        else break;
+    }
+    *out = arr;
+    return (int)n;
+oom:
+    for (size_t i = 0; i < n; ++i) free(arr[i]);
+    free(arr);
+    *out = NULL;
+    return -1;
+}
+
+/* Parse one CSV line into typed cells, storing into the per-column
+ * staging arrays at row index `row_idx`. Returns 0 on success, -1 on
+ * format error. Mutates `line` (NUL-terminates each field). */
+static int csv_parse_typed_row(CsvState *s, char *line, size_t row_idx) {
+    size_t got = 0;
+    char *p = line;
+    for (;;) {
+        char *start = p;
+        while (*p && *p != s->delim) ++p;
+        char saved = *p;
+        *p = '\0';
+        if (got >= s->n_cols) return -1;
+        CsvCol *col = &s->cols[got];
+        if (col->type == CSV_T_INT64) {
+            char *end = NULL;
+            long long v = strtoll(start, &end, 10);
+            if (end == start || *end != '\0') return -1;
+            col->i64_vals[row_idx] = (int64_t)v;
+        } else { /* CSV_T_UTF8 */
+            size_t len = (size_t)(p - start);
+            char *dup = malloc(len + 1);
+            if (!dup) return -1;
+            memcpy(dup, start, len);
+            dup[len] = '\0';
+            col->u8_strs[row_idx] = dup;
+            col->u8_lens[row_idx] = len;
+        }
+        ++got;
+        if (saved) ++p;
+        else break;
+    }
+    return (got == s->n_cols) ? 0 : -1;
+}
+
+static void csv_state_clear_columns(CsvState *s) {
+    if (s->cols) {
+        for (size_t c = 0; c < s->n_cols; ++c) {
+            CsvCol *col = &s->cols[c];
+            free(col->name);
+            free(col->i64_vals);
+            if (col->u8_strs) {
+                for (size_t r = 0; r < s->n_rows; ++r) free(col->u8_strs[r]);
+                free(col->u8_strs);
+            }
+            free(col->u8_lens);
+        }
+        free(s->cols);
+        s->cols = NULL;
+    }
+    s->n_cols = 0;
+    s->n_rows = 0;
+    s->row_cap = 0;
+}
+
+/* ---- Schema parsing ----------------------------------------------------- */
+
+/* Walk a JSON array element-by-element. Same shape/spirit as the walkers
+ * in transforms.c — duplicated here to keep builtins.c self-contained. */
+typedef int (*csv_item_visit_fn)(const char *value, size_t value_len, void *user);
+
+static int csv_walk_array_at(const char *p, csv_item_visit_fn cb, void *user) {
+    if (!p || *p != '[') return -1;
+    ++p;
+    while (1) {
+        while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') ++p;
+        if (*p == ']' || *p == '\0') return 0;
+        const char *vstart = p;
+        int depth = 0, in_str = 0;
+        while (*p) {
+            if (in_str) {
+                if (*p == '\\' && p[1]) { p += 2; continue; }
+                if (*p == '"') in_str = 0;
+                ++p;
+                continue;
+            }
+            if (*p == '"') { in_str = 1; ++p; continue; }
+            if (*p == '{' || *p == '[') { ++depth; ++p; continue; }
+            if (*p == '}' || *p == ']') {
+                if (depth == 0) break;
+                --depth; ++p; continue;
+            }
+            if (*p == ',' && depth == 0) break;
+            ++p;
+        }
+        size_t vlen = (size_t)(p - vstart);
+        while (vlen > 0 && (vstart[vlen - 1] == ' '
+                         || vstart[vlen - 1] == '\n'
+                         || vstart[vlen - 1] == '\t'
+                         || vstart[vlen - 1] == '\r')) --vlen;
+        if (cb(vstart, vlen, user) != 0) return -1;
+        while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') ++p;
+        if (*p == ',') { ++p; continue; }
+        if (*p == ']' || *p == '\0') return 0;
+        return -1;
+    }
+}
+
+typedef struct {
+    CsvState *s;
+    int       err;
+    char      err_msg[160];
+} CsvSchemaCtx;
+
+static int csv_schema_visit(const char *value, size_t value_len, void *user) {
+    CsvSchemaCtx *c = user;
+    if (value_len == 0 || value[0] != '{') {
+        snprintf(c->err_msg, sizeof c->err_msg,
+                 "schema entry must be {name, type}");
+        c->err = 1; return -1;
+    }
+    char *vbuf = malloc(value_len + 1);
+    if (!vbuf) { c->err = 1; return -1; }
+    memcpy(vbuf, value, value_len);
+    vbuf[value_len] = '\0';
+
+    char *name = NULL, *type = NULL;
+    json_string(vbuf, "name", &name);
+    json_string(vbuf, "type", &type);
+    free(vbuf);
+
+    if (!name || !type) {
+        free(name); free(type);
+        snprintf(c->err_msg, sizeof c->err_msg,
+                 "schema entry needs both 'name' and 'type'");
+        c->err = 1; return -1;
+    }
+    CsvType t;
+    if      (strcmp(type, "int64") == 0) t = CSV_T_INT64;
+    else if (strcmp(type, "utf8")  == 0) t = CSV_T_UTF8;
+    else {
+        snprintf(c->err_msg, sizeof c->err_msg,
+                 "unsupported schema type '%s' (v0.1: int64, utf8)", type);
+        free(name); free(type); c->err = 1; return -1;
+    }
+    free(type);
+
+    CsvState *s = c->s;
+    CsvCol *grow = realloc(s->cols, (s->n_cols + 1) * sizeof *grow);
+    if (!grow) { free(name); c->err = 1; return -1; }
+    s->cols = grow;
+    CsvCol *col = &s->cols[s->n_cols++];
+    memset(col, 0, sizeof *col);
+    col->name = name;
+    col->type = t;
+    return 0;
+}
+
+/* Parse `schema: { columns: [...] }` if present. Returns 0 on success
+ * (which may mean "no schema given" — caller falls back to header-derived
+ * all-int64). Returns -1 on a malformed schema. Sets c->err_msg on error. */
+static int csv_parse_schema(CsvState *s, const char *cfg, CsvSchemaCtx *out) {
+    out->s = s;
+    out->err = 0;
+    out->err_msg[0] = '\0';
+    const char *sch = json_value_after(cfg, "schema");
+    if (!sch || *sch != '{') return 0;     /* no schema specified */
+    /* Find columns inside the schema object. The top-level json_value_after
+     * doesn't enter nested objects, but our schema has columns at the same
+     * top level as far as the strstr-based search is concerned. Caveat:
+     * if some other key happened to be named "columns", we'd find it
+     * instead. v0.1 limitation. */
+    const char *cols = json_value_after(cfg, "columns");
+    if (!cols || *cols != '[') {
+        snprintf(out->err_msg, sizeof out->err_msg,
+                 "schema must contain a `columns:` list");
+        out->err = 1;
+        return -1;
+    }
+    if (csv_walk_array_at(cols, csv_schema_visit, out) != 0 || out->err) {
+        return -1;
+    }
+    if (s->n_cols == 0) {
+        snprintf(out->err_msg, sizeof out->err_msg,
+                 "schema columns: list is empty");
+        out->err = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
+    CsvState *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx    = ctx;
+    s->delim  = ',';
+    s->header = 1;
+
+    if (json_string(cfg, "path", &s->path) != 0 || !s->path) {
+        betl_set_error(ctx, "csv.read: missing required `path`");
+        free(s);
+        return BETL_ERR_INVALID;
+    }
+    char *delim_str = NULL;
+    if (json_string(cfg, "delimiter", &delim_str) == 0 && delim_str) {
+        if (delim_str[0] && delim_str[0] != '"') s->delim = delim_str[0];
+        free(delim_str);
+    }
+    /* `header` is a bool literal in JSON — extract via the same value
+     * scanner. We accept either "true" or "false" as the next 4-5 chars. */
+    {
+        const char *v = json_value_after(cfg, "header");
+        if (v) {
+            if (strncmp(v, "false", 5) == 0) s->header = 0;
+            else if (strncmp(v, "true", 4) == 0) s->header = 1;
+        }
+    }
+
+    /* schema: { columns: [...] } — optional. If present, gives names+types
+     * directly. If absent and header=true, names come from the header line
+     * and every column defaults to int64. If absent and header=false, the
+     * file has no way to tell us its columns and we error out. */
+    CsvSchemaCtx schema_ctx = {0};
+    if (csv_parse_schema(s, cfg, &schema_ctx) != 0) {
+        betl_set_error(ctx, "csv.read: %s", schema_ctx.err_msg);
+        csv_state_clear_columns(s);
+        free(s->path); free(s);
+        return BETL_ERR_INVALID;
+    }
+    int schema_provided = (s->n_cols > 0);
+
+    FILE *fp = fopen(s->path, "r");
+    if (!fp) {
+        betl_set_error(ctx, "csv.read: cannot open %s", s->path);
+        csv_state_clear_columns(s);
+        free(s->path); free(s);
+        return BETL_ERR_IO;
+    }
+
+    char  *line = NULL;
+    size_t cap  = 0;
+    ssize_t rd;
+
+    if (s->header) {
+        rd = getline(&line, &cap, fp);
+        if (rd <= 0) {
+            betl_set_error(ctx, "csv.read: empty file or read error: %s",
+                           s->path);
+            free(line); fclose(fp);
+            csv_state_clear_columns(s);
+            free(s->path); free(s);
+            return BETL_ERR_IO;
+        }
+        while (rd > 0 && (line[rd - 1] == '\n' || line[rd - 1] == '\r')) {
+            line[--rd] = '\0';
+        }
+        if (!schema_provided) {
+            /* No schema → derive names from the header, types default to int64. */
+            char **names = NULL;
+            int n = csv_split_names(line, s->delim, &names);
+            if (n < 0) {
+                betl_set_error(ctx, "csv.read: failed to parse header in %s",
+                               s->path);
+                free(line); fclose(fp);
+                csv_state_clear_columns(s);
+                free(s->path); free(s);
+                return BETL_ERR_IO;
+            }
+            s->n_cols = (size_t)n;
+            s->cols = calloc(s->n_cols, sizeof *s->cols);
+            if (!s->cols) {
+                for (int i = 0; i < n; ++i) free(names[i]);
+                free(names); free(line); fclose(fp);
+                free(s->path); free(s);
+                return BETL_ERR_INTERNAL;
+            }
+            for (size_t i = 0; i < s->n_cols; ++i) {
+                s->cols[i].name = names[i];
+                s->cols[i].type = CSV_T_INT64;
+            }
+            free(names);
+        }
+        /* If schema_provided, the header line is consumed but discarded. */
+    } else if (!schema_provided) {
+        betl_set_error(ctx, "csv.read: when header=false, a `schema:` is required");
+        free(line); fclose(fp);
+        csv_state_clear_columns(s);
+        free(s->path); free(s);
+        return BETL_ERR_INVALID;
+    }
+
+    /* Allocate per-column staging now that we know n_cols and types. */
+    if (csv_grow_rows(s) != 0) {
+        free(line); fclose(fp);
+        csv_state_clear_columns(s);
+        free(s->path); free(s);
+        return BETL_ERR_INTERNAL;
+    }
+
+    while ((rd = getline(&line, &cap, fp)) > 0) {
+        while (rd > 0 && (line[rd - 1] == '\n' || line[rd - 1] == '\r')) {
+            line[--rd] = '\0';
+        }
+        if (rd == 0) continue;        /* skip blank lines */
+
+        if (s->n_rows == s->row_cap) {
+            if (csv_grow_rows(s) != 0) {
+                free(line); fclose(fp);
+                csv_state_clear_columns(s);
+                free(s->path); free(s);
+                return BETL_ERR_INTERNAL;
+            }
+        }
+        if (csv_parse_typed_row(s, line, s->n_rows) != 0) {
+            betl_set_error(ctx,
+                "csv.read: parse error in %s at row %zu (expected %zu cells)",
+                s->path, s->n_rows + 1, s->n_cols);
+            free(line); fclose(fp);
+            csv_state_clear_columns(s);
+            free(s->path); free(s);
+            return BETL_ERR_INVALID;
+        }
+        s->n_rows++;
+    }
+    free(line);
+    fclose(fp);
+
+    *state = s;
+    return BETL_OK;
+}
+
+static void csv_destroy(void *state) {
+    CsvState *s = state;
+    if (!s) return;
+    free(s->path);
+    csv_state_clear_columns(s);
+    free(s);
+}
+
+static const char *csv_format_for(CsvType t) {
+    return (t == CSV_T_INT64) ? "l" : "u";
+}
+
+static int csv_stream_get_schema(struct ArrowArrayStream *st,
+                                 struct ArrowSchema *out) {
+    CsvState *s = st->private_data;
+    memset(out, 0, sizeof *out);
+
+    struct ArrowSchema **kids = malloc(s->n_cols * sizeof *kids);
+    if (!kids) return 1;
+    for (size_t i = 0; i < s->n_cols; ++i) kids[i] = NULL;
+
+    for (size_t i = 0; i < s->n_cols; ++i) {
+        struct ArrowSchema *child = calloc(1, sizeof *child);
+        char *name = strdup(s->cols[i].name);
+        if (!child || !name) {
+            free(child); free(name);
+            for (size_t j = 0; j < i; ++j) {
+                if (kids[j]->release) kids[j]->release(kids[j]);
+                free(kids[j]);
+            }
+            free(kids);
+            return 1;
+        }
+        child->format  = csv_format_for(s->cols[i].type);
+        child->name    = name;
+        child->flags   = ARROW_FLAG_NULLABLE;
+        child->release = release_schema_named;
+        kids[i] = child;
+    }
+
+    out->format     = "+s";
+    out->n_children = (int64_t)s->n_cols;
+    out->children   = kids;
+    out->release    = release_schema_struct;
+    return 0;
+}
+
+/* Build a fresh utf8 leaf from per-row strings + lengths. Allocates
+ * offsets + concatenated data buffer. */
+static int csv_build_utf8_leaf(struct ArrowArray *out,
+                               char **strs, size_t *lens, size_t n) {
+    int32_t *offsets = malloc((n + 1) * sizeof *offsets);
+    if (!offsets) return -1;
+    size_t total = 0;
+    offsets[0] = 0;
+    for (size_t i = 0; i < n; ++i) {
+        total += lens[i];
+        if (total > (size_t)INT32_MAX) { free(offsets); return -1; }
+        offsets[i + 1] = (int32_t)total;
+    }
+    char *data = malloc(total ? total : 1);
+    if (!data) { free(offsets); return -1; }
+    size_t pos = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (lens[i]) memcpy(data + pos, strs[i], lens[i]);
+        pos += lens[i];
+    }
+    const void **bufs = malloc(3 * sizeof *bufs);
+    if (!bufs) { free(offsets); free(data); return -1; }
+    bufs[0] = NULL;
+    bufs[1] = offsets;
+    bufs[2] = data;
+
+    out->length     = (int64_t)n;
+    out->null_count = 0;
+    out->offset     = 0;
+    out->n_buffers  = 3;
+    out->n_children = 0;
+    out->buffers    = bufs;
+    out->release    = release_array_utf8_leaf;
+    return 0;
+}
+
+static int csv_stream_get_next(struct ArrowArrayStream *st,
+                               struct ArrowArray *out) {
+    CsvState *s = st->private_data;
+    memset(out, 0, sizeof *out);
+    if (s->emitted) return 0;     /* end-of-stream */
+
+    int64_t n = (int64_t)s->n_rows;
+
+    struct ArrowArray **kids = calloc(s->n_cols, sizeof *kids);
+    if (!kids) return 1;
+    for (size_t c = 0; c < s->n_cols; ++c) {
+        kids[c] = calloc(1, sizeof **kids);
+        if (!kids[c]) {
+            for (size_t k = 0; k < c; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids);
+            return 1;
+        }
+        if (s->cols[c].type == CSV_T_INT64) {
+            int64_t *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
+            if (!vals) {
+                free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            if (n > 0) memcpy(vals, s->cols[c].i64_vals,
+                              (size_t)n * sizeof *vals);
+            const void **bufs = malloc(2 * sizeof *bufs);
+            if (!bufs) {
+                free(vals); free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            bufs[0] = NULL;
+            bufs[1] = vals;
+            kids[c]->length     = n;
+            kids[c]->null_count = 0;
+            kids[c]->n_buffers  = 2;
+            kids[c]->buffers    = bufs;
+            kids[c]->release    = release_array_int64_leaf;
+        } else {
+            if (csv_build_utf8_leaf(kids[c], s->cols[c].u8_strs,
+                                    s->cols[c].u8_lens, (size_t)n) != 0) {
+                free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+        }
+    }
+
+    const void **outer_bufs = malloc(1 * sizeof *outer_bufs);
+    if (!outer_bufs) {
+        for (size_t c = 0; c < s->n_cols; ++c) {
+            if (kids[c]->release) kids[c]->release(kids[c]);
+            free(kids[c]);
+        }
+        free(kids);
+        return 1;
+    }
+    outer_bufs[0] = NULL;
+
+    out->length     = n;
+    out->n_buffers  = 1;
+    out->n_children = (int64_t)s->n_cols;
+    out->buffers    = outer_bufs;
+    out->children   = kids;
+    out->release    = release_array_struct;
+
+    s->emitted = 1;
+    return 0;
+}
+
+static const char *csv_stream_get_last_error(struct ArrowArrayStream *st) {
+    (void)st; return NULL;
+}
+
+static void csv_stream_release(struct ArrowArrayStream *st) {
+    st->private_data = NULL;
+    st->release      = NULL;
+}
+
+static int csv_attach_output(void *state, int port,
+                             struct ArrowArrayStream *out) {
+    (void)port;
+    out->get_schema     = csv_stream_get_schema;
+    out->get_next       = csv_stream_get_next;
+    out->get_last_error = csv_stream_get_last_error;
+    out->release        = csv_stream_release;
+    out->private_data   = state;
+    return BETL_OK;
+}
+
+static const BetlPortDef csv_outputs[] = {
+    { .name = "out", .schema_mode = BETL_SCHEMA_DERIVED, .doc = "csv rows" },
+};
+
+static const BetlComponentDef csv_components[] = {
+    { .name               = "csv.read",
+      .kind               = BETL_KIND_SOURCE,
+      .config_schema_json = "{}",
+      .flags              = BETL_FLAG_DETERMINISTIC,
+      .outputs            = csv_outputs,
+      .output_count       = 1,
+      .init               = csv_init,
+      .destroy            = csv_destroy,
+      .attach_output      = csv_attach_output },
+};
+
+static const BetlProvider csv_provider = {
+    .abi_version     = BETL_ABI_VERSION,
+    .name            = "betl-builtins-csv",
+    .version         = "0.1.0",
+    .license         = "Apache-2.0",
+    .components      = csv_components,
+    .component_count = sizeof csv_components / sizeof csv_components[0],
+};
+
+/* ============================================================== *
+ *  Registry helper                                                 *
+ * ============================================================== */
+
+int betl_register_builtins(BetlRegistry *r) {
+    int rc;
+    rc = betl_registry_register(r, &gen_provider,   "<builtin:gen>");
+    if (rc != BETL_OK) return rc;
+    rc = betl_registry_register(r, &gens_provider,  "<builtin:gen-strings>");
+    if (rc != BETL_OK) return rc;
+    rc = betl_registry_register(r, &count_provider, "<builtin:count>");
+    if (rc != BETL_OK) return rc;
+    rc = betl_registry_register(r, &csv_provider,   "<builtin:csv>");
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_literal_engine(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_transforms(r);
+    if (rc != BETL_OK) return rc;
+#ifdef BETL_HAVE_LIBPQ
+    rc = betl_register_postgres(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_postgres_lookup(r);
+    if (rc != BETL_OK) return rc;
+#endif
+    return rc;
+}

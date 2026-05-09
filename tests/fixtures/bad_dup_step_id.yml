@@ -1,0 +1,10 @@
+betl: 1
+name: duplicate-step-ids
+pipeline:
+  - id: stage1
+    type: dataflow
+    steps:
+      - id: read
+        type: csv.read
+      - id: read
+        type: csv.read

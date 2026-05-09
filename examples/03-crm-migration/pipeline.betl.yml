@@ -1,0 +1,206 @@
+# =============================================================================
+# Example 03 — One-shot migration from a legacy CRM (MSSQL) to a new CRM
+# (Postgres), table-by-table, with per-table field transforms.
+#
+# Demonstrates:
+#   - `include:` to factor connections out into a reusable bundle.
+#   - Filtering out archived rows at the source (push the predicate down).
+#   - Field merge (first_name + last_name -> full_name).
+#   - Computed columns (sha256 address hash, normalized email, USD total).
+#   - Dropped columns via explicit `select:` projection.
+#   - Renaming via `{ name, from }`.
+#   - FK-aware control-flow ordering — orders depends on customers being loaded.
+#
+# Setup (one-time):
+#   sqlcmd -i sql/ddl_source.sql        # in MSSQL: creates dbo.customers etc.
+#   sqlcmd -i sql/seed_source.sql       # optional: deterministic test data
+#   psql -f sql/ddl_target.sql          # in Postgres: creates crm.*
+#
+# Run:
+#   cp ../.env.example ../.env && edit DSN values
+#   export $(grep -v '^#' ../.env | xargs)
+#   betl run pipeline.betl.yml
+# =============================================================================
+
+betl: 1
+name: crm-migration
+description: |
+  Move customers, orders, and addresses out of the legacy CRM into the new
+  one. Skips archived records. Idempotent — safe to re-run; upserts on the
+  natural keys.
+
+include:
+  - ./connections.betl.yml
+
+pipeline:
+
+  # =========================================================================
+  # Customers — merge first/last, normalize email, compute address hash,
+  # drop legacy internal columns.
+  # =========================================================================
+  - id: migrate_customers
+    type: dataflow
+    steps:
+
+      - id: read
+        type: mssql.query
+        connection: legacy_crm
+        # Push the archived filter down to the source DB rather than reading
+        # everything and filtering in betl. Cheaper and faster.
+        sql: |
+          SELECT
+            customer_id,
+            first_name,
+            last_name,
+            email,
+            address_line_1,
+            address_line_2,
+            city,
+            postal_code,
+            country,
+            legacy_internal_id,    -- to drop
+            deprecated_flag,       -- to drop
+            created_at
+          FROM dbo.customers
+          WHERE archived = 0
+
+      - id: transform
+        type: lua.map
+        from: read
+        # `betl-lua` exposes a small standard helper library; `sha256(s)`
+        # is one of those. See the betl-lua provider docs for the full list.
+        script: |
+          local function trim(s) return (s or ""):gsub("^%s+", ""):gsub("%s+$", "") end
+
+          -- Merge: first + last -> full_name
+          local first = trim(row.first_name)
+          local last  = trim(row.last_name)
+          row.full_name = trim(first .. " " .. last)
+
+          -- Normalize email: lowercase + trim
+          row.email = row.email and trim(row.email):lower() or nil
+
+          -- Compute: deterministic address hash for de-dup checks downstream
+          local addr = table.concat({
+            row.address_line_1 or "",
+            row.address_line_2 or "",
+            row.city           or "",
+            row.postal_code    or "",
+            row.country        or "",
+          }, "|"):lower()
+          row.address_hash = sha256(addr)
+
+          return row
+
+      - id: project
+        type: map
+        from: transform
+        # `select:` (replacing the column set) — anything not listed here
+        # is dropped. This is how `migrate_customers` discards
+        # legacy_internal_id, deprecated_flag, first_name, last_name.
+        select:
+          - customer_id
+          - full_name              # merged
+          - email                  # normalized
+          - address_line_1
+          - address_line_2
+          - city
+          - postal_code
+          - country
+          - address_hash           # computed
+          - created_at
+
+      - id: write
+        type: postgres.upsert
+        from: project
+        connection: new_crm
+        table: crm.customers
+        key: [customer_id]
+        on_conflict: update
+
+  # =========================================================================
+  # Orders — depends on customers (FK). Demonstrates `map` with a mix of
+  # pass-through, computed, and dropped columns without a Lua step.
+  # =========================================================================
+  - id: migrate_orders
+    type: dataflow
+    after: [migrate_customers]
+    steps:
+
+      - id: read
+        type: mssql.query
+        connection: legacy_crm
+        sql: |
+          SELECT
+            order_id,
+            customer_id,
+            order_date,
+            total_amount,
+            currency,
+            status,
+            internal_notes,        -- to drop (PII / not migrating)
+            archived
+          FROM dbo.orders
+          WHERE archived = 0
+
+      - id: project
+        type: map
+        from: read
+        # Mixed projection. Three forms:
+        #   - "name"                      pass-through
+        #   - { name, from }              rename
+        #   - { name, expr, lang? }       computed (default lang: lua)
+        select:
+          - order_id
+          - customer_id
+          - order_date
+          - total_amount
+          - currency
+          # Normalize status: upper-case and default missing to UNKNOWN.
+          - { name: status,
+              expr: "string.upper(row.status or 'UNKNOWN')" }
+          # Computed column. (Real FX would use a rate table; this is just
+          # a sketch of the syntax.)
+          - { name: total_amount_usd,
+              expr: "row.currency == 'USD' and row.total_amount or row.total_amount * fx_rate(row.currency, 'USD')" }
+          # dropped: internal_notes, archived
+
+      - id: write
+        type: postgres.upsert
+        from: project
+        connection: new_crm
+        table: crm.orders
+        key: [order_id]
+        on_conflict: update
+
+  # =========================================================================
+  # Addresses — straight copy with archived filter, no transforms beyond
+  # what the source query already does. Included to show the simple case.
+  # =========================================================================
+  - id: migrate_addresses
+    type: dataflow
+    after: [migrate_customers]
+    steps:
+
+      - id: read
+        type: mssql.query
+        connection: legacy_crm
+        sql: |
+          SELECT
+            address_id,
+            customer_id,
+            line_1,
+            line_2,
+            city,
+            postal_code,
+            country
+          FROM dbo.addresses
+          WHERE archived = 0
+
+      - id: write
+        type: postgres.upsert
+        from: read
+        connection: new_crm
+        table: crm.addresses
+        key: [address_id]
+        on_conflict: update

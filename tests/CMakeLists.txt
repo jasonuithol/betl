@@ -1,0 +1,284 @@
+# Public-header smoke test: confirm provider.h is self-contained and
+# every advertised symbol is reachable.
+add_executable(test_provider_header test_provider_header.c)
+target_include_directories(test_provider_header PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+add_test(NAME provider_header COMMAND test_provider_header)
+
+# Smoke tests of the betl binary itself.
+add_test(NAME cli_version
+    COMMAND betl --version
+)
+set_tests_properties(cli_version PROPERTIES
+    PASS_REGULAR_EXPRESSION "^betl 0\\."
+)
+
+add_test(NAME validate_example_01
+    COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/01-csv-to-postgres/pipeline.betl.yml
+)
+add_test(NAME validate_example_02
+    COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/02-build-sales-star/pipeline.betl.yml
+)
+add_test(NAME validate_example_03
+    COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/03-crm-migration/pipeline.betl.yml
+)
+add_test(NAME validate_connections_bundle
+    COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/03-crm-migration/connections.betl.yml
+)
+
+# Negative: a YAML file with no betl discriminator must be rejected.
+file(WRITE ${CMAKE_BINARY_DIR}/tests/not_betl.yml "foo: bar\nbaz: 1\n")
+add_test(NAME validate_rejects_non_betl
+    COMMAND betl validate ${CMAKE_BINARY_DIR}/tests/not_betl.yml
+)
+set_tests_properties(validate_rejects_non_betl PROPERTIES
+    WILL_FAIL TRUE
+)
+
+# --- Loader ------------------------------------------------------------------
+# A test-only provider that contributes one TASK component. Built as a
+# MODULE library — appropriate for dlopen targets, won't be linked against.
+add_library(betl-test-echo MODULE plugins/echo_provider.c)
+target_include_directories(betl-test-echo PRIVATE ${CMAKE_SOURCE_DIR}/include)
+set_target_properties(betl-test-echo PROPERTIES
+    PREFIX ""              # no "lib" prefix on .so
+    C_VISIBILITY_PRESET hidden
+)
+
+add_executable(test_loader test_loader.c)
+target_link_libraries(test_loader PRIVATE betl_core)
+# Bake the plugin path as a fallback so the test still has work to do
+# when invoked without argv (e.g. by `c-build analyze`).
+target_compile_definitions(test_loader PRIVATE
+    BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:betl-test-echo>"
+)
+add_dependencies(test_loader betl-test-echo)
+
+add_test(NAME loader
+    COMMAND test_loader $<TARGET_FILE:betl-test-echo>
+)
+
+# --- Host context (BetlContext) end-to-end through the loader. --------------
+# A test-only provider whose single TASK component calls every betl_*
+# extern from inside its task_run, so the test can verify the host-side
+# implementations resolve and behave correctly.
+add_library(betl-test-ctx-probe MODULE plugins/ctx_probe_provider.c)
+target_include_directories(betl-test-ctx-probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+set_target_properties(betl-test-ctx-probe PROPERTIES
+    PREFIX ""
+    C_VISIBILITY_PRESET hidden
+)
+
+add_executable(test_context test_context.c)
+target_link_libraries(test_context PRIVATE betl_core)
+# Plugin loaded into this binary needs to resolve host externs.
+set_target_properties(test_context PROPERTIES ENABLE_EXPORTS ON)
+target_compile_definitions(test_context PRIVATE
+    BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:betl-test-ctx-probe>"
+)
+add_dependencies(test_context betl-test-ctx-probe)
+
+add_test(NAME context
+    COMMAND test_context $<TARGET_FILE:betl-test-ctx-probe>
+)
+
+# --- Pipeline parser ---------------------------------------------------------
+add_executable(test_pipeline test_pipeline.c)
+target_link_libraries(test_pipeline PRIVATE betl_core)
+target_compile_definitions(test_pipeline PRIVATE
+    BETL_TEST_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples"
+    BETL_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
+)
+add_test(NAME pipeline
+    COMMAND test_pipeline
+        ${CMAKE_SOURCE_DIR}/examples
+        ${CMAKE_SOURCE_DIR}/tests/fixtures
+)
+
+# --- Executor end-to-end -----------------------------------------------------
+# Runs an in-memory pipeline through the parser, the registry (with
+# built-in test providers registered), the runtime context, and the
+# executor.
+add_executable(test_exec test_exec.c)
+target_link_libraries(test_exec PRIVATE betl_core)
+target_compile_definitions(test_exec PRIVATE
+    BETL_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
+)
+add_test(NAME exec COMMAND test_exec)
+
+# `betl run` end-to-end via the CLI.
+add_test(NAME cli_run
+    COMMAND betl run ${CMAKE_SOURCE_DIR}/tests/fixtures/run_demo.yml
+)
+set_tests_properties(cli_run PROPERTIES
+    PASS_REGULAR_EXPRESSION "run ok"
+)
+
+# csv.read end-to-end via the CLI. Demonstrates a real `parameters:`
+# block + ${params.X} substitution: --param fixtures_dir=... is passed
+# in, the YAML interpolates it into the csv.read step's `path:`.
+add_test(NAME cli_run_csv
+    COMMAND betl run ${CMAKE_SOURCE_DIR}/tests/fixtures/csv_demo.yml
+            --param fixtures_dir=${CMAKE_SOURCE_DIR}/tests/fixtures
+)
+set_tests_properties(cli_run_csv PROPERTIES
+    PASS_REGULAR_EXPRESSION "run ok"
+)
+
+# Same pipeline without the required --param: must fail at apply-parameters.
+add_test(NAME cli_run_csv_missing_required
+    COMMAND betl run ${CMAKE_SOURCE_DIR}/tests/fixtures/csv_demo.yml
+)
+set_tests_properties(cli_run_csv_missing_required PROPERTIES
+    WILL_FAIL TRUE
+)
+
+# A --param override naming an undeclared parameter is a typo guard.
+add_test(NAME cli_run_csv_unknown_override
+    COMMAND betl run ${CMAKE_SOURCE_DIR}/tests/fixtures/csv_demo.yml
+            --param fixtures_dir=${CMAKE_SOURCE_DIR}/tests/fixtures
+            --param totally_bogus=42
+)
+set_tests_properties(cli_run_csv_unknown_override PROPERTIES
+    WILL_FAIL TRUE
+)
+
+# `betl run` against a pipeline whose connection references an unset
+# env var. Should exit non-zero with a clear error mentioning the
+# variable name. Drives `betl_apply_connections` through the CLI.
+file(WRITE ${CMAKE_BINARY_DIR}/tests/missing_env.yml
+"betl: 1
+name: missing-env
+connections:
+  warehouse:
+    type: postgres
+    dsn: \${env.BETL_NONEXISTENT_VAR_FOR_TESTS}
+pipeline:
+  - id: stage_one
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1
+      - id: sink
+        type: betl.count_rows
+        from: source
+")
+add_test(NAME cli_run_missing_env
+    COMMAND betl run ${CMAKE_BINARY_DIR}/tests/missing_env.yml
+)
+set_tests_properties(cli_run_missing_env PROPERTIES
+    WILL_FAIL TRUE
+)
+
+# --- Lua provider end-to-end ------------------------------------------------
+# The provider is built in providers/betl-lua. The parent scope sets
+# BETL_LUA_FOUND / BETL_LUA_TARGET only when Lua 5.4 was located in deps/.
+if(BETL_LUA_FOUND)
+    add_executable(test_lua_task test_lua_task.c)
+    target_link_libraries(test_lua_task PRIVATE betl_core)
+    # The plugin dlopen'd into this binary needs to resolve betl_log /
+    # betl_set_error / betl_get_param / betl_get_connection back into
+    # the host. ENABLE_EXPORTS is the portable spelling of -rdynamic.
+    set_target_properties(test_lua_task PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_lua_task PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_lua_task ${BETL_LUA_TARGET})
+    add_test(NAME lua_task
+        COMMAND test_lua_task $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+
+    # End-to-end: gen_int64 → lua.map → count_rows.
+    add_executable(test_lua_map test_lua_map.c)
+    target_link_libraries(test_lua_map PRIVATE betl_core)
+    set_target_properties(test_lua_map PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_lua_map PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_lua_map ${BETL_LUA_TARGET})
+    add_test(NAME lua_map
+        COMMAND test_lua_map $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+
+    # SPEC §7 expression engine: drive compile + evaluate directly.
+    add_executable(test_lua_expr test_lua_expr.c)
+    target_link_libraries(test_lua_expr PRIVATE betl_core)
+    set_target_properties(test_lua_expr PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_lua_expr PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_lua_expr ${BETL_LUA_TARGET})
+    add_test(NAME lua_expr
+        COMMAND test_lua_expr $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+
+    # Standard transforms — filter + map driven by literal/lua engines.
+    add_executable(test_transforms test_transforms.c)
+    target_link_libraries(test_transforms PRIVATE betl_core)
+    set_target_properties(test_transforms PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_transforms PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+        BETL_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
+    )
+    add_dependencies(test_transforms ${BETL_LUA_TARGET})
+    add_test(NAME transforms
+        COMMAND test_transforms $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+endif()
+
+# --- Postgres connectivity smoke test ---------------------------------------
+# Built only when libpq was found at configure time. The test exits 77 if
+# it can't reach the database, so absence of a sibling Postgres turns
+# into Skipped rather than Failed.
+if(LIBPQ_FOUND)
+    add_executable(test_pg_smoke test_pg_smoke.c)
+    target_link_libraries(test_pg_smoke PRIVATE betl_libpq)
+    add_test(NAME pg_smoke COMMAND test_pg_smoke)
+    set_tests_properties(pg_smoke PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "^ok: pg server says PostgreSQL "
+    )
+
+    # --- postgres.upsert SQL builder unit test ------------------------------
+    # No libpq linkage needed — pure string code in pg_sql.c. We still gate
+    # the test on LIBPQ_FOUND to keep it next to the other PG tests.
+    add_executable(test_pg_sql test_pg_sql.c)
+    target_link_libraries(test_pg_sql PRIVATE betl_core)
+    add_test(NAME pg_sql COMMAND test_pg_sql)
+    set_tests_properties(pg_sql PROPERTIES
+        PASS_REGULAR_EXPRESSION "^ok: pg_sql unit tests passed"
+    )
+
+    # --- postgres.upsert end-to-end integration test ------------------------
+    # Drives gen_int64 → postgres.upsert against the sibling Postgres,
+    # verifies via libpq, drops its scratch schema. Skips on no DB.
+    add_executable(test_pg_upsert test_pg_upsert.c)
+    target_link_libraries(test_pg_upsert PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_upsert COMMAND test_pg_upsert)
+    set_tests_properties(pg_upsert PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_upsert integration test passed"
+    )
+
+    # --- postgres `lookup` end-to-end integration test ----------------------
+    # Drives gen_int64 → lookup → lua.map (logs) → count_rows against the
+    # sibling Postgres. Loads betl-lua.so so the verification step can run.
+    if(BETL_LUA_FOUND)
+        add_executable(test_pg_lookup test_pg_lookup.c)
+        target_link_libraries(test_pg_lookup PRIVATE betl_core betl_libpq)
+        set_target_properties(test_pg_lookup PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_pg_lookup PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+        )
+        add_dependencies(test_pg_lookup ${BETL_LUA_TARGET})
+        add_test(NAME pg_lookup
+            COMMAND test_pg_lookup $<TARGET_FILE:${BETL_LUA_TARGET}>
+        )
+        set_tests_properties(pg_lookup PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: pg_lookup integration test passed"
+        )
+    endif()
+endif()

@@ -1,0 +1,124 @@
+# =============================================================================
+# Example 01 — Daily CSV ingestion into a Postgres staging table.
+#
+# Demonstrates:
+#   - Parameters with defaults
+#   - A connection with the DSN sourced from an env var (no inline secrets)
+#   - A typed CSV source with an explicit Arrow-typed schema
+#   - A Lua per-row clean-up step
+#   - An inline filter expression (default lang: lua)
+#   - A literal-engine `add` to tag the load
+#   - An upsert sink keyed by a natural key
+#   - A post-load row-count sanity check via sql.execute
+#
+# Setup (one-time):
+#   psql -f sql/ddl_target.sql                           # creates stg.orders
+#
+# Run:
+#   cp ../.env.example ../.env && edit DSN values
+#   export $(grep -v '^#' ../.env | xargs)
+#   betl run pipeline.betl.yml --param src_dir=fixtures --param load_date=2026-05-04
+#
+# Bundled fixtures/orders-2026-05-04.csv contains a deliberately messy
+# input including a zero-quantity row that the filter step drops.
+# =============================================================================
+
+betl: 1
+name: orders-daily-ingest
+description: |
+  Load one day of orders.csv from a drop directory into stg.orders, with
+  light cleaning and an upsert by order_id.
+
+parameters:
+  src_dir:
+    type: string
+    required: true
+    doc: Directory where the daily orders-YYYY-MM-DD.csv files land.
+  load_date:
+    type: date
+    default: today              # recognized literal default for `type: date`
+    doc: Which day's file to load. Defaults to today.
+
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.WAREHOUSE_DSN}
+
+pipeline:
+
+  - id: ingest_orders
+    type: dataflow
+    on_failure: stop
+    steps:
+
+      - id: read
+        type: csv.read
+        path: ${params.src_dir}/orders-${params.load_date}.csv
+        delimiter: ","
+        header: true
+        # Schema is declared up front. Arrow logical types throughout.
+        schema:
+          - { name: order_id,    type: int64,                  nullable: false }
+          - { name: customer_id, type: int64,                  nullable: false }
+          - { name: sku,         type: string,                 nullable: false }
+          - { name: quantity,    type: int32,                  nullable: false }
+          - { name: unit_price,  type: "decimal128(12,2)",     nullable: false }
+          - { name: ordered_at,  type: "timestamp[us, UTC]",   nullable: false }
+          - { name: notes,       type: string,                 nullable: true  }
+
+      - id: clean
+        type: lua.map
+        from: read
+        # `script` runs per row. `row` is a mutable table; return it (or nil
+        # to drop). A returned `row.<field>` of nil writes SQL NULL.
+        script: |
+          local function trim(s) return (s or ""):gsub("^%s+", ""):gsub("%s+$", "") end
+          row.sku   = trim(row.sku):upper()
+          row.notes = row.notes and trim(row.notes) or nil
+          if row.notes == "" then row.notes = nil end
+          return row
+
+      - id: drop_zero_qty
+        type: filter
+        from: clean
+        # Inline shorthand: a string at `where:` means `{lang: lua, expr: ...}`.
+        # The default expression engine is lua (see SPEC §7), so no `lang:` needed.
+        where: "row.quantity > 0"
+
+      - id: tag_load
+        type: map
+        from: drop_zero_qty
+        # `add:` only adds columns. `lang: literal` does pure substitution
+        # — no code execution — and is the right choice for constant tags.
+        add:
+          load_date:
+            lang: literal
+            value: ${params.load_date}
+          source_file:
+            lang: literal
+            value: orders-${params.load_date}.csv
+
+      - id: write
+        type: postgres.upsert
+        from: tag_load
+        connection: warehouse
+        table: stg.orders
+        key: [order_id]
+        on_conflict: update     # update | ignore | error
+
+  # ---------------------------------------------------------------------------
+  # Post-load sanity check. If zero rows landed for the load date, fail
+  # the run loudly so the orchestrator (cron / Airflow / whatever) sees it.
+  # ---------------------------------------------------------------------------
+  - id: row_count_check
+    type: sql.execute
+    connection: warehouse
+    after: [ingest_orders]
+    sql: |
+      SELECT COUNT(*) AS rows_loaded
+      FROM stg.orders
+      WHERE load_date = :load_date
+    params:
+      load_date: ${params.load_date}
+    expect:
+      rows_loaded: { min: 1 }

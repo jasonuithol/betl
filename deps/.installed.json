@@ -1,0 +1,86 @@
+{
+  "apt": {
+    "liblua5.4-0": {
+      "arch": "amd64",
+      "files": [
+        "lib/liblua5.4-c++.so.0",
+        "lib/liblua5.4-c++.so.0.0.0",
+        "lib/liblua5.4.so.0",
+        "lib/liblua5.4.so.0.0.0"
+      ],
+      "version": "5.4.4-3+deb12u1"
+    },
+    "liblua5.4-dev": {
+      "arch": "amd64",
+      "files": [
+        "include/lua5.4/lauxlib.h",
+        "include/lua5.4/lua.h",
+        "include/lua5.4/lua.hpp",
+        "include/lua5.4/luaconf.h",
+        "include/lua5.4/lualib.h",
+        "include/x86_64-linux-gnu/lua5.4-deb-multiarch.h",
+        "lib/liblua5.4-c++.a",
+        "lib/liblua5.4-c++.so",
+        "lib/liblua5.4.a",
+        "lib/liblua5.4.so",
+        "lib/pkgconfig/lua-5.4-c++.pc",
+        "lib/pkgconfig/lua-5.4.pc",
+        "lib/pkgconfig/lua5.4-c++.pc",
+        "lib/pkgconfig/lua5.4.pc",
+        "lib/pkgconfig/lua54-c++.pc",
+        "lib/pkgconfig/lua54.pc"
+      ],
+      "version": "5.4.4-3+deb12u1"
+    },
+    "libpq-dev": {
+      "arch": "amd64",
+      "files": [
+        "include/postgresql/internal/c.h",
+        "include/postgresql/internal/fe-auth-sasl.h",
+        "include/postgresql/internal/libpq-int.h",
+        "include/postgresql/internal/libpq/pqcomm.h",
+        "include/postgresql/internal/port.h",
+        "include/postgresql/internal/postgres_fe.h",
+        "include/postgresql/internal/pqexpbuffer.h",
+        "include/postgresql/libpq-events.h",
+        "include/postgresql/libpq-fe.h",
+        "include/postgresql/libpq/libpq-fs.h",
+        "include/postgresql/pg_config.h",
+        "include/postgresql/pg_config_ext.h",
+        "include/postgresql/pg_config_manual.h",
+        "include/postgresql/pg_config_os.h",
+        "include/postgresql/postgres_ext.h",
+        "lib/libpq.a",
+        "lib/libpq.so",
+        "lib/pkgconfig/libpq.pc"
+      ],
+      "version": "15.16-0+deb12u1"
+    },
+    "libpq5": {
+      "arch": "amd64",
+      "files": [
+        "lib/libpq.so.5",
+        "lib/libpq.so.5.15"
+      ],
+      "version": "15.16-0+deb12u1"
+    },
+    "libyaml-0-2": {
+      "arch": "amd64",
+      "files": [
+        "lib/libyaml-0.so.2",
+        "lib/libyaml-0.so.2.0.9"
+      ],
+      "version": "0.2.5-1"
+    },
+    "libyaml-dev": {
+      "arch": "amd64",
+      "files": [
+        "include/yaml.h",
+        "lib/libyaml.a",
+        "lib/libyaml.so",
+        "lib/pkgconfig/yaml-0.1.pc"
+      ],
+      "version": "0.2.5-1"
+    }
+  }
+}

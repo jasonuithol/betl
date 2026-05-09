@@ -1,0 +1,11 @@
+betl: 1
+name: from-references-nothing
+pipeline:
+  - id: stage1
+    type: dataflow
+    steps:
+      - id: read
+        type: csv.read
+      - id: write
+        type: postgres.upsert
+        from: no_such_step

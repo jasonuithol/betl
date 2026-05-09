@@ -1,0 +1,17 @@
+betl: 1
+name: bundle-with-pipeline-section
+description: |
+  Root pipeline that includes a malformed connection bundle. The bundle
+  declares a `pipeline:` section which is not allowed in
+  `betl_connections:` files — must be rejected at load time.
+
+include:
+  - ./bad_bundle_with_pipeline.yml
+
+pipeline:
+  - id: stage_one
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1

@@ -1,0 +1,6 @@
+betl: 1
+name: dataflow-with-no-steps
+pipeline:
+  - id: empty_stage
+    type: dataflow
+    steps: []

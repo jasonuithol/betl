@@ -1,0 +1,9 @@
+betl: 1
+name: stage-after-self
+pipeline:
+  - id: alone
+    type: dataflow
+    after: [alone]
+    steps:
+      - id: noop
+        type: csv.read

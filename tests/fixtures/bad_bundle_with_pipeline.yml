@@ -1,0 +1,17 @@
+betl_connections: 1
+
+# Connection bundles may only contribute connections — the parser must
+# reject this file because it also declares a `pipeline:` section.
+
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.WAREHOUSE_DSN}
+
+pipeline:
+  - id: should_not_be_here
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1

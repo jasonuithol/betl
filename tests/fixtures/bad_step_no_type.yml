@@ -1,0 +1,9 @@
+betl: 1
+name: step-missing-type
+pipeline:
+  - id: stage1
+    type: dataflow
+    steps:
+      - id: read
+        # `type:` is required and absent.
+        path: /tmp/x.csv

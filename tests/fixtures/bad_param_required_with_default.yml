@@ -1,0 +1,19 @@
+betl: 1
+name: param-required-with-default
+
+parameters:
+  load_date:
+    type: date
+    # `required: true` together with a default is a contradiction —
+    # required means "the user must supply a value", default means
+    # "we'll fall back if they don't". Reject at parse time.
+    required: true
+    default: today
+
+pipeline:
+  - id: stage_one
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1

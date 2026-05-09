@@ -1,0 +1,13 @@
+betl: 1
+name: step-cycle
+pipeline:
+  - id: stage1
+    type: dataflow
+    steps:
+      - id: alpha
+        type: filter
+        from: beta
+
+      - id: beta
+        type: filter
+        from: alpha

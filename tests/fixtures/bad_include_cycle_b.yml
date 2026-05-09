@@ -1,0 +1,14 @@
+betl: 1
+name: cycle-b
+
+# Closes the cycle by including back into a.
+include:
+  - ./bad_include_cycle_a.yml
+
+pipeline:
+  - id: stage_two
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1

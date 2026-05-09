@@ -1,0 +1,15 @@
+betl: 1
+name: after-references-nothing
+pipeline:
+  - id: real_stage
+    type: dataflow
+    steps:
+      - id: noop
+        type: csv.read
+
+  - id: dependent_stage
+    type: dataflow
+    after: [no_such_stage]
+    steps:
+      - id: noop
+        type: csv.read

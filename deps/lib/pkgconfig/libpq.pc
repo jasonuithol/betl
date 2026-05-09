@@ -1,0 +1,14 @@
+prefix=/opt/projects/betl/deps
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include/postgresql
+
+Name: libpq
+Description: PostgreSQL libpq library
+Url: https://www.postgresql.org/
+Version: 15.16
+Requires: 
+Requires.private: libssl libcrypto
+Cflags: -I${includedir}
+Libs: -L${libdir} -lpq
+Libs.private:  -lpgcommon -lpgport -lgssapi_krb5 -lm -lldap

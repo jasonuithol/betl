@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://betl.dev/schemas/v0.1/connections.schema.json",
+  "title": "betl connections bundle (v0.1)",
+  "description": "Schema for a betl connection-bundle file. Discriminator key is `betl_connections: 1`. Pulled into pipelines via `include:`. See SPEC §5.3.",
+
+  "type": "object",
+  "required": ["betl_connections", "connections"],
+  "unevaluatedProperties": false,
+
+  "properties": {
+    "betl_connections": {
+      "const": 1,
+      "description": "Document-kind discriminator. Must be `1` for v0.1 connection bundles."
+    },
+
+    "name": {
+      "type": "string",
+      "description": "Optional name for the bundle (informational)."
+    },
+
+    "description": {
+      "type": "string"
+    },
+
+    "connections": {
+      "type": "object",
+      "description": "Map of connection name → connection definition.",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type", "dsn"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "examples": ["postgres", "mssql", "mysql", "sqlite", "kafka", "s3", "http"]
+          },
+          "dsn": {
+            "type": "string",
+            "description": "Connection string. MUST be a substitution (`${env.X}`, `${secret.X}`, or a file-path indirection); inline literals are a lint error."
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+betl: 1
+name: csv-demo
+description: |
+  Reads sample.csv (5 rows x 2 int64 columns) and counts the rows.
+  Used by the cli_run_csv ctest case. The `fixtures_dir` parameter is
+  passed via --param at run time, so the file is independent of the
+  build directory.
+
+parameters:
+  fixtures_dir:
+    type: string
+    required: true
+    doc: Directory containing sample.csv.
+
+pipeline:
+  - id: ingest
+    type: dataflow
+    steps:
+      - id: source
+        type: csv.read
+        path: ${params.fixtures_dir}/sample.csv
+        header: true
+      - id: sink
+        type: betl.count_rows
+        from: source
+        expect: 5

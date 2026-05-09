@@ -1,0 +1,16 @@
+betl: 1
+name: stage-cycle
+pipeline:
+  - id: alpha
+    type: dataflow
+    after: [beta]
+    steps:
+      - id: noop
+        type: csv.read
+
+  - id: beta
+    type: dataflow
+    after: [alpha]
+    steps:
+      - id: noop
+        type: csv.read

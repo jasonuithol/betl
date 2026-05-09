@@ -1,0 +1,11 @@
+---
+# clang-analyzer-security.insecureAPI.*:
+#     Recommends Annex K `_s` variants (memset_s, snprintf_s, ...) that
+#     are not implemented by glibc and are widely considered a failed
+#     extension. We use bounds-checking forms (snprintf/vsnprintf with
+#     explicit sizes) which is the right answer for portable C11.
+#
+# clang-analyzer-valist.Uninitialized:
+#     False positive on var-arg helpers that immediately follow
+#     `va_start`. Triggers on every error-formatting helper.
+Checks: '-clang-analyzer-security.insecureAPI.*,-clang-analyzer-valist.Uninitialized'

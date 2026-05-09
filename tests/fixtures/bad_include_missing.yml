@@ -1,0 +1,15 @@
+betl: 1
+name: include-missing
+
+# Path does not exist — must surface as a load error attributed to the
+# include item (not to the parent file's own structure).
+include:
+  - ./this_file_does_not_exist_42.yml
+
+pipeline:
+  - id: stage_one
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_int64
+        row_count: 1

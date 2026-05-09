@@ -1,0 +1,12 @@
+# Connection bundle. Included by pipeline.betl.yml so the connections
+# block can be shared across pipelines or environment-overridden in CI.
+
+betl_connections: 1
+
+connections:
+  legacy_crm:
+    type: mssql
+    dsn: ${env.LEGACY_CRM_DSN}
+  new_crm:
+    type: postgres
+    dsn: ${env.NEW_CRM_DSN}

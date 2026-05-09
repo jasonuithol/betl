@@ -1,0 +1,4 @@
+betl: 1
+name: missing-pipeline-key
+description: |
+  betl: 1 is present but the required `pipeline:` sequence is absent.
