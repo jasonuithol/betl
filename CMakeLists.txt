@@ -85,6 +85,12 @@ add_library(betl_core STATIC
     src/runtime/pg_sql.c
     src/runtime/substitute.c
     src/runtime/transforms.c
+    src/runtime/transforms_common.c
+    src/runtime/transform_filter.c
+    src/runtime/transform_map.c
+    src/runtime/transform_aggregate.c
+    src/runtime/transform_sort.c
+    src/runtime/transform_join.c
     src/yaml/yaml_load.c
 )
 target_include_directories(betl_core PUBLIC
