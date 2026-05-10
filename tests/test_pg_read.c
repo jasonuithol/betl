@@ -1,13 +1,13 @@
-/* Integration test for the mssql.read SOURCE.
+/* Integration test for the postgres.read SOURCE.
  *
  * Setup creates a disposable schema with a 5-row table that includes
  * one NULL utf8 value. The pipeline runs `SELECT id, color FROM ...`
- * via mssql.read, pipes through lua.map (which logs each row), and
+ * via postgres.read, pipes through lua.map (which logs each row), and
  * counts. We verify:
  *   - row count is 5
  *   - the lua log shows the four non-null colors
  *   - the lua log shows `nil` for the row whose color is SQL NULL
- *   - small batch_size (=2) → still works (covers > 1 batch)
+ *   - small batch_size (=2) → still works (covers > 1 batch via cursor)
  */
 
 #include <stdio.h>
@@ -15,8 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <sql.h>
-#include <sqlext.h>
+#include <libpq-fe.h>
 
 #include "betl/provider.h"
 #include "loader/registry.h"
@@ -38,10 +37,7 @@ static int failures = 0;
 } while (0)
 
 static const char *default_dsn(void) {
-    return "Driver=/opt/projects/betl/deps/lib/odbc/libtdsodbc.so;"
-           "Server=host.containers.internal;Port=1433;"
-           "UID=sa;PWD=DevP@ssw0rd!42;Database=master;"
-           "TDS_Version=7.4;";
+    return "postgresql://postgres@host.containers.internal:5432/postgres";
 }
 
 static int write_file(const char *path, const char *contents) {
@@ -51,6 +47,15 @@ static int write_file(const char *path, const char *contents) {
     int rc = fwrite(contents, 1, len, f) == len ? 0 : -1;
     fclose(f);
     return rc;
+}
+
+static int pg_exec(PGconn *c, const char *sql) {
+    PGresult *r = PQexec(c, sql);
+    int ok = PQresultStatus(r) == PGRES_COMMAND_OK
+          || PQresultStatus(r) == PGRES_TUPLES_OK;
+    if (!ok) fprintf(stderr, "SQL fail [%s]: %s", sql, PQerrorMessage(c));
+    PQclear(r);
+    return ok ? 0 : -1;
 }
 
 static char *slurp(FILE *f) {
@@ -66,34 +71,6 @@ static char *slurp(FILE *f) {
     return buf;
 }
 
-static void diag(SQLSMALLINT type, SQLHANDLE h, const char *step) {
-    SQLCHAR state[6], msg[400];
-    SQLINTEGER native = 0;
-    SQLSMALLINT msg_len = 0;
-    if (SQL_SUCCEEDED(SQLGetDiagRec(type, h, 1, state, &native,
-                                    msg, sizeof msg, &msg_len))) {
-        fprintf(stderr, "[%s] SQLSTATE=%s native=%d msg=%s\n",
-                step, state, (int)native, msg);
-    }
-}
-
-/* FreeTDS via ODBC returns SQL_NO_DATA (100) for DDL like CREATE/DROP
- * SCHEMA — that's "this statement produced no result set," not an
- * error. Accept it alongside SUCCESS / SUCCESS_WITH_INFO so the test's
- * setup statements don't silently bail to teardown. */
-static int ms_exec(SQLHDBC hdbc, const char *sql) {
-    SQLHSTMT hstmt = SQL_NULL_HSTMT;
-    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt))) return -1;
-    int rc = 0;
-    SQLRETURN er = SQLExecDirect(hstmt, (SQLCHAR *)sql, SQL_NTS);
-    if (!SQL_SUCCEEDED(er) && er != SQL_NO_DATA) {
-        diag(SQL_HANDLE_STMT, hstmt, sql);
-        rc = -1;
-    }
-    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-    return rc;
-}
-
 int main(int argc, char **argv) {
     const char *plugin_path = (argc >= 2) ? argv[1]
 #ifdef BETL_TEST_PLUGIN_PATH
@@ -106,71 +83,54 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    const char *dsn = getenv("BETL_TEST_MSSQL_DSN");
+    const char *dsn = getenv("BETL_TEST_PG_DSN");
     if (!dsn || !*dsn) {
         dsn = default_dsn();
-        setenv("BETL_TEST_MSSQL_DSN", dsn, 1);
+        setenv("BETL_TEST_PG_DSN", dsn, 1);
     }
 
-    SQLHENV  henv = SQL_NULL_HENV;
-    SQLHDBC  hdbc = SQL_NULL_HDBC;
-    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
-    SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
-    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
-
-    SQLCHAR out[1024];
-    SQLSMALLINT out_len = 0;
-    SQLRETURN rc = SQLDriverConnect(hdbc, NULL, (SQLCHAR *)dsn, SQL_NTS,
-                                    out, sizeof out, &out_len,
-                                    SQL_DRIVER_NOPROMPT);
-    if (!SQL_SUCCEEDED(rc)) {
-        fprintf(stderr, "[skip] connect failed:\n");
-        diag(SQL_HANDLE_DBC, hdbc, "connect");
-        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        SQLFreeHandle(SQL_HANDLE_ENV, henv);
+    PGconn *c = PQconnectdb(dsn);
+    if (PQstatus(c) != CONNECTION_OK) {
+        fprintf(stderr, "[skip] connect failed: %s", PQerrorMessage(c));
+        PQfinish(c);
         return SKIP_RC;
     }
 
     char schema[64];
     snprintf(schema, sizeof schema, "betl_rd_%d", (int)getpid());
     char ddl[400];
+    snprintf(ddl, sizeof ddl, "DROP SCHEMA IF EXISTS %s CASCADE", schema);
+    if (pg_exec(c, ddl) != 0) { PQfinish(c); return 1; }
+    snprintf(ddl, sizeof ddl, "CREATE SCHEMA %s", schema);
+    if (pg_exec(c, ddl) != 0) { PQfinish(c); return 1; }
     snprintf(ddl, sizeof ddl,
-             "IF EXISTS (SELECT 1 FROM sys.schemas WHERE name='%s') "
-             "EXEC('DROP SCHEMA [%s]')", schema, schema);
-    ms_exec(hdbc, ddl);
-
-    snprintf(ddl, sizeof ddl, "CREATE SCHEMA [%s]", schema);
-    if (ms_exec(hdbc, ddl) != 0) goto teardown;
-
-    snprintf(ddl, sizeof ddl,
-             "CREATE TABLE [%s].[colors] (id BIGINT PRIMARY KEY, "
-             "color VARCHAR(50) NULL)", schema);
-    if (ms_exec(hdbc, ddl) != 0) goto teardown;
-
+             "CREATE TABLE %s.colors (id bigint PRIMARY KEY, color text)",
+             schema);
+    if (pg_exec(c, ddl) != 0) { PQfinish(c); return 1; }
     /* Five rows; row 4 has color = NULL. */
     snprintf(ddl, sizeof ddl,
-             "INSERT INTO [%s].[colors] VALUES "
+             "INSERT INTO %s.colors VALUES "
              "(1,'red'),(2,'green'),(3,'blue'),(4,NULL),(5,'cyan')", schema);
-    if (ms_exec(hdbc, ddl) != 0) goto teardown;
+    if (pg_exec(c, ddl) != 0) { PQfinish(c); return 1; }
 
-    /* Pipeline: SELECT via mssql.read with batch_size=2 (forces three
-     * batches over five rows), log each row, count. */
+    /* Pipeline: SELECT via postgres.read with batch_size=2 (forces three
+     * cursor FETCHes over five rows), log each row, count. */
     char yaml[2048];
     snprintf(yaml, sizeof yaml,
         "betl: 1\n"
-        "name: mssql-read-it\n"
+        "name: pg-read-it\n"
         "connections:\n"
         "  warehouse:\n"
-        "    type: mssql\n"
-        "    dsn: ${env.BETL_TEST_MSSQL_DSN}\n"
+        "    type: postgres\n"
+        "    dsn: ${env.BETL_TEST_PG_DSN}\n"
         "pipeline:\n"
         "  - id: stage_one\n"
         "    type: dataflow\n"
         "    steps:\n"
         "      - id: source\n"
-        "        type: mssql.read\n"
+        "        type: postgres.read\n"
         "        connection: warehouse\n"
-        "        query: SELECT id, color FROM [%s].[colors] ORDER BY id\n"
+        "        query: SELECT id, color FROM %s.colors ORDER BY id\n"
         "        batch_size: 2\n"
         "      - id: log\n"
         "        type: lua.map\n"
@@ -185,32 +145,30 @@ int main(int argc, char **argv) {
         schema);
 
     char path[64];
-    snprintf(path, sizeof path, "/tmp/betl-test-mssql-read-%d.yml", (int)getpid());
-    if (write_file(path, yaml) != 0) goto teardown;
+    snprintf(path, sizeof path, "/tmp/betl-test-pg-read-%d.yml", (int)getpid());
+    if (write_file(path, yaml) != 0) { PQfinish(c); return 1; }
 
     char err[1024] = {0};
     BetlPipeline *p = betl_pipeline_load(path, err, sizeof err);
-    unlink(path);
     if (!p) {
         fprintf(stderr, "pipeline_load: %s\n", err);
-        ++failures;
-        goto teardown;
+        unlink(path); PQfinish(c); return 1;
     }
 
     BetlContext  *ctx = betl_context_create();
     BetlRegistry *reg = betl_registry_create();
     CHECK(ctx && reg);
 
-    int rrc = betl_register_builtins(reg);
-    CHECK(rrc == BETL_OK);
-    rrc = betl_registry_load(reg, plugin_path);
-    if (rrc != BETL_OK) {
+    int rc = betl_register_builtins(reg);
+    CHECK(rc == BETL_OK);
+    rc = betl_registry_load(reg, plugin_path);
+    if (rc != BETL_OK) {
         fprintf(stderr, "load lua plugin: %s\n", betl_registry_last_error(reg));
         ++failures;
     }
     char conn_err[256];
-    rrc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
-    if (rrc != BETL_OK) {
+    rc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
+    if (rc != BETL_OK) {
         fprintf(stderr, "apply_connections: %s\n", conn_err);
         ++failures;
     }
@@ -220,9 +178,9 @@ int main(int argc, char **argv) {
         betl_context_set_log_stream(ctx, log);
         betl_context_set_min_log_level(ctx, BETL_LOG_TRACE);
     }
-    rrc = betl_run(ctx, reg, p);
-    if (rrc != BETL_OK) {
-        fprintf(stderr, "betl_run rc=%d: %s\n", rrc,
+    rc = betl_run(ctx, reg, p);
+    if (rc != BETL_OK) {
+        fprintf(stderr, "betl_run rc=%d: %s\n", rc,
                 betl_context_last_error(ctx));
         ++failures;
     }
@@ -243,21 +201,17 @@ int main(int argc, char **argv) {
     betl_pipeline_free(p);
     betl_registry_destroy(reg);
     betl_context_destroy(ctx);
+    unlink(path);
 
-teardown:
-    snprintf(ddl, sizeof ddl, "DROP TABLE IF EXISTS [%s].[colors]", schema);
-    ms_exec(hdbc, ddl);
-    snprintf(ddl, sizeof ddl, "DROP SCHEMA IF EXISTS [%s]", schema);
-    ms_exec(hdbc, ddl);
-
-    SQLDisconnect(hdbc);
-    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+    /* Cleanup. */
+    snprintf(ddl, sizeof ddl, "DROP SCHEMA IF EXISTS %s CASCADE", schema);
+    pg_exec(c, ddl);
+    PQfinish(c);
 
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
     }
-    printf("ok: mssql_read integration test passed\n");
+    printf("ok: pg_read integration test passed\n");
     return 0;
 }

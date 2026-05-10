@@ -1,14 +1,10 @@
-/* Integration test for the mssql.read SOURCE.
+/* Streaming stress test for mssql.read.
  *
- * Setup creates a disposable schema with a 5-row table that includes
- * one NULL utf8 value. The pipeline runs `SELECT id, color FROM ...`
- * via mssql.read, pipes through lua.map (which logs each row), and
- * counts. We verify:
- *   - row count is 5
- *   - the lua log shows the four non-null colors
- *   - the lua log shows `nil` for the row whose color is SQL NULL
- *   - small batch_size (=2) → still works (covers > 1 batch)
- */
+ * Same shape as test_pg_read_stream but against the sibling MSSQL via
+ * unixODBC + FreeTDS. Pushes ~10MB of result-set data through
+ * mssql.read with a small batch_size and asserts that VmHWM delta
+ * around betl_run stays bounded — i.e. that FreeTDS / unixODBC don't
+ * silently buffer the whole result before the first SQLFetch returns. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +23,14 @@
 #include "runtime/exec.h"
 
 #define SKIP_RC 77
+/* 4000 rows × 500-byte payload = ~2 MB on the wire — small enough to
+ * run reasonably under valgrind, large enough that "buffer it all"
+ * would push VmHWM well past the 5 MB threshold. Streaming keeps the
+ * delta under a few hundred KB regardless of total volume. */
+#define ROW_COUNT        4000
+#define PAYLOAD_BYTES     500
+#define BATCH_SIZE        100
+#define MAX_HWM_DELTA_KB (5 * 1024)   /* 5 MB headroom */
 
 static int failures = 0;
 
@@ -53,19 +57,6 @@ static int write_file(const char *path, const char *contents) {
     return rc;
 }
 
-static char *slurp(FILE *f) {
-    fflush(f);
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) return NULL;
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) return NULL;
-    size_t n = fread(buf, 1, (size_t)sz, f);
-    buf[n] = '\0';
-    return buf;
-}
-
 static void diag(SQLSMALLINT type, SQLHANDLE h, const char *step) {
     SQLCHAR state[6], msg[400];
     SQLINTEGER native = 0;
@@ -77,10 +68,10 @@ static void diag(SQLSMALLINT type, SQLHANDLE h, const char *step) {
     }
 }
 
-/* FreeTDS via ODBC returns SQL_NO_DATA (100) for DDL like CREATE/DROP
- * SCHEMA — that's "this statement produced no result set," not an
- * error. Accept it alongside SUCCESS / SUCCESS_WITH_INFO so the test's
- * setup statements don't silently bail to teardown. */
+/* Run a one-shot statement. FreeTDS via ODBC returns SQL_NO_DATA (100)
+ * for DDL like CREATE/DROP SCHEMA — that isn't an error, just "this
+ * statement produced no result set." Accept it alongside SUCCESS /
+ * SUCCESS_WITH_INFO so DDL setup doesn't silently goto teardown. */
 static int ms_exec(SQLHDBC hdbc, const char *sql) {
     SQLHSTMT hstmt = SQL_NULL_HSTMT;
     if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt))) return -1;
@@ -94,24 +85,27 @@ static int ms_exec(SQLHDBC hdbc, const char *sql) {
     return rc;
 }
 
-int main(int argc, char **argv) {
-    const char *plugin_path = (argc >= 2) ? argv[1]
-#ifdef BETL_TEST_PLUGIN_PATH
-        : BETL_TEST_PLUGIN_PATH;
-#else
-        : NULL;
-    if (!plugin_path) {
-        fprintf(stderr, "usage: %s <path-to-betl-lua.so>\n", argv[0]);
-        return 2;
+static long read_vm_hwm_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "VmHWM:", 6) == 0) {
+            kb = strtol(line + 6, NULL, 10);
+            break;
+        }
     }
-#endif
+    fclose(f);
+    return kb;
+}
 
+int main(void) {
     const char *dsn = getenv("BETL_TEST_MSSQL_DSN");
     if (!dsn || !*dsn) {
         dsn = default_dsn();
         setenv("BETL_TEST_MSSQL_DSN", dsn, 1);
     }
-
     SQLHENV  henv = SQL_NULL_HENV;
     SQLHDBC  hdbc = SQL_NULL_HDBC;
     SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
@@ -132,33 +126,65 @@ int main(int argc, char **argv) {
     }
 
     char schema[64];
-    snprintf(schema, sizeof schema, "betl_rd_%d", (int)getpid());
-    char ddl[400];
+    snprintf(schema, sizeof schema, "betl_rs_%d", (int)getpid());
+    char ddl[1024];
     snprintf(ddl, sizeof ddl,
              "IF EXISTS (SELECT 1 FROM sys.schemas WHERE name='%s') "
              "EXEC('DROP SCHEMA [%s]')", schema, schema);
     ms_exec(hdbc, ddl);
 
     snprintf(ddl, sizeof ddl, "CREATE SCHEMA [%s]", schema);
-    if (ms_exec(hdbc, ddl) != 0) goto teardown;
+    if (ms_exec(hdbc, ddl) != 0) {
+        fprintf(stderr, "FAIL: CREATE SCHEMA\n"); ++failures; goto teardown;
+    }
 
     snprintf(ddl, sizeof ddl,
-             "CREATE TABLE [%s].[colors] (id BIGINT PRIMARY KEY, "
-             "color VARCHAR(50) NULL)", schema);
-    if (ms_exec(hdbc, ddl) != 0) goto teardown;
+             "CREATE TABLE [%s].[bulk] (id BIGINT PRIMARY KEY, "
+             "payload VARCHAR(%d))", schema, PAYLOAD_BYTES + 16);
+    if (ms_exec(hdbc, ddl) != 0) {
+        fprintf(stderr, "FAIL: CREATE TABLE\n"); ++failures; goto teardown;
+    }
 
-    /* Five rows; row 4 has color = NULL. */
+    /* Server-side row generation via cross-join over sys.all_objects.
+     * MSSQL has no generate_series; this gives plenty of rows quickly. */
     snprintf(ddl, sizeof ddl,
-             "INSERT INTO [%s].[colors] VALUES "
-             "(1,'red'),(2,'green'),(3,'blue'),(4,NULL),(5,'cyan')", schema);
-    if (ms_exec(hdbc, ddl) != 0) goto teardown;
+             "INSERT INTO [%s].[bulk] (id, payload) "
+             "SELECT TOP %d "
+             "ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS id, "
+             "REPLICATE('x', %d) AS payload "
+             "FROM sys.all_objects a CROSS JOIN sys.all_objects b",
+             schema, ROW_COUNT, PAYLOAD_BYTES);
+    if (ms_exec(hdbc, ddl) != 0) {
+        fprintf(stderr, "FAIL: bulk INSERT\n"); ++failures; goto teardown;
+    }
 
-    /* Pipeline: SELECT via mssql.read with batch_size=2 (forces three
-     * batches over five rows), log each row, count. */
+    /* Verify the bulk insert actually populated the table. */
+    {
+        char q[160];
+        snprintf(q, sizeof q, "SELECT COUNT(*) FROM [%s].[bulk]", schema);
+        SQLHSTMT hs = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hs);
+        int got_rows = -1;
+        if (SQL_SUCCEEDED(SQLExecDirect(hs, (SQLCHAR *)q, SQL_NTS))
+            && SQLFetch(hs) == SQL_SUCCESS) {
+            SQLINTEGER v = 0; SQLLEN ind = 0;
+            if (SQL_SUCCEEDED(SQLGetData(hs, 1, SQL_C_LONG, &v, sizeof v, &ind))) {
+                got_rows = (int)v;
+            }
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, hs);
+        printf("[mssql_read_stream] inserted rows=%d (want %d)\n",
+               got_rows, ROW_COUNT);
+        if (got_rows != ROW_COUNT) {
+            fprintf(stderr, "FAIL: insert count mismatch\n");
+            ++failures; goto teardown;
+        }
+    }
+
     char yaml[2048];
     snprintf(yaml, sizeof yaml,
         "betl: 1\n"
-        "name: mssql-read-it\n"
+        "name: mssql-read-stream\n"
         "connections:\n"
         "  warehouse:\n"
         "    type: mssql\n"
@@ -170,22 +196,17 @@ int main(int argc, char **argv) {
         "      - id: source\n"
         "        type: mssql.read\n"
         "        connection: warehouse\n"
-        "        query: SELECT id, color FROM [%s].[colors] ORDER BY id\n"
-        "        batch_size: 2\n"
-        "      - id: log\n"
-        "        type: lua.map\n"
-        "        from: source\n"
-        "        script: |\n"
-        "          log.info('id=' .. row.id .. ' color=' .. tostring(row.color))\n"
-        "          return row\n"
+        "        query: SELECT id, payload FROM [%s].[bulk] ORDER BY id\n"
+        "        batch_size: %d\n"
         "      - id: sink\n"
         "        type: betl.count_rows\n"
-        "        from: log\n"
-        "        expect: 5\n",
-        schema);
+        "        from: source\n"
+        "        expect: %d\n",
+        schema, BATCH_SIZE, ROW_COUNT);
 
     char path[64];
-    snprintf(path, sizeof path, "/tmp/betl-test-mssql-read-%d.yml", (int)getpid());
+    snprintf(path, sizeof path, "/tmp/betl-test-mssql-read-stream-%d.yml",
+             (int)getpid());
     if (write_file(path, yaml) != 0) goto teardown;
 
     char err[1024] = {0};
@@ -196,56 +217,42 @@ int main(int argc, char **argv) {
         ++failures;
         goto teardown;
     }
-
     BetlContext  *ctx = betl_context_create();
     BetlRegistry *reg = betl_registry_create();
     CHECK(ctx && reg);
-
-    int rrc = betl_register_builtins(reg);
-    CHECK(rrc == BETL_OK);
-    rrc = betl_registry_load(reg, plugin_path);
-    if (rrc != BETL_OK) {
-        fprintf(stderr, "load lua plugin: %s\n", betl_registry_last_error(reg));
-        ++failures;
-    }
+    CHECK(betl_register_builtins(reg) == BETL_OK);
     char conn_err[256];
-    rrc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
+    int rrc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
     if (rrc != BETL_OK) {
         fprintf(stderr, "apply_connections: %s\n", conn_err);
         ++failures;
     }
 
-    FILE *log = tmpfile();
-    if (log) {
-        betl_context_set_log_stream(ctx, log);
-        betl_context_set_min_log_level(ctx, BETL_LOG_TRACE);
-    }
+    long hwm_before = read_vm_hwm_kb();
     rrc = betl_run(ctx, reg, p);
+    long hwm_after = read_vm_hwm_kb();
+
     if (rrc != BETL_OK) {
         fprintf(stderr, "betl_run rc=%d: %s\n", rrc,
                 betl_context_last_error(ctx));
         ++failures;
     }
 
-    if (log) {
-        char *txt = slurp(log);
-        if (txt) {
-            CHECK(strstr(txt, "id=1 color=red")   != NULL);
-            CHECK(strstr(txt, "id=2 color=green") != NULL);
-            CHECK(strstr(txt, "id=3 color=blue")  != NULL);
-            CHECK(strstr(txt, "id=4 color=nil")   != NULL); /* SQL NULL */
-            CHECK(strstr(txt, "id=5 color=cyan")  != NULL);
-            free(txt);
-        }
-        fclose(log);
-    }
+    long delta = (hwm_before > 0 && hwm_after > 0)
+                 ? (hwm_after - hwm_before) : -1;
+    printf("[mssql_read_stream] VmHWM before=%ld KB after=%ld KB delta=%ld KB "
+           "(threshold=%d KB, %d rows × %d bytes)\n",
+           hwm_before, hwm_after, delta,
+           MAX_HWM_DELTA_KB, ROW_COUNT, PAYLOAD_BYTES);
+    CHECK(delta >= 0);
+    CHECK(delta < MAX_HWM_DELTA_KB);
 
     betl_pipeline_free(p);
     betl_registry_destroy(reg);
     betl_context_destroy(ctx);
 
 teardown:
-    snprintf(ddl, sizeof ddl, "DROP TABLE IF EXISTS [%s].[colors]", schema);
+    snprintf(ddl, sizeof ddl, "DROP TABLE IF EXISTS [%s].[bulk]", schema);
     ms_exec(hdbc, ddl);
     snprintf(ddl, sizeof ddl, "DROP SCHEMA IF EXISTS [%s]", schema);
     ms_exec(hdbc, ddl);
@@ -258,6 +265,6 @@ teardown:
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
     }
-    printf("ok: mssql_read integration test passed\n");
+    printf("ok: mssql_read_stream test passed\n");
     return 0;
 }

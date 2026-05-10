@@ -68,11 +68,16 @@ static void diag(SQLSMALLINT type, SQLHANDLE h, const char *step) {
     }
 }
 
+/* FreeTDS via ODBC returns SQL_NO_DATA (100) for DDL like CREATE/DROP
+ * SCHEMA — that's "this statement produced no result set," not an
+ * error. Accept it alongside SUCCESS / SUCCESS_WITH_INFO so the test's
+ * setup statements don't silently bail to teardown. */
 static int ms_exec(SQLHDBC hdbc, const char *sql) {
     SQLHSTMT hstmt = SQL_NULL_HSTMT;
     if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt))) return -1;
     int rc = 0;
-    if (!SQL_SUCCEEDED(SQLExecDirect(hstmt, (SQLCHAR *)sql, SQL_NTS))) {
+    SQLRETURN er = SQLExecDirect(hstmt, (SQLCHAR *)sql, SQL_NTS);
+    if (!SQL_SUCCEEDED(er) && er != SQL_NO_DATA) {
         diag(SQL_HANDLE_STMT, hstmt, sql);
         rc = -1;
     }

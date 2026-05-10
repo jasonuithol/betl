@@ -133,6 +133,7 @@ if(LIBPQ_FOUND)
     target_sources(betl_core PRIVATE
         src/runtime/postgres_upsert.c
         src/runtime/postgres_lookup.c
+        src/runtime/postgres_read.c
     )
     target_link_libraries(betl_core PUBLIC betl_libpq)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBPQ)

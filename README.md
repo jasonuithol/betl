@@ -88,6 +88,7 @@ upserts).
 | Kind | Component | Status | Notes |
 |---|---|---|---|
 | SOURCE | `csv.read` | ✓ | Streaming; RFC 4180 quoted fields incl. multi-line; int64 / utf8 |
+| SOURCE | `postgres.read` | ✓ | Run a SELECT, stream rows; libpq cursor; nulls supported |
 | SOURCE | `mssql.read` | ✓ | Run a SELECT, stream rows; unixODBC + FreeTDS; nulls supported |
 | SOURCE | `betl.gen_int64` / `betl.gen_strings` | ✓ | Test generators |
 | SINK | `csv.write` | ✓ | RFC 4180 quoting, header / delimiter |
@@ -108,7 +109,7 @@ upserts).
 
 ### Missing on purpose at v0.1
 
-- No `parquet.*`, no `kafka.*`, no `postgres.read`.
+- No `parquet.*`, no `kafka.*`.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
 

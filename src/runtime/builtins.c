@@ -14,6 +14,7 @@
 #ifdef BETL_HAVE_LIBPQ
 #include "runtime/postgres_upsert.h"
 #include "runtime/postgres_lookup.h"
+#include "runtime/postgres_read.h"
 #endif
 
 #ifdef BETL_HAVE_ODBC
@@ -1849,6 +1850,8 @@ int betl_register_builtins(BetlRegistry *r) {
     rc = betl_register_postgres(r);
     if (rc != BETL_OK) return rc;
     rc = betl_register_postgres_lookup(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_postgres_read(r);
     if (rc != BETL_OK) return rc;
 #endif
 #ifdef BETL_HAVE_ODBC

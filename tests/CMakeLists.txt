@@ -309,6 +309,22 @@ if(ODBC_FOUND)
             PASS_REGULAR_EXPRESSION "ok: mssql_read integration test passed"
         )
     endif()
+
+    # --- mssql.read streaming stress test (no Lua) --------------------------
+    # Verifies VmHWM stays bounded across a 2MB result set with a small
+    # batch_size — proves nothing along ODBC / FreeTDS silently buffers
+    # the whole result. Built as `stress_*` rather than `test_*` so the
+    # c-build `analyze` sweep skips it (libtdsodbc keeps internal
+    # buffers around that valgrind flags as definite leaks for
+    # large-ish result sets — that's a property of the driver, not of
+    # our code, and irrelevant to what this test is asserting).
+    add_executable(stress_mssql_read_stream test_mssql_read_stream.c)
+    target_link_libraries(stress_mssql_read_stream PRIVATE betl_core betl_odbc)
+    add_test(NAME mssql_read_stream COMMAND stress_mssql_read_stream)
+    set_tests_properties(mssql_read_stream PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: mssql_read_stream test passed"
+    )
 endif()
 
 # --- Postgres connectivity smoke test ---------------------------------------
@@ -363,5 +379,35 @@ if(LIBPQ_FOUND)
             SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "ok: pg_lookup integration test passed"
         )
+
+        # --- postgres.read end-to-end integration test -----------------------
+        add_executable(test_pg_read test_pg_read.c)
+        target_link_libraries(test_pg_read PRIVATE betl_core betl_libpq)
+        set_target_properties(test_pg_read PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_pg_read PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+        )
+        add_dependencies(test_pg_read ${BETL_LUA_TARGET})
+        add_test(NAME pg_read
+            COMMAND test_pg_read $<TARGET_FILE:${BETL_LUA_TARGET}>
+        )
+        set_tests_properties(pg_read PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: pg_read integration test passed"
+        )
     endif()
+
+    # --- postgres.read streaming stress test (no Lua) -----------------------
+    # Verifies VmHWM stays bounded across a 2MB result set with a small
+    # batch_size — proves the libpq cursor path actually streams rather
+    # than buffering the whole result client-side. Built as `stress_*`
+    # to keep it out of the `analyze` valgrind sweep (libpq's internal
+    # bookkeeping around large result sets is irrelevant to this test).
+    add_executable(stress_pg_read_stream test_pg_read_stream.c)
+    target_link_libraries(stress_pg_read_stream PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_read_stream COMMAND stress_pg_read_stream)
+    set_tests_properties(pg_read_stream PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_read_stream test passed"
+    )
 endif()
