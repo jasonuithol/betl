@@ -228,6 +228,65 @@ if(BETL_LUA_FOUND)
     )
 endif()
 
+# --- csv.write end-to-end ---------------------------------------------------
+# No Lua dependency: the test pipelines are gen_int64 / gen_strings → csv.write,
+# and the assertions compare exact file bytes after the pipeline runs.
+add_executable(test_csv_write test_csv_write.c)
+target_link_libraries(test_csv_write PRIVATE betl_core)
+add_test(NAME csv_write COMMAND test_csv_write)
+set_tests_properties(csv_write PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: csv.write end-to-end test passed"
+)
+
+# --- mssql.upsert SQL (MERGE) builder unit test -----------------------------
+# Pure string code — compiles even when ODBC isn't found, since mssql_sql.c
+# is always part of betl_core.
+add_executable(test_mssql_sql test_mssql_sql.c)
+target_link_libraries(test_mssql_sql PRIVATE betl_core)
+add_test(NAME mssql_sql COMMAND test_mssql_sql)
+set_tests_properties(mssql_sql PROPERTIES
+    PASS_REGULAR_EXPRESSION "^ok: mssql_sql unit tests passed"
+)
+
+# --- MSSQL connectivity smoke test ------------------------------------------
+# Built only when unixODBC was found at configure time. Skips on no DB.
+if(ODBC_FOUND)
+    add_executable(test_mssql_smoke test_mssql_smoke.c)
+    target_link_libraries(test_mssql_smoke PRIVATE betl_odbc)
+    add_test(NAME mssql_smoke COMMAND test_mssql_smoke)
+    set_tests_properties(mssql_smoke PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "^ok: mssql server says "
+    )
+
+    # --- mssql.upsert end-to-end integration test ---------------------------
+    add_executable(test_mssql_upsert test_mssql_upsert.c)
+    target_link_libraries(test_mssql_upsert PRIVATE betl_core betl_odbc)
+    add_test(NAME mssql_upsert COMMAND test_mssql_upsert)
+    set_tests_properties(mssql_upsert PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: mssql_upsert integration test passed"
+    )
+
+    # --- mssql.lookup end-to-end integration test ---------------------------
+    if(BETL_LUA_FOUND)
+        add_executable(test_mssql_lookup test_mssql_lookup.c)
+        target_link_libraries(test_mssql_lookup PRIVATE betl_core betl_odbc)
+        set_target_properties(test_mssql_lookup PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_mssql_lookup PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+        )
+        add_dependencies(test_mssql_lookup ${BETL_LUA_TARGET})
+        add_test(NAME mssql_lookup
+            COMMAND test_mssql_lookup $<TARGET_FILE:${BETL_LUA_TARGET}>
+        )
+        set_tests_properties(mssql_lookup PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: mssql_lookup integration test passed"
+        )
+    endif()
+endif()
+
 # --- Postgres connectivity smoke test ---------------------------------------
 # Built only when libpq was found at configure time. The test exits 77 if
 # it can't reach the database, so absence of a sibling Postgres turns

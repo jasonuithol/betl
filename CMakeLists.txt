@@ -65,6 +65,32 @@ else()
     message(STATUS "libpq not found — Postgres tests will be skipped")
 endif()
 
+# unixODBC: same shape as libpq — we look up sql.h + libodbc.so directly.
+# Available headers: sql.h, sqlext.h, sqltypes.h.
+find_path(ODBC_INCLUDE_DIR sql.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include
+)
+find_library(ODBC_LIBRARY NAMES odbc
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(ODBC_INCLUDE_DIR AND ODBC_LIBRARY)
+    set(ODBC_FOUND TRUE)
+    add_library(betl_odbc INTERFACE)
+    target_include_directories(betl_odbc INTERFACE ${ODBC_INCLUDE_DIR})
+    # sqltypes.h #includes "unixodbc.h", which Debian packages under a
+    # multiarch path. Add the shim dir if it exists so the headers
+    # resolve under -std=c11.
+    if(EXISTS ${CMAKE_SOURCE_DIR}/deps/include/x86_64-linux-gnu/unixodbc.h)
+        target_include_directories(betl_odbc INTERFACE
+            ${CMAKE_SOURCE_DIR}/deps/include/x86_64-linux-gnu)
+    endif()
+    target_link_libraries(betl_odbc INTERFACE ${ODBC_LIBRARY})
+    message(STATUS "Found unixODBC: ${ODBC_LIBRARY} (headers: ${ODBC_INCLUDE_DIR})")
+else()
+    set(ODBC_FOUND FALSE)
+    message(STATUS "unixODBC not found — MSSQL components will be omitted")
+endif()
+
 # --- Generated headers -----------------------------------------------------
 configure_file(
     ${CMAKE_SOURCE_DIR}/include/betl/version.h.in
@@ -81,6 +107,7 @@ add_library(betl_core STATIC
     src/runtime/context.c
     src/runtime/exec.c
     src/runtime/literal_expr.c
+    src/runtime/mssql_sql.c
     src/runtime/parameters.c
     src/runtime/pg_sql.c
     src/runtime/substitute.c
@@ -109,6 +136,17 @@ if(LIBPQ_FOUND)
     )
     target_link_libraries(betl_core PUBLIC betl_libpq)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBPQ)
+endif()
+
+# Pull in mssql.upsert when unixODBC is available. Same model as the
+# postgres integration — the component is part of the core.
+if(ODBC_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/mssql_upsert.c
+        src/runtime/mssql_lookup.c
+    )
+    target_link_libraries(betl_core PUBLIC betl_odbc)
+    target_compile_definitions(betl_core PUBLIC BETL_HAVE_ODBC)
 endif()
 
 # --- Engine binary ---------------------------------------------------------

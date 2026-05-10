@@ -1,5 +1,6 @@
 #include "runtime/builtins.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,11 @@
 #ifdef BETL_HAVE_LIBPQ
 #include "runtime/postgres_upsert.h"
 #include "runtime/postgres_lookup.h"
+#endif
+
+#ifdef BETL_HAVE_ODBC
+#include "runtime/mssql_upsert.h"
+#include "runtime/mssql_lookup.h"
 #endif
 
 /* ============================================================== *
@@ -1312,6 +1318,286 @@ static const BetlPortDef csv_outputs[] = {
     { .name = "out", .schema_mode = BETL_SCHEMA_DERIVED, .doc = "csv rows" },
 };
 
+/* ============================================================== *
+ *  csv.write — SINK                                                *
+ *                                                                  *
+ *  v0.1 capabilities:                                              *
+ *    - writes the entire input stream to a single text file        *
+ *    - column types: int64 (`l`) and utf8 (`u`); other Arrow       *
+ *      formats are rejected at sink_run time                       *
+ *    - delimiter: single char, default ','                         *
+ *    - header: bool, default true                                  *
+ *    - utf8 fields are RFC 4180 quoted on demand: a value          *
+ *      containing the delimiter, a double-quote, CR, or LF is      *
+ *      wrapped in "..." with internal quotes doubled. (csv.read    *
+ *      v0.1 doesn't yet round-trip quoted fields — that asymmetry  *
+ *      is documented; csv.write produces the standard form so      *
+ *      external consumers behave correctly.)                       *
+ *    - NULL cells are emitted as the empty string                  *
+ *                                                                  *
+ *  Config:                                                         *
+ *    path       (string, required)                                 *
+ *    delimiter  (string, optional, default ",")                    *
+ *    header     (bool,   optional, default true)                   *
+ * ============================================================== */
+
+typedef struct {
+    BetlContext              *ctx;
+    char                     *path;
+    char                      delim;
+    int                       header;
+    struct ArrowArrayStream   input;
+    int                       have_input;
+} CsvWriteState;
+
+static int csv_write_init(BetlContext *ctx, const char *cfg, void **state) {
+    CsvWriteState *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx    = ctx;
+    s->delim  = ',';
+    s->header = 1;
+
+    if (json_string(cfg, "path", &s->path) != 0 || !s->path) {
+        betl_set_error(ctx, "csv.write: missing required `path`");
+        free(s);
+        return BETL_ERR_INVALID;
+    }
+    char *delim_str = NULL;
+    if (json_string(cfg, "delimiter", &delim_str) == 0 && delim_str) {
+        if (delim_str[0] && delim_str[0] != '"') s->delim = delim_str[0];
+        free(delim_str);
+    }
+    {
+        const char *v = json_value_after(cfg, "header");
+        if (v) {
+            if (strncmp(v, "false", 5) == 0) s->header = 0;
+            else if (strncmp(v, "true", 4) == 0) s->header = 1;
+        }
+    }
+    *state = s;
+    return BETL_OK;
+}
+
+static void csv_write_destroy(void *state) {
+    CsvWriteState *s = state;
+    if (!s) return;
+    if (s->have_input && s->input.release) s->input.release(&s->input);
+    free(s->path);
+    free(s);
+}
+
+static int csv_write_attach_input(void *state, int port,
+                                  struct ArrowArrayStream *in) {
+    (void)port;
+    CsvWriteState *s = state;
+    s->input      = *in;
+    s->have_input = 1;
+    memset(in, 0, sizeof *in);
+    return BETL_OK;
+}
+
+/* True if the validity bitmap marks (col, row) as null. NULL bitmap
+ * means "all valid". Mirrors the helper in postgres_upsert.c. */
+static int csv_write_is_null(const struct ArrowArray *a, int64_t row) {
+    if (a->n_buffers < 1 || !a->buffers[0]) return 0;
+    const uint8_t *v = a->buffers[0];
+    int64_t bit = row + a->offset;
+    return ((v[bit / 8] >> (bit % 8)) & 1) == 0;
+}
+
+/* Emit a utf8 cell with RFC 4180 quoting when needed. */
+static int csv_write_utf8_cell(FILE *fp, char delim,
+                               const char *data, size_t len) {
+    int needs_quote = 0;
+    for (size_t i = 0; i < len; ++i) {
+        char c = data[i];
+        if (c == delim || c == '"' || c == '\n' || c == '\r') {
+            needs_quote = 1;
+            break;
+        }
+    }
+    if (!needs_quote) {
+        if (len && fwrite(data, 1, len, fp) != len) return -1;
+        return 0;
+    }
+    if (fputc('"', fp) == EOF) return -1;
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] == '"') {
+            if (fputs("\"\"", fp) == EOF) return -1;
+        } else {
+            if (fputc(data[i], fp) == EOF) return -1;
+        }
+    }
+    if (fputc('"', fp) == EOF) return -1;
+    return 0;
+}
+
+static int csv_write_render_cell(FILE *fp, char delim,
+                                 const struct ArrowArray *col,
+                                 const char *fmt, int64_t row) {
+    if (csv_write_is_null(col, row)) return 0; /* empty field */
+    int64_t off = col->offset + row;
+    if (strcmp(fmt, "l") == 0) {
+        const int64_t *vals = col->buffers[1];
+        if (fprintf(fp, "%" PRId64, vals[off]) < 0) return -1;
+        return 0;
+    }
+    if (strcmp(fmt, "u") == 0) {
+        const int32_t *offs = col->buffers[1];
+        const char    *data = col->buffers[2];
+        int32_t start = offs[off];
+        int32_t end   = offs[off + 1];
+        return csv_write_utf8_cell(fp, delim, data + start,
+                                   (size_t)(end - start));
+    }
+    return -2; /* unsupported format */
+}
+
+static int csv_write_sink_run(void *state) {
+    CsvWriteState *s = state;
+    if (!s->have_input) {
+        betl_set_error(s->ctx, "csv.write: sink_run without attached input");
+        return BETL_ERR_INVALID;
+    }
+
+    struct ArrowSchema schema = {0};
+    if (s->input.get_schema(&s->input, &schema) != 0) {
+        const char *up = s->input.get_last_error
+            ? s->input.get_last_error(&s->input) : NULL;
+        betl_set_error(s->ctx, "csv.write: get_schema failed%s%s",
+                       up ? ": " : "", up ? up : "");
+        return BETL_ERR_IO;
+    }
+    if (!schema.format || strcmp(schema.format, "+s") != 0) {
+        betl_set_error(s->ctx,
+            "csv.write: input must be a struct stream (got '%s')",
+            schema.format ? schema.format : "(null)");
+        if (schema.release) schema.release(&schema);
+        return BETL_ERR_TYPE;
+    }
+    int64_t n_cols = schema.n_children;
+    if (n_cols <= 0) {
+        betl_set_error(s->ctx, "csv.write: input stream has no columns");
+        schema.release(&schema);
+        return BETL_ERR_TYPE;
+    }
+    /* Validate every column's format up front. Bail before opening the
+     * file so a bad type doesn't leave a half-written artefact behind. */
+    for (int64_t i = 0; i < n_cols; ++i) {
+        const char *fmt = schema.children[i]->format;
+        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+            betl_set_error(s->ctx,
+                "csv.write: column '%s' has unsupported Arrow format '%s' "
+                "(v0.1 supports int64 'l' and utf8 'u')",
+                schema.children[i]->name ? schema.children[i]->name : "?",
+                fmt ? fmt : "(null)");
+            schema.release(&schema);
+            return BETL_ERR_TYPE;
+        }
+    }
+
+    FILE *fp = fopen(s->path, "w");
+    if (!fp) {
+        betl_set_error(s->ctx, "csv.write: cannot open %s for writing",
+                       s->path);
+        schema.release(&schema);
+        return BETL_ERR_IO;
+    }
+
+    int rc = BETL_OK;
+
+    if (s->header) {
+        for (int64_t i = 0; i < n_cols; ++i) {
+            if (i > 0 && fputc(s->delim, fp) == EOF) goto io_err;
+            const char *nm = schema.children[i]->name;
+            size_t nlen = nm ? strlen(nm) : 0;
+            if (csv_write_utf8_cell(fp, s->delim, nm ? nm : "", nlen) != 0) {
+                goto io_err;
+            }
+        }
+        if (fputc('\n', fp) == EOF) goto io_err;
+    }
+
+    /* Capture per-column formats now so we don't dereference schema
+     * children during cell rendering. */
+    const char **fmts = malloc((size_t)n_cols * sizeof *fmts);
+    if (!fmts) { rc = BETL_ERR_INTERNAL; goto cleanup; }
+    for (int64_t i = 0; i < n_cols; ++i) fmts[i] = schema.children[i]->format;
+
+    while (1) {
+        struct ArrowArray batch = {0};
+        if (s->input.get_next(&s->input, &batch) != 0) {
+            const char *up = s->input.get_last_error
+                ? s->input.get_last_error(&s->input) : NULL;
+            betl_set_error(s->ctx, "csv.write: get_next failed%s%s",
+                           up ? ": " : "", up ? up : "");
+            rc = BETL_ERR_IO;
+            free(fmts);
+            goto cleanup;
+        }
+        if (!batch.release) break;          /* end-of-stream */
+        if (batch.n_children != n_cols) {
+            betl_set_error(s->ctx,
+                "csv.write: batch has %" PRId64 " columns, schema declared %" PRId64,
+                batch.n_children, n_cols);
+            batch.release(&batch);
+            rc = BETL_ERR_TYPE;
+            free(fmts);
+            goto cleanup;
+        }
+        for (int64_t r = 0; r < batch.length; ++r) {
+            for (int64_t c = 0; c < n_cols; ++c) {
+                if (c > 0 && fputc(s->delim, fp) == EOF) {
+                    batch.release(&batch);
+                    free(fmts);
+                    goto io_err;
+                }
+                int crc = csv_write_render_cell(fp, s->delim,
+                                                batch.children[c],
+                                                fmts[c], r);
+                if (crc != 0) {
+                    betl_set_error(s->ctx,
+                        crc == -2
+                          ? "csv.write: column '%s' format changed mid-stream"
+                          : "csv.write: write error on %s",
+                        crc == -2
+                          ? schema.children[c]->name
+                          : s->path);
+                    batch.release(&batch);
+                    free(fmts);
+                    rc = (crc == -2) ? BETL_ERR_TYPE : BETL_ERR_IO;
+                    goto cleanup;
+                }
+            }
+            if (fputc('\n', fp) == EOF) {
+                batch.release(&batch);
+                free(fmts);
+                goto io_err;
+            }
+        }
+        batch.release(&batch);
+    }
+    free(fmts);
+
+cleanup:
+    if (fclose(fp) != 0 && rc == BETL_OK) {
+        betl_set_error(s->ctx, "csv.write: fclose failed on %s", s->path);
+        rc = BETL_ERR_IO;
+    }
+    schema.release(&schema);
+    return rc;
+
+io_err:
+    betl_set_error(s->ctx, "csv.write: write error on %s", s->path);
+    fclose(fp);
+    schema.release(&schema);
+    return BETL_ERR_IO;
+}
+
+static const BetlPortDef csv_write_inputs[] = {
+    { .name = "in", .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "rows to write" },
+};
+
 static const BetlComponentDef csv_components[] = {
     { .name               = "csv.read",
       .kind               = BETL_KIND_SOURCE,
@@ -1322,6 +1608,16 @@ static const BetlComponentDef csv_components[] = {
       .init               = csv_init,
       .destroy            = csv_destroy,
       .attach_output      = csv_attach_output },
+    { .name               = "csv.write",
+      .kind               = BETL_KIND_SINK,
+      .config_schema_json = "{}",
+      .flags              = 0,
+      .inputs             = csv_write_inputs,
+      .input_count        = 1,
+      .init               = csv_write_init,
+      .destroy            = csv_write_destroy,
+      .attach_input       = csv_write_attach_input,
+      .sink_run           = csv_write_sink_run },
 };
 
 static const BetlProvider csv_provider = {
@@ -1355,6 +1651,12 @@ int betl_register_builtins(BetlRegistry *r) {
     rc = betl_register_postgres(r);
     if (rc != BETL_OK) return rc;
     rc = betl_register_postgres_lookup(r);
+    if (rc != BETL_OK) return rc;
+#endif
+#ifdef BETL_HAVE_ODBC
+    rc = betl_register_mssql(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_mssql_lookup(r);
     if (rc != BETL_OK) return rc;
 #endif
     return rc;

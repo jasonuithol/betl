@@ -1,0 +1,12 @@
+prefix=/opt/projects/betl/deps
+exec_prefix=${prefix}
+includedir=${prefix}/include
+libdir=${prefix}/lib/x86_64-linux-gnu
+
+Name: odbccr (unixODBC)
+Description: unixODBC Cursor Library
+URL: http://unixodbc.org
+Version: 2.3.11
+Requires: odbc
+Cflags: -I${includedir}
+Libs: -L${libdir} -lodbccr

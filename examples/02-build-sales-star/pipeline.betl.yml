@@ -143,7 +143,7 @@ pipeline:
           load_date: ${params.load_date}
 
       - id: lookup_customer_sk
-        type: lookup
+        type: postgres.lookup
         from: read_transactions
         connection: olap
         table: olap.dim_customer
@@ -152,7 +152,7 @@ pipeline:
         on_miss: error                  # error | null | drop
 
       - id: lookup_product_sk
-        type: lookup
+        type: postgres.lookup
         from: lookup_customer_sk
         connection: olap
         table: olap.dim_product
