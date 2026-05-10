@@ -228,6 +228,14 @@ if(BETL_LUA_FOUND)
     )
 endif()
 
+# --- csv.read v2 end-to-end (streaming + RFC 4180 quoting) ------------------
+add_executable(test_csv_read test_csv_read.c)
+target_link_libraries(test_csv_read PRIVATE betl_core)
+add_test(NAME csv_read COMMAND test_csv_read)
+set_tests_properties(csv_read PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: csv.read v2 end-to-end test passed"
+)
+
 # --- csv.write end-to-end ---------------------------------------------------
 # No Lua dependency: the test pipelines are gen_int64 / gen_strings → csv.write,
 # and the assertions compare exact file bytes after the pipeline runs.
@@ -283,6 +291,22 @@ if(ODBC_FOUND)
         set_tests_properties(mssql_lookup PROPERTIES
             SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "ok: mssql_lookup integration test passed"
+        )
+
+        # --- mssql.read end-to-end integration test -------------------------
+        add_executable(test_mssql_read test_mssql_read.c)
+        target_link_libraries(test_mssql_read PRIVATE betl_core betl_odbc)
+        set_target_properties(test_mssql_read PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_mssql_read PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+        )
+        add_dependencies(test_mssql_read ${BETL_LUA_TARGET})
+        add_test(NAME mssql_read
+            COMMAND test_mssql_read $<TARGET_FILE:${BETL_LUA_TARGET}>
+        )
+        set_tests_properties(mssql_read PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: mssql_read integration test passed"
         )
     endif()
 endif()

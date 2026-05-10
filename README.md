@@ -87,7 +87,8 @@ upserts).
 
 | Kind | Component | Status | Notes |
 |---|---|---|---|
-| SOURCE | `csv.read` | ✓ | int64, utf8 columns; header / delimiter / typed schema |
+| SOURCE | `csv.read` | ✓ | Streaming; RFC 4180 quoted fields incl. multi-line; int64 / utf8 |
+| SOURCE | `mssql.read` | ✓ | Run a SELECT, stream rows; unixODBC + FreeTDS; nulls supported |
 | SOURCE | `betl.gen_int64` / `betl.gen_strings` | ✓ | Test generators |
 | SINK | `csv.write` | ✓ | RFC 4180 quoting, header / delimiter |
 | SINK | `postgres.upsert` | ✓ | INSERT…ON CONFLICT; 4 conflict modes; libpq |
@@ -97,7 +98,7 @@ upserts).
 | TRANSFORM | `map` | ✓ | `add:` (append) and `select:` (project / rename) |
 | TRANSFORM | `aggregate` | ✓ | `group_by` + count / sum / min / max |
 | TRANSFORM | `sort` | ✓ | Multi-key, asc / desc, stable |
-| TRANSFORM | `join` | ✓ | Inner-only at v0.1, multi-stream input |
+| TRANSFORM | `join` | ✓ | inner / left / outer; multi-key; null-aware output |
 | TRANSFORM | `postgres.lookup` | ✓ | Cached SELECT + linear probe; on_miss error/null/drop |
 | TRANSFORM | `mssql.lookup` | ✓ | Same model over ODBC |
 | TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return |
@@ -107,11 +108,7 @@ upserts).
 
 ### Missing on purpose at v0.1
 
-- No streaming `csv.read` (whole file is materialized).
-- No `outer join` / `left join` (inner only).
-- No quoted-field `csv.read` (csv.write does emit RFC 4180 quotes;
-  the read side will catch up).
-- No `parquet.*`, no `kafka.*`, no `mssql.*` source.
+- No `parquet.*`, no `kafka.*`, no `postgres.read`.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
 

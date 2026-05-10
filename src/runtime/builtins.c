@@ -19,6 +19,7 @@
 #ifdef BETL_HAVE_ODBC
 #include "runtime/mssql_upsert.h"
 #include "runtime/mssql_lookup.h"
+#include "runtime/mssql_read.h"
 #endif
 
 /* ============================================================== *
@@ -703,22 +704,25 @@ static const BetlProvider count_provider = {
  *  csv.read — SOURCE                                               *
  *                                                                  *
  *  v0.1 capabilities:                                              *
- *    - reads the entire file at init time (no streaming yet)       *
- *    - emits the data as a single Arrow batch                      *
+ *    - streams the file: emits one Arrow batch per `batch_size`    *
+ *      rows (default 1024) instead of materializing the whole file *
  *    - column types: int64 and utf8 (set per column via `schema:`) *
- *    - if `schema:` is omitted, every column defaults to int64 —   *
- *      same behavior as the original v0.0.x csv.read               *
+ *    - if `schema:` is omitted, every column defaults to int64     *
  *    - delimiter: single char, default ','                         *
  *    - header: bool, default true. When true, the first line       *
  *      provides column names (schema may override). When false,    *
  *      a schema is required.                                       *
- *    - no field quoting yet (RFC 4180 escapes deferred — strings   *
- *      cannot contain the delimiter or a newline)                  *
+ *    - RFC 4180 quoted fields: a field starting with `"` runs to   *
+ *      the matching `"`, with `""` decoded as a literal quote.     *
+ *      Quoted fields may contain the delimiter and/or newlines;    *
+ *      records that span multiple lines are reassembled before     *
+ *      type coercion.                                              *
  *                                                                  *
  *  Config:                                                         *
- *    path       (string, required)                                 *
- *    delimiter  (string, optional, default ",")                    *
- *    header     (bool,   optional, default true)                   *
+ *    path        (string, required)                                *
+ *    delimiter   (string, optional, default ",")                   *
+ *    header      (bool,   optional, default true)                  *
+ *    batch_size  (int,    optional, default 1024)                  *
  *    schema:                                                       *
  *      columns:                                                    *
  *        - { name: id,    type: int64 }                            *
@@ -730,8 +734,9 @@ typedef enum {
     CSV_T_UTF8  = 2,
 } CsvType;
 
-/* Per-column staging: one of i64_vals or u8_strs is populated based on
- * type. row_cap is shared across the whole CsvState. */
+/* Per-column: schema fields (name, type) are set at init and live for
+ * the whole stream; the buffer fields below are per-batch staging that
+ * gets reused across get_next calls. */
 typedef struct {
     char    *name;
     CsvType  type;
@@ -745,101 +750,289 @@ typedef struct {
     char        *path;
     char         delim;
     int          header;
-    int          emitted;
+    size_t       batch_size;
 
+    /* Streaming reader state. */
+    FILE        *fp;
+    char        *rec_buf;        /* growable scratch for one logical record */
+    size_t       rec_cap;
+    int          eof;
+    size_t       line_no;        /* 1-based file line, for error messages */
+
+    /* Schema + per-batch staging. row_cap is allocated once to batch_size;
+     * n_rows is the row count of the *current* batch and resets between
+     * get_next calls. */
     CsvCol *cols;
     size_t  n_cols;
     size_t  n_rows;
     size_t  row_cap;
 } CsvState;
 
-static int csv_grow_rows(CsvState *s) {
-    size_t nc = s->row_cap ? s->row_cap * 2 : 64;
+/* ---- Record reader (RFC 4180 quote-aware) ------------------------------- */
+
+static int csv_rec_grow(CsvState *s, size_t need) {
+    if (need < s->rec_cap) return 0;
+    size_t nc = s->rec_cap ? s->rec_cap : 256;
+    while (nc <= need) nc *= 2;
+    char *p = realloc(s->rec_buf, nc);
+    if (!p) return -1;
+    s->rec_buf = p;
+    s->rec_cap = nc;
+    return 0;
+}
+
+/* Read one logical CSV record into s->rec_buf. The record covers
+ * everything up to a newline that is OUTSIDE quotes (or EOF). Embedded
+ * quotes (`""`) and quoted-field contents are stored verbatim — field
+ * unescaping happens in parse_field below.
+ *
+ * Returns:
+ *    0 + sets *out_len  — got a record (possibly empty if blank line)
+ *   -1                  — clean EOF (no more records)
+ *   -2                  — read or OOM error                            */
+static int csv_read_record(CsvState *s, size_t *out_len) {
+    if (s->eof) return -1;
+    size_t n = 0;
+    int in_quote = 0;
+    int saw_any  = 0;
+    for (;;) {
+        int c = fgetc(s->fp);
+        if (c == EOF) {
+            s->eof = 1;
+            if (!saw_any) return -1;
+            break;
+        }
+        saw_any = 1;
+        if (csv_rec_grow(s, n + 2) != 0) return -2;
+        if (in_quote) {
+            if (c == '"') {
+                int next = fgetc(s->fp);
+                if (next == '"') {
+                    /* Escaped quote: keep both bytes; parse_field will
+                     * collapse them to a single quote during unescape. */
+                    s->rec_buf[n++] = '"';
+                    s->rec_buf[n++] = '"';
+                    continue;
+                }
+                /* Closing quote. */
+                s->rec_buf[n++] = '"';
+                in_quote = 0;
+                if (next == EOF)  { s->eof = 1; break; }
+                if (next == '\n') { s->line_no++; break; }
+                if (next == '\r') {
+                    int c2 = fgetc(s->fp);
+                    if (c2 != EOF && c2 != '\n') ungetc(c2, s->fp);
+                    s->line_no++;
+                    break;
+                }
+                if (csv_rec_grow(s, n + 1) != 0) return -2;
+                s->rec_buf[n++] = (char)next;
+                continue;
+            }
+            if (c == '\n') s->line_no++;     /* track lines inside quoted */
+            s->rec_buf[n++] = (char)c;
+            continue;
+        }
+        /* not in quote */
+        if (c == '"') {
+            in_quote = 1;
+            s->rec_buf[n++] = '"';
+            continue;
+        }
+        if (c == '\n') { s->line_no++; break; }
+        if (c == '\r') {
+            int c2 = fgetc(s->fp);
+            if (c2 != EOF && c2 != '\n') ungetc(c2, s->fp);
+            s->line_no++;
+            break;
+        }
+        s->rec_buf[n++] = (char)c;
+    }
+    if (csv_rec_grow(s, n + 1) != 0) return -2;
+    s->rec_buf[n] = '\0';
+    *out_len = n;
+    return 0;
+}
+
+/* ---- Field parser ------------------------------------------------------- */
+
+/* Parse one field from [*p, end). Allocates *out + sets *out_len with
+ * the unquoted/unescaped value. Advances *p past the trailing delimiter
+ * (or to `end` if this was the last field).
+ *
+ * Returns:
+ *    1 — consumed a delimiter (caller should expect another field)
+ *    0 — hit end-of-record (no more fields)
+ *   -1 — malformed (e.g. text after a closing quote that isn't `delim`) */
+static int csv_parse_field(const char **p, const char *end, char delim,
+                           char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    const char *q = *p;
+    int quoted = 0;
+    if (q < end && *q == '"') { quoted = 1; ++q; }
+
+    if (!quoted) {
+        const char *start = q;
+        while (q < end && *q != delim) ++q;
+        size_t len = (size_t)(q - start);
+        char *dup = malloc(len + 1);
+        if (!dup) return -1;
+        if (len) memcpy(dup, start, len);
+        dup[len] = '\0';
+        *out = dup;
+        *out_len = len;
+        if (q < end && *q == delim) { *p = q + 1; return 1; }
+        *p = q; return 0;
+    }
+    /* quoted: bytes between the opening `"` and the next unescaped `"`,
+     * with `""` collapsed to a single `"`. We allocate worst-case
+     * capacity (remaining bytes) to avoid a growth loop. */
+    size_t cap = (size_t)(end - q) + 1;
+    char *dup = malloc(cap);
+    if (!dup) return -1;
+    size_t n = 0;
+    int closed = 0;
+    while (q < end) {
+        char c = *q++;
+        if (c == '"') {
+            if (q < end && *q == '"') { dup[n++] = '"'; ++q; continue; }
+            closed = 1;
+            break;
+        }
+        dup[n++] = c;
+    }
+    dup[n] = '\0';
+    if (!closed) { free(dup); return -1; }      /* unterminated quote */
+    *out = dup;
+    *out_len = n;
+    if (q == end) { *p = q; return 0; }
+    if (*q == delim) { *p = q + 1; return 1; }
+    /* Anything else after a closing quote (other than delim or EOR) is
+     * a malformed field — RFC 4180 strict mode. */
+    free(dup); *out = NULL; *out_len = 0;
+    return -1;
+}
+
+/* Parse the *header* record: turn the bytes in s->rec_buf[0..len)
+ * into a malloc'd array of NUL-terminated names. Caller takes
+ * ownership of the array and each element. */
+static int csv_parse_header(CsvState *s, size_t rec_len,
+                            char ***out_names, size_t *out_n) {
+    const char *p   = s->rec_buf;
+    const char *end = s->rec_buf + rec_len;
+    char  **arr = NULL;
+    size_t  n   = 0, cap = 0;
+    int     more = 1;
+    while (more) {
+        char  *field = NULL;
+        size_t flen  = 0;
+        int r = csv_parse_field(&p, end, s->delim, &field, &flen);
+        if (r < 0) goto fail;
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            char **np = realloc(arr, nc * sizeof *np);
+            if (!np) { free(field); goto fail; }
+            arr = np; cap = nc;
+        }
+        arr[n++] = field;
+        more = (r == 1);
+    }
+    *out_names = arr;
+    *out_n     = n;
+    return 0;
+fail:
+    for (size_t i = 0; i < n; ++i) free(arr[i]);
+    free(arr);
+    *out_names = NULL;
+    *out_n     = 0;
+    return -1;
+}
+
+/* Pre-allocate per-column staging so the get_next loop doesn't grow
+ * mid-batch. row_cap is set to batch_size; n_rows is reset between
+ * batches. */
+static int csv_alloc_staging(CsvState *s) {
+    if (s->row_cap == s->batch_size) return 0;
     for (size_t c = 0; c < s->n_cols; ++c) {
         CsvCol *col = &s->cols[c];
         if (col->type == CSV_T_INT64) {
-            int64_t *p = realloc(col->i64_vals, nc * sizeof *p);
+            int64_t *p = realloc(col->i64_vals,
+                                 s->batch_size * sizeof *p);
             if (!p) return -1;
             col->i64_vals = p;
-        } else { /* CSV_T_UTF8 */
-            char **sp = realloc(col->u8_strs, nc * sizeof *sp);
+        } else {
+            char **sp = realloc(col->u8_strs,
+                                s->batch_size * sizeof *sp);
             if (!sp) return -1;
             col->u8_strs = sp;
-            size_t *lp = realloc(col->u8_lens, nc * sizeof *lp);
+            size_t *lp = realloc(col->u8_lens,
+                                 s->batch_size * sizeof *lp);
             if (!lp) return -1;
             col->u8_lens = lp;
         }
     }
-    s->row_cap = nc;
+    s->row_cap = s->batch_size;
     return 0;
 }
 
-/* Split a raw line into column-name strings; returns count, fills
- * out[] with strdup'd names. Caller frees on failure. */
-static int csv_split_names(const char *line, char delim, char ***out) {
-    size_t cap = 0, n = 0;
-    char **arr = NULL;
-    const char *p = line;
-    while (1) {
-        const char *start = p;
-        while (*p && *p != delim && *p != '\n' && *p != '\r') ++p;
-        size_t len = (size_t)(p - start);
-        char *name = malloc(len + 1);
-        if (!name) goto oom;
-        memcpy(name, start, len);
-        name[len] = '\0';
-        if (n == cap) {
-            size_t nc = cap ? cap * 2 : 4;
-            char **np = realloc(arr, nc * sizeof *np);
-            if (!np) { free(name); goto oom; }
-            arr = np;
-            cap = nc;
+/* Parse a *data* record into the per-column staging arrays at
+ * row_idx. Returns 0 on success, -1 on parse / type / shape error. */
+static int csv_parse_record_typed(CsvState *s, size_t rec_len,
+                                  size_t row_idx) {
+    const char *p   = s->rec_buf;
+    const char *end = s->rec_buf + rec_len;
+    size_t got  = 0;
+    int    more = 1;
+    while (more) {
+        if (got >= s->n_cols) goto bad_shape;
+        char  *field = NULL;
+        size_t flen  = 0;
+        int r = csv_parse_field(&p, end, s->delim, &field, &flen);
+        if (r < 0) goto bad_field;
+        CsvCol *col = &s->cols[got];
+        if (col->type == CSV_T_INT64) {
+            char *endp = NULL;
+            long long v = strtoll(field, &endp, 10);
+            if (endp == field || *endp != '\0') {
+                free(field);
+                goto bad_field;
+            }
+            col->i64_vals[row_idx] = (int64_t)v;
+            free(field);
+        } else {
+            col->u8_strs[row_idx] = field;
+            col->u8_lens[row_idx] = flen;
         }
-        arr[n++] = name;
-        if (*p == delim) ++p;
-        else break;
+        ++got;
+        more = (r == 1);
     }
-    *out = arr;
-    return (int)n;
-oom:
-    for (size_t i = 0; i < n; ++i) free(arr[i]);
-    free(arr);
-    *out = NULL;
+    if (got != s->n_cols) goto bad_shape;
+    return 0;
+bad_field:
+bad_shape:
+    /* Free any utf8 cells we already wrote into this row before the
+     * error so the next attempt (or destroy) doesn't double-free. */
+    for (size_t k = 0; k < got; ++k) {
+        if (s->cols[k].type == CSV_T_UTF8) {
+            free(s->cols[k].u8_strs[row_idx]);
+            s->cols[k].u8_strs[row_idx] = NULL;
+        }
+    }
     return -1;
 }
 
-/* Parse one CSV line into typed cells, storing into the per-column
- * staging arrays at row index `row_idx`. Returns 0 on success, -1 on
- * format error. Mutates `line` (NUL-terminates each field). */
-static int csv_parse_typed_row(CsvState *s, char *line, size_t row_idx) {
-    size_t got = 0;
-    char *p = line;
-    for (;;) {
-        char *start = p;
-        while (*p && *p != s->delim) ++p;
-        char saved = *p;
-        *p = '\0';
-        if (got >= s->n_cols) return -1;
-        CsvCol *col = &s->cols[got];
-        if (col->type == CSV_T_INT64) {
-            char *end = NULL;
-            long long v = strtoll(start, &end, 10);
-            if (end == start || *end != '\0') return -1;
-            col->i64_vals[row_idx] = (int64_t)v;
-        } else { /* CSV_T_UTF8 */
-            size_t len = (size_t)(p - start);
-            char *dup = malloc(len + 1);
-            if (!dup) return -1;
-            memcpy(dup, start, len);
-            dup[len] = '\0';
-            col->u8_strs[row_idx] = dup;
-            col->u8_lens[row_idx] = len;
+/* Free per-row utf8 strings stored in the staging arrays for the
+ * current batch, AFTER the Arrow leaf builder has copied them. */
+static void csv_free_batch_strings(CsvState *s) {
+    for (size_t c = 0; c < s->n_cols; ++c) {
+        CsvCol *col = &s->cols[c];
+        if (col->type != CSV_T_UTF8 || !col->u8_strs) continue;
+        for (size_t r = 0; r < s->n_rows; ++r) {
+            free(col->u8_strs[r]);
+            col->u8_strs[r] = NULL;
         }
-        ++got;
-        if (saved) ++p;
-        else break;
     }
-    return (got == s->n_cols) ? 0 : -1;
 }
 
 static void csv_state_clear_columns(CsvState *s) {
@@ -991,9 +1184,11 @@ static int csv_parse_schema(CsvState *s, const char *cfg, CsvSchemaCtx *out) {
 static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
     CsvState *s = calloc(1, sizeof *s);
     if (!s) return BETL_ERR_INTERNAL;
-    s->ctx    = ctx;
-    s->delim  = ',';
-    s->header = 1;
+    s->ctx        = ctx;
+    s->delim      = ',';
+    s->header     = 1;
+    s->batch_size = 1024;
+    s->line_no    = 0;
 
     if (json_string(cfg, "path", &s->path) != 0 || !s->path) {
         betl_set_error(ctx, "csv.read: missing required `path`");
@@ -1006,12 +1201,19 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
         free(delim_str);
     }
     /* `header` is a bool literal in JSON — extract via the same value
-     * scanner. We accept either "true" or "false" as the next 4-5 chars. */
+     * scanner. */
     {
         const char *v = json_value_after(cfg, "header");
         if (v) {
             if (strncmp(v, "false", 5) == 0) s->header = 0;
             else if (strncmp(v, "true", 4) == 0) s->header = 1;
+        }
+    }
+    /* `batch_size` int literal — anything <= 0 falls back to default. */
+    {
+        int64_t bs = 0;
+        if (json_int64(cfg, "batch_size", &bs) == 0 && bs > 0) {
+            s->batch_size = (size_t)bs;
         }
     }
 
@@ -1028,101 +1230,68 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
     }
     int schema_provided = (s->n_cols > 0);
 
-    FILE *fp = fopen(s->path, "r");
-    if (!fp) {
+    s->fp = fopen(s->path, "r");
+    if (!s->fp) {
         betl_set_error(ctx, "csv.read: cannot open %s", s->path);
         csv_state_clear_columns(s);
         free(s->path); free(s);
         return BETL_ERR_IO;
     }
-
-    char  *line = NULL;
-    size_t cap  = 0;
-    ssize_t rd;
+    s->line_no = 1;
 
     if (s->header) {
-        rd = getline(&line, &cap, fp);
-        if (rd <= 0) {
-            betl_set_error(ctx, "csv.read: empty file or read error: %s",
-                           s->path);
-            free(line); fclose(fp);
+        size_t hlen = 0;
+        int rr = csv_read_record(s, &hlen);
+        if (rr != 0) {
+            betl_set_error(ctx, "csv.read: %s reading header in %s",
+                           rr == -1 ? "empty file" : "read error", s->path);
+            fclose(s->fp); s->fp = NULL;
             csv_state_clear_columns(s);
             free(s->path); free(s);
             return BETL_ERR_IO;
         }
-        while (rd > 0 && (line[rd - 1] == '\n' || line[rd - 1] == '\r')) {
-            line[--rd] = '\0';
-        }
         if (!schema_provided) {
-            /* No schema → derive names from the header, types default to int64. */
             char **names = NULL;
-            int n = csv_split_names(line, s->delim, &names);
-            if (n < 0) {
+            size_t n = 0;
+            if (csv_parse_header(s, hlen, &names, &n) != 0 || n == 0) {
                 betl_set_error(ctx, "csv.read: failed to parse header in %s",
                                s->path);
-                free(line); fclose(fp);
+                fclose(s->fp); s->fp = NULL;
                 csv_state_clear_columns(s);
                 free(s->path); free(s);
                 return BETL_ERR_IO;
             }
-            s->n_cols = (size_t)n;
-            s->cols = calloc(s->n_cols, sizeof *s->cols);
+            s->cols = calloc(n, sizeof *s->cols);
             if (!s->cols) {
-                for (int i = 0; i < n; ++i) free(names[i]);
-                free(names); free(line); fclose(fp);
+                for (size_t i = 0; i < n; ++i) free(names[i]);
+                free(names);
+                fclose(s->fp); s->fp = NULL;
                 free(s->path); free(s);
                 return BETL_ERR_INTERNAL;
             }
-            for (size_t i = 0; i < s->n_cols; ++i) {
+            s->n_cols = n;
+            for (size_t i = 0; i < n; ++i) {
                 s->cols[i].name = names[i];
                 s->cols[i].type = CSV_T_INT64;
             }
             free(names);
         }
-        /* If schema_provided, the header line is consumed but discarded. */
+        /* If schema was provided, header was consumed but discarded. */
     } else if (!schema_provided) {
         betl_set_error(ctx, "csv.read: when header=false, a `schema:` is required");
-        free(line); fclose(fp);
+        fclose(s->fp); s->fp = NULL;
         csv_state_clear_columns(s);
         free(s->path); free(s);
         return BETL_ERR_INVALID;
     }
 
-    /* Allocate per-column staging now that we know n_cols and types. */
-    if (csv_grow_rows(s) != 0) {
-        free(line); fclose(fp);
+    /* Allocate per-column staging once at batch_size capacity. */
+    if (csv_alloc_staging(s) != 0) {
+        fclose(s->fp); s->fp = NULL;
         csv_state_clear_columns(s);
         free(s->path); free(s);
         return BETL_ERR_INTERNAL;
     }
-
-    while ((rd = getline(&line, &cap, fp)) > 0) {
-        while (rd > 0 && (line[rd - 1] == '\n' || line[rd - 1] == '\r')) {
-            line[--rd] = '\0';
-        }
-        if (rd == 0) continue;        /* skip blank lines */
-
-        if (s->n_rows == s->row_cap) {
-            if (csv_grow_rows(s) != 0) {
-                free(line); fclose(fp);
-                csv_state_clear_columns(s);
-                free(s->path); free(s);
-                return BETL_ERR_INTERNAL;
-            }
-        }
-        if (csv_parse_typed_row(s, line, s->n_rows) != 0) {
-            betl_set_error(ctx,
-                "csv.read: parse error in %s at row %zu (expected %zu cells)",
-                s->path, s->n_rows + 1, s->n_cols);
-            free(line); fclose(fp);
-            csv_state_clear_columns(s);
-            free(s->path); free(s);
-            return BETL_ERR_INVALID;
-        }
-        s->n_rows++;
-    }
-    free(line);
-    fclose(fp);
 
     *state = s;
     return BETL_OK;
@@ -1131,6 +1300,8 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
 static void csv_destroy(void *state) {
     CsvState *s = state;
     if (!s) return;
+    if (s->fp) fclose(s->fp);
+    free(s->rec_buf);
     free(s->path);
     csv_state_clear_columns(s);
     free(s);
@@ -1215,7 +1386,31 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
                                struct ArrowArray *out) {
     CsvState *s = st->private_data;
     memset(out, 0, sizeof *out);
-    if (s->emitted) return 0;     /* end-of-stream */
+    if (s->eof && s->n_rows == 0) return 0;   /* end-of-stream */
+
+    /* Fill staging up to batch_size or EOF. Blank lines (a record with
+     * length 0) are skipped, matching the previous behavior. */
+    s->n_rows = 0;
+    while (s->n_rows < s->batch_size && !s->eof) {
+        size_t rec_len = 0;
+        int rr = csv_read_record(s, &rec_len);
+        if (rr == -1) break;        /* EOF — emit whatever we have */
+        if (rr == -2) {
+            betl_set_error(s->ctx, "csv.read: I/O error reading %s", s->path);
+            return 1;
+        }
+        if (rec_len == 0) continue; /* blank line */
+        if (csv_parse_record_typed(s, rec_len, s->n_rows) != 0) {
+            betl_set_error(s->ctx,
+                "csv.read: parse error in %s near line %zu "
+                "(expected %zu fields, %s)",
+                s->path, s->line_no, s->n_cols,
+                "type or quoting mismatch");
+            return 1;
+        }
+        s->n_rows++;
+    }
+    if (s->n_rows == 0) return 0;   /* clean EOF */
 
     int64_t n = (int64_t)s->n_rows;
 
@@ -1290,7 +1485,10 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
     out->children   = kids;
     out->release    = release_array_struct;
 
-    s->emitted = 1;
+    /* csv_build_utf8_leaf copied each row's bytes into the Arrow data
+     * buffer, so the per-row scratch strings are no longer needed.
+     * Free them and reset the pointers ahead of the next batch. */
+    csv_free_batch_strings(s);
     return 0;
 }
 
@@ -1657,6 +1855,8 @@ int betl_register_builtins(BetlRegistry *r) {
     rc = betl_register_mssql(r);
     if (rc != BETL_OK) return rc;
     rc = betl_register_mssql_lookup(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_mssql_read(r);
     if (rc != BETL_OK) return rc;
 #endif
     return rc;

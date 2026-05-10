@@ -1,10 +1,18 @@
-/* `join` TRANSFORM (SPEC §4.3) — two-stream inner join.
+/* `join` TRANSFORM (SPEC §4.3) — two-stream join.
  *
- * v0.1: inner only, multi-key match via `on: { left_col: right_col }`,
- * int64 + utf8 columns, both sides materialized into per-column tables
- * (JTab) and probed with a nested loop. Output schema = left columns
- * followed by right columns; collisions on names are not renamed (use
- * `map: select:` upstream to disambiguate).
+ * v0.1.1: kinds = inner | left | outer (full outer). Multi-key match
+ * via `on: { left_col: right_col }`, int64 + utf8 columns, both sides
+ * materialized into per-column tables (JTab) and probed with a nested
+ * loop. Output schema = left columns followed by right columns;
+ * collisions on names are not renamed (use `map: select:` upstream to
+ * disambiguate).
+ *
+ * Null semantics:
+ *   inner — every output row has a value on both sides.
+ *   left  — every left row appears at least once; right cells are
+ *           NULL when no right row matched.
+ *   outer — every left row AND every right row appears at least once;
+ *           the side that didn't match is NULL.
  */
 
 #include <ctype.h>
@@ -242,8 +250,11 @@ static int join_init(BetlContext *ctx, const char *cfg, void **state) {
     betl_tx_json_string_at(cfg, "kind", &kind);
     j->kind = kind ? kind : strdup("inner");
     if (!j->kind) { free(j); return BETL_ERR_INTERNAL; }
-    if (strcmp(j->kind, "inner") != 0) {
-        jset_err(j, "join: only 'inner' supported in v0.1 (got '%s')", j->kind);
+    if (strcmp(j->kind, "inner") != 0
+        && strcmp(j->kind, "left")  != 0
+        && strcmp(j->kind, "outer") != 0)
+    {
+        jset_err(j, "join: kind must be inner|left|outer (got '%s')", j->kind);
         free(j->kind); free(j); return BETL_ERR_UNSUPPORTED;
     }
 
@@ -408,31 +419,62 @@ static int row_keys_equal(const JoinState *j, size_t lr, size_t rr) {
     return 1;
 }
 
+/* Build a validity bitmap from a nulls flag array. Returns NULL if no
+ * nulls are present (sets *out_null_count = 0); else returns a fresh
+ * bitmap with bits set for valid rows, cleared for null rows. */
+static uint8_t *join_build_validity(const uint8_t *nulls, size_t n,
+                                    int64_t *out_null_count) {
+    *out_null_count = 0;
+    if (!nulls) return NULL;
+    int64_t nc = 0;
+    for (size_t i = 0; i < n; ++i) if (nulls[i]) ++nc;
+    if (nc == 0) return NULL;
+    size_t bytes = (n + 7) / 8;
+    uint8_t *bm = malloc(bytes ? bytes : 1);
+    if (!bm) return NULL;
+    memset(bm, 0xFF, bytes ? bytes : 1);
+    for (size_t i = 0; i < n; ++i) {
+        if (nulls[i]) bm[i / 8] &= (uint8_t)~(1u << (i % 8));
+    }
+    *out_null_count = nc;
+    return bm;
+}
+
 static int join_build_int64_leaf(struct ArrowArray *out,
                                  JTab *side, int col_idx,
-                                 const size_t *rows, size_t n) {
+                                 const size_t *rows,
+                                 const uint8_t *nulls, size_t n) {
     int64_t *v = malloc((n ? n : 1) * sizeof *v);
     if (!v) return -1;
-    for (size_t i = 0; i < n; ++i) v[i] = side->i64[col_idx][rows[i]];
+    for (size_t i = 0; i < n; ++i) {
+        if (nulls && nulls[i]) v[i] = 0;
+        else                   v[i] = side->i64[col_idx][rows[i]];
+    }
+    int64_t null_count = 0;
+    uint8_t *vmap = join_build_validity(nulls, n, &null_count);
+    if (nulls && null_count > 0 && !vmap) { free(v); return -1; }
     const void **bufs = malloc(2 * sizeof *bufs);
-    if (!bufs) { free(v); return -1; }
-    bufs[0] = NULL; bufs[1] = v;
-    out->length = (int64_t)n;
-    out->n_buffers = 2;
-    out->buffers = bufs;
-    out->release = betl_tx_release_int64_leaf;
+    if (!bufs) { free(v); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = v;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = betl_tx_release_int64_leaf;
     return 0;
 }
 
 static int join_build_utf8_leaf(struct ArrowArray *out,
                                 JTab *side, int col_idx,
-                                const size_t *rows, size_t n) {
+                                const size_t *rows,
+                                const uint8_t *nulls, size_t n) {
     int32_t *offs = malloc((n + 1) * sizeof *offs);
     if (!offs) return -1;
     size_t total = 0;
     offs[0] = 0;
     for (size_t i = 0; i < n; ++i) {
-        total += side->u8l[col_idx][rows[i]];
+        size_t len = (nulls && nulls[i]) ? 0 : side->u8l[col_idx][rows[i]];
+        total += len;
         if (total > (size_t)INT32_MAX) { free(offs); return -1; }
         offs[i + 1] = (int32_t)total;
     }
@@ -440,17 +482,43 @@ static int join_build_utf8_leaf(struct ArrowArray *out,
     if (!data) { free(offs); return -1; }
     size_t pos = 0;
     for (size_t i = 0; i < n; ++i) {
+        if (nulls && nulls[i]) continue;
         size_t len = side->u8l[col_idx][rows[i]];
         if (len) memcpy(data + pos, side->u8s[col_idx][rows[i]], len);
         pos += len;
     }
+    int64_t null_count = 0;
+    uint8_t *vmap = join_build_validity(nulls, n, &null_count);
+    if (nulls && null_count > 0 && !vmap) {
+        free(offs); free(data); return -1;
+    }
     const void **bufs = malloc(3 * sizeof *bufs);
-    if (!bufs) { free(offs); free(data); return -1; }
-    bufs[0] = NULL; bufs[1] = offs; bufs[2] = data;
-    out->length = (int64_t)n;
-    out->n_buffers = 3;
-    out->buffers = bufs;
-    out->release = betl_tx_release_utf8_leaf;
+    if (!bufs) { free(offs); free(data); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = offs; bufs[2] = data;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 3;
+    out->buffers    = bufs;
+    out->release    = betl_tx_release_utf8_leaf;
+    return 0;
+}
+
+/* Pair tracker for the match loop. For inner, l_null/r_null are always
+ * 0. For left, r_null may be 1 (unmatched left rows). For outer, either
+ * may be 1 (unmatched left or unmatched right). */
+typedef struct {
+    size_t  lr;
+    size_t  rr;
+    uint8_t l_null;
+    uint8_t r_null;
+} JPair;
+
+static int jpairs_grow(JPair **arr, size_t *cap) {
+    size_t nc = *cap ? *cap * 2 : 16;
+    JPair *p = realloc(*arr, nc * sizeof **arr);
+    if (!p) return -1;
+    *arr = p;
+    *cap = nc;
     return 0;
 }
 
@@ -461,92 +529,152 @@ static int join_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
     if (join_materialize(j) != 0) return EIO;
     if (j->emitted) return 0;
 
-    /* Find all match pairs (left_row, right_row). Linear scan v0.1. */
-    size_t cap = 16, n = 0;
-    size_t *lr = malloc(cap * sizeof *lr);
-    size_t *rr = malloc(cap * sizeof *rr);
-    if (!lr || !rr) { free(lr); free(rr); jset_err(j, "join: out of memory"); return EIO; }
+    int do_left  = (strcmp(j->kind, "inner") != 0); /* left or outer */
+    int do_outer = (strcmp(j->kind, "outer") == 0);
 
+    size_t   cap = 0;
+    size_t   n   = 0;
+    JPair   *pairs = NULL;
+    uint8_t *r_matched = NULL;
+    size_t  *lr = NULL,  *rr = NULL;
+    uint8_t *ln = NULL,  *rn = NULL;
+    struct ArrowArray **kids = NULL;
+    size_t   n_total = j->L.n_cols + j->R.n_cols;
+    int      retcode = 0;
+
+    if (n_total == 0) {
+        jset_err(j, "join: no output columns");
+        retcode = EIO; goto fail;
+    }
+
+    if (jpairs_grow(&pairs, &cap) != 0) goto oom;
+
+    if (do_outer && j->R.n_rows > 0) {
+        r_matched = calloc(j->R.n_rows, 1);
+        if (!r_matched) goto oom;
+    }
+
+    /* Match loop: for each left row, find right matches; if none and
+     * mode is left/outer, emit (li, NULL). For outer, also flag matched
+     * right rows so we can emit unmatched ones afterwards. */
     for (size_t li = 0; li < j->L.n_rows; ++li) {
         if (betl_should_cancel(j->ctx)) {
-            free(lr); free(rr);
-            jset_err(j, "join: cancelled"); return EIO;
+            jset_err(j, "join: cancelled"); retcode = EIO; goto fail;
         }
+        size_t before = n;
         for (size_t ri = 0; ri < j->R.n_rows; ++ri) {
             if (!row_keys_equal(j, li, ri)) continue;
-            if (n == cap) {
-                cap *= 2;
-                size_t *nlr = realloc(lr, cap * sizeof *lr);
-                size_t *nrr = realloc(rr, cap * sizeof *rr);
-                if (!nlr || !nrr) {
-                    free(nlr ? nlr : lr); free(nrr ? nrr : rr);
-                    jset_err(j, "join: out of memory"); return EIO;
-                }
-                lr = nlr; rr = nrr;
-            }
-            lr[n] = li; rr[n] = ri; ++n;
+            if (n == cap && jpairs_grow(&pairs, &cap) != 0) goto oom;
+            pairs[n].lr     = li;
+            pairs[n].rr     = ri;
+            pairs[n].l_null = 0;
+            pairs[n].r_null = 0;
+            ++n;
+            if (r_matched) r_matched[ri] = 1;
+        }
+        if (do_left && n == before) {
+            if (n == cap && jpairs_grow(&pairs, &cap) != 0) goto oom;
+            pairs[n].lr     = li;
+            pairs[n].rr     = 0;
+            pairs[n].l_null = 0;
+            pairs[n].r_null = 1;
+            ++n;
         }
     }
+    if (do_outer) {
+        for (size_t ri = 0; ri < j->R.n_rows; ++ri) {
+            if (r_matched[ri]) continue;
+            if (n == cap && jpairs_grow(&pairs, &cap) != 0) goto oom;
+            pairs[n].lr     = 0;
+            pairs[n].rr     = ri;
+            pairs[n].l_null = 1;
+            pairs[n].r_null = 0;
+            ++n;
+        }
+    }
+    free(r_matched);
+    r_matched = NULL;
 
-    size_t n_total = j->L.n_cols + j->R.n_cols;
-    if (n_total == 0) {
-        free(lr); free(rr);
-        jset_err(j, "join: no output columns");
-        return EIO;
+    /* Materialize parallel arrays for the leaf builders. l_null is only
+     * needed when outer (left side may be null); r_null when left or
+     * outer (right side may be null). For inner, both stay NULL. */
+    size_t alloc_n = n ? n : 1;
+    lr = malloc(alloc_n * sizeof *lr);
+    rr = malloc(alloc_n * sizeof *rr);
+    if (!lr || !rr) goto oom;
+    if (do_outer) { ln = calloc(alloc_n, 1); if (!ln) goto oom; }
+    if (do_left)  { rn = calloc(alloc_n, 1); if (!rn) goto oom; }
+    for (size_t i = 0; i < n; ++i) {
+        lr[i] = pairs[i].lr;
+        rr[i] = pairs[i].rr;
+        if (ln) ln[i] = pairs[i].l_null;
+        if (rn) rn[i] = pairs[i].r_null;
     }
-    struct ArrowArray **kids = calloc(n_total, sizeof *kids);
-    if (!kids) {
-        free(lr); free(rr);
-        jset_err(j, "join: out of memory"); return EIO;
-    }
+    free(pairs);
+    pairs = NULL;
+
+    kids = calloc(n_total, sizeof *kids);
+    if (!kids) goto oom;
     for (size_t c = 0; c < n_total; ++c) {
         kids[c] = calloc(1, sizeof **kids);
+        if (!kids[c]) goto oom;
         int rc;
         if (c < j->L.n_cols) {
             int idx = (int)c;
             rc = (j->L.fmts[idx] == 'l')
-                 ? join_build_int64_leaf(kids[c], &j->L, idx, lr, n)
-                 : join_build_utf8_leaf (kids[c], &j->L, idx, lr, n);
+                 ? join_build_int64_leaf(kids[c], &j->L, idx, lr, ln, n)
+                 : join_build_utf8_leaf (kids[c], &j->L, idx, lr, ln, n);
         } else {
             int idx = (int)(c - j->L.n_cols);
             rc = (j->R.fmts[idx] == 'l')
-                 ? join_build_int64_leaf(kids[c], &j->R, idx, rr, n)
-                 : join_build_utf8_leaf (kids[c], &j->R, idx, rr, n);
+                 ? join_build_int64_leaf(kids[c], &j->R, idx, rr, rn, n)
+                 : join_build_utf8_leaf (kids[c], &j->R, idx, rr, rn, n);
         }
-        if (!kids[c] || rc != 0) {
-            free(kids[c]);
-            for (size_t k = 0; k < c; ++k) {
-                if (kids[k]->release) kids[k]->release(kids[k]);
-                free(kids[k]);
-            }
-            free(kids); free(lr); free(rr);
+        if (rc != 0) {
             jset_err(j, "join: failed to build output column");
-            return EIO;
+            retcode = EIO;
+            goto fail;
         }
     }
-    free(lr); free(rr);
 
-    const void **outer = malloc(1 * sizeof *outer);
-    if (!outer) {
-        for (size_t c = 0; c < n_total; ++c) {
-            if (kids[c]->release) kids[c]->release(kids[c]);
-            free(kids[c]);
-        }
-        free(kids);
-        jset_err(j, "join: out of memory"); return EIO;
+    {
+        const void **outer = malloc(1 * sizeof *outer);
+        if (!outer) goto oom;
+        outer[0] = NULL;
+        out->length     = (int64_t)n;
+        out->null_count = 0;
+        out->n_buffers  = 1;
+        out->n_children = (int64_t)n_total;
+        out->buffers    = outer;
+        out->children   = kids;
+        out->release    = betl_tx_release_struct;
     }
-    outer[0] = NULL;
 
-    out->length     = (int64_t)n;
-    out->null_count = 0;
-    out->n_buffers  = 1;
-    out->n_children = (int64_t)n_total;
-    out->buffers    = outer;
-    out->children   = kids;
-    out->release    = betl_tx_release_struct;
-
+    free(lr); free(rr); free(ln); free(rn);
     j->emitted = 1;
     return 0;
+
+oom:
+    jset_err(j, "join: out of memory");
+    retcode = EIO;
+fail:
+    /* Centralized cleanup. Each kids[c] is either NULL (never built),
+     * fully built (has a release callback), or freshly calloc'd with no
+     * release set yet (release == NULL); the conditional on `release`
+     * makes the iteration safe in all three cases. */
+    free(pairs);
+    free(r_matched);
+    free(lr); free(rr); free(ln); free(rn);
+    if (kids) {
+        for (size_t c = 0; c < n_total; ++c) {
+            if (kids[c]) {
+                if (kids[c]->release) kids[c]->release(kids[c]);
+                free(kids[c]);
+            }
+        }
+        free(kids);
+    }
+    return retcode ? retcode : EIO;
 }
 
 static const char *join_get_last_error(struct ArrowArrayStream *st) {

@@ -144,6 +144,7 @@ if(ODBC_FOUND)
     target_sources(betl_core PRIVATE
         src/runtime/mssql_upsert.c
         src/runtime/mssql_lookup.c
+        src/runtime/mssql_read.c
     )
     target_link_libraries(betl_core PUBLIC betl_odbc)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_ODBC)

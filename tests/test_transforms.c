@@ -453,6 +453,91 @@ static const char PL_JOIN_INT64[] =
     "        from: jn\n"
     "        expect: 3\n";
 
+/* Layout used by LEFT / OUTER cases below:
+ *   left:  lid in {0, 1, 2, 3}    (4 rows, gen_int64 row_count=4 start=0)
+ *   right: rid in {2, 3, 4}       (3 rows, gen_int64 row_count=3 start=2)
+ *
+ *   inner matches: lid=2,3 → 2 rows
+ *   left  -> 2 matches + 2 left-only (lid=0,1) = 4 rows
+ *   outer -> same 4 + 1 right-only (rid=4)     = 5 rows
+ */
+static const char PL_JOIN_LEFT[] =
+    "betl: 1\n"
+    "name: tx-join-left\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: left_src\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "        column: lid\n"
+    "      - id: right_src\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 3\n"
+    "        start: 2\n"
+    "        column: rid\n"
+    "      - id: jn\n"
+    "        type: join\n"
+    "        kind: left\n"
+    "        from: [left_src, right_src]\n"
+    "        on: { lid: rid }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: jn\n"
+    "        expect: 4\n";
+
+static const char PL_JOIN_OUTER[] =
+    "betl: 1\n"
+    "name: tx-join-outer\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: left_src\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "        column: lid\n"
+    "      - id: right_src\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 3\n"
+    "        start: 2\n"
+    "        column: rid\n"
+    "      - id: jn\n"
+    "        type: join\n"
+    "        kind: outer\n"
+    "        from: [left_src, right_src]\n"
+    "        on: { lid: rid }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: jn\n"
+    "        expect: 5\n";
+
+/* Bad kind value: must produce a parse-time error. */
+static const char PL_JOIN_BAD_KIND[] =
+    "betl: 1\n"
+    "name: tx-join-bad-kind\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: left_src\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "        column: lid\n"
+    "      - id: right_src\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "        column: rid\n"
+    "      - id: jn\n"
+    "        type: join\n"
+    "        kind: cross\n"
+    "        from: [left_src, right_src]\n"
+    "        on: { lid: rid }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: jn\n";
+
 /* csv.read with a `schema:` block: loads a mixed-type file and pipes
  * the utf8 column through a filter predicate. %s is replaced with the
  * absolute path to the fixture at test time. */
@@ -732,6 +817,8 @@ int main(int argc, char **argv) {
         { "agg-two-groups",        PL_AGG_TWO_GROUPS        },
         { "sort-utf8",             PL_SORT_UTF8             },
         { "join-int64",            PL_JOIN_INT64            },
+        { "join-left",             PL_JOIN_LEFT             },
+        { "join-outer",            PL_JOIN_OUTER            },
     };
 
     /* csv.read typed: substitute the fixture path into the template. */
@@ -786,6 +873,61 @@ int main(int argc, char **argv) {
         fclose(log);
     }
 
+    /* outer join + lua.map log: verify the four expected lid/rid pairs
+     * appear, including the unmatched ones (which lua sees as nil). */
+    {
+        char err[512] = {0};
+        FILE *log = tmpfile();
+        static const char PL_OUTER_LOG[] =
+            "betl: 1\n"
+            "name: tx-join-outer-log\n"
+            "pipeline:\n"
+            "  - id: stage_one\n"
+            "    type: dataflow\n"
+            "    steps:\n"
+            "      - id: left_src\n"
+            "        type: betl.gen_int64\n"
+            "        row_count: 4\n"
+            "        column: lid\n"
+            "      - id: right_src\n"
+            "        type: betl.gen_int64\n"
+            "        row_count: 3\n"
+            "        start: 2\n"
+            "        column: rid\n"
+            "      - id: jn\n"
+            "        type: join\n"
+            "        kind: outer\n"
+            "        from: [left_src, right_src]\n"
+            "        on: { lid: rid }\n"
+            "      - id: probe\n"
+            "        type: lua.map\n"
+            "        from: jn\n"
+            "        script: |\n"
+            "          log.info('row lid=' .. tostring(row.lid) "
+            ".. ' rid=' .. tostring(row.rid))\n"
+            "          return row\n"
+            "      - id: sink\n"
+            "        type: betl.count_rows\n"
+            "        from: probe\n"
+            "        expect: 5\n";
+        int rc = run_yaml_log(plugin_path, PL_OUTER_LOG, err, sizeof err, log);
+        if (rc != BETL_OK) fprintf(stderr, "outer-log failed: %s\n", err);
+        CHECK(rc == BETL_OK);
+        char *txt = slurp_file(log);
+        if (txt) {
+            /* Matches: lid=2 rid=2, lid=3 rid=3 */
+            CHECK(strstr(txt, "row lid=2 rid=2") != NULL);
+            CHECK(strstr(txt, "row lid=3 rid=3") != NULL);
+            /* Left-only (rid is null): lid=0,1 */
+            CHECK(strstr(txt, "row lid=0 rid=nil") != NULL);
+            CHECK(strstr(txt, "row lid=1 rid=nil") != NULL);
+            /* Right-only (lid is null): rid=4 */
+            CHECK(strstr(txt, "row lid=nil rid=4") != NULL);
+            free(txt);
+        }
+        fclose(log);
+    }
+
     /* Cases that should fail with a specific error keyword. */
     struct {
         const char *name;
@@ -800,6 +942,8 @@ int main(int argc, char **argv) {
           "group_by column 'no_such' not found" },
         { "agg-bad-agg", PL_AGG_BAD_AGG,
           "unsupported agg" },
+        { "join-bad-kind", PL_JOIN_BAD_KIND,
+          "kind must be inner|left|outer" },
     };
     for (size_t i = 0; i < sizeof fail_cases / sizeof fail_cases[0]; ++i) {
         char err[512] = {0};
