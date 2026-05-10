@@ -102,12 +102,43 @@ static int step_index(const BetlStage *s, const char *id) {
     return -1;
 }
 
+/* Split a `from:` ref of the form "step_id" or "step_id:port_name".
+ * Writes the step part into `step_buf` (NUL-terminated, must hold at
+ * least 128 chars), and sets *port_name_out to the port suffix or NULL
+ * if absent. Returns 0 on success, -1 on truncation. */
+static int split_input_ref(const char *ref, char *step_buf,
+                           const char **port_name_out) {
+    const char *colon = strchr(ref, ':');
+    if (!colon) {
+        size_t len = strlen(ref);
+        if (len >= 128) return -1;
+        memcpy(step_buf, ref, len + 1);
+        *port_name_out = NULL;
+        return 0;
+    }
+    size_t step_len = (size_t)(colon - ref);
+    if (step_len == 0 || step_len >= 128) return -1;
+    memcpy(step_buf, ref, step_len);
+    step_buf[step_len] = '\0';
+    const char *port = colon + 1;
+    if (*port == '\0') return -1;       /* "step:" with empty port */
+    *port_name_out = port;
+    return 0;
+}
+
+static int step_index_ref(const BetlStage *s, const char *ref) {
+    char step_buf[128];
+    const char *port = NULL;
+    if (split_input_ref(ref, step_buf, &port) != 0) return -1;
+    return step_index(s, step_buf);
+}
+
 static void step_incoming(int i, int *out, size_t *out_count, void *user) {
     const StepCtx *c = user;
     const BetlDataflowStep *step = &c->s->steps[i];
     *out_count = 0;
     for (size_t k = 0; k < step->input_count; ++k) {
-        int idx = step_index(c->s, step->inputs[k]);
+        int idx = step_index_ref(c->s, step->inputs[k]);
         if (idx >= 0 && *out_count < 64) out[(*out_count)++] = idx;
     }
 }
@@ -159,9 +190,16 @@ static int run_task_stage(BetlContext *ctx, BetlRegistry *reg,
 typedef struct {
     const BetlComponentDef *def;
     void                   *state;
-    struct ArrowArrayStream output;     /* populated if def->attach_output ran */
-    int                     output_attached;
-    int                     destroyed;
+    /* One stream slot per declared output port. attach_output() is
+     * called lazily — only when a downstream step actually references
+     * a given port via `from: step:port`. Slots stay zeroed for ports
+     * with no consumer. After ownership is transferred to a downstream
+     * (attach_input), output_attached[i] flips back to 0 so cleanup
+     * doesn't double-release. */
+    struct ArrowArrayStream *outputs;        /* [n_output_ports] */
+    int                     *output_attached;/* [n_output_ports] */
+    size_t                   n_output_ports;
+    int                      destroyed;
 } StepRunner;
 
 static int run_dataflow_stage(BetlContext *ctx, BetlRegistry *reg,
@@ -215,6 +253,19 @@ static int run_dataflow_stage(BetlContext *ctx, BetlRegistry *reg,
             rc = BETL_ERR_INVALID;
             goto cleanup;
         }
+        /* Pre-allocate per-output slots (lazily attached). For sinks
+         * with output_count == 0 we leave outputs == NULL. */
+        if (def->output_count > 0) {
+            runners[i].outputs = calloc(def->output_count,
+                                        sizeof *runners[i].outputs);
+            runners[i].output_attached = calloc(def->output_count,
+                                                sizeof *runners[i].output_attached);
+            if (!runners[i].outputs || !runners[i].output_attached) {
+                rc = BETL_ERR_INTERNAL;
+                goto cleanup;
+            }
+            runners[i].n_output_ports = def->output_count;
+        }
         char sub_err[256];
         char *resolved = betl_substitute_refs(
             st->config_json ? st->config_json : "{}",
@@ -230,31 +281,93 @@ static int run_dataflow_stage(BetlContext *ctx, BetlRegistry *reg,
         if (rc != BETL_OK) goto cleanup;
     }
 
-    /* Walk in topo order: for each step, attach inputs from upstream
-     * outputs, then call attach_output to populate THIS step's output. */
+    /* Walk in topo order: for each step, lazy-attach the specific
+     * upstream port each input refers to, then forward it as input. */
     for (int oi = 0; oi < (int)s->step_count; ++oi) {
         int i = order[oi];
         const BetlDataflowStep *st = &s->steps[i];
         StepRunner *r = &runners[i];
 
-        /* attach_input from each declared upstream, by port order. */
         for (size_t pi = 0; pi < st->input_count; ++pi) {
-            int up = step_index(s, st->inputs[pi]);
-            if (up < 0) {
+            char step_buf[128];
+            const char *port_name = NULL;
+            if (split_input_ref(st->inputs[pi], step_buf, &port_name) != 0) {
                 betl_set_error(ctx,
-                    "stage '%s' step '%s': upstream '%s' missing",
+                    "stage '%s' step '%s': malformed `from:` ref '%s'",
                     s->id, st->id, st->inputs[pi]);
                 rc = BETL_ERR_INVALID;
                 goto cleanup;
             }
-            StepRunner *upr = &runners[up];
-            if (!upr->output_attached) {
+            int up = step_index(s, step_buf);
+            if (up < 0) {
                 betl_set_error(ctx,
-                    "stage '%s' step '%s': upstream '%s' has no output stream",
-                    s->id, st->id, s->steps[up].id);
-                rc = BETL_ERR_INTERNAL;
+                    "stage '%s' step '%s': upstream '%s' missing",
+                    s->id, st->id, step_buf);
+                rc = BETL_ERR_INVALID;
                 goto cleanup;
             }
+            StepRunner *upr = &runners[up];
+
+            /* Resolve port_name → port_idx on the upstream. Empty /
+             * absent → port 0 (the default first output). Otherwise
+             * defer to the component's output_port_index callback if
+             * set, else accept the name only when it equals the static
+             * outputs[0].name. */
+            int port_idx = 0;
+            if (port_name) {
+                if (upr->def->output_port_index) {
+                    port_idx = upr->def->output_port_index(upr->state, port_name);
+                } else if (upr->def->outputs && upr->def->output_count > 0
+                           && upr->def->outputs[0].name
+                           && strcmp(upr->def->outputs[0].name, port_name) == 0) {
+                    port_idx = 0;
+                } else {
+                    port_idx = -1;
+                }
+                if (port_idx < 0) {
+                    betl_set_error(ctx,
+                        "stage '%s' step '%s': upstream '%s' has no output port '%s'",
+                        s->id, st->id, s->steps[up].id, port_name);
+                    rc = BETL_ERR_INVALID;
+                    goto cleanup;
+                }
+            }
+            if ((size_t)port_idx >= upr->n_output_ports) {
+                betl_set_error(ctx,
+                    "stage '%s' step '%s': upstream '%s' port index %d out of range",
+                    s->id, st->id, s->steps[up].id, port_idx);
+                rc = BETL_ERR_INVALID;
+                goto cleanup;
+            }
+
+            /* Lazy attach this specific port if not yet attached. A
+             * port may be referenced by multiple downstream consumers
+             * — but since attach_input transfers ownership, only one
+             * consumer can own a given upstream port. We catch the
+             * second consumer below with a clear error. */
+            if (!upr->output_attached[port_idx]) {
+                if (!upr->def->attach_output) {
+                    betl_set_error(ctx,
+                        "stage '%s' step '%s': upstream '%s' lacks attach_output",
+                        s->id, st->id, s->steps[up].id);
+                    rc = BETL_ERR_INVALID;
+                    goto cleanup;
+                }
+                rc = upr->def->attach_output(upr->state, port_idx,
+                                             &upr->outputs[port_idx]);
+                if (rc != BETL_OK) goto cleanup;
+                upr->output_attached[port_idx] = 1;
+            } else if (upr->outputs[port_idx].private_data == NULL) {
+                /* Already transferred to an earlier consumer. */
+                betl_set_error(ctx,
+                    "stage '%s' step '%s': upstream '%s' port '%s' already "
+                    "consumed (each output port can have at most one consumer)",
+                    s->id, st->id, s->steps[up].id,
+                    port_name ? port_name : "<default>");
+                rc = BETL_ERR_INVALID;
+                goto cleanup;
+            }
+
             if (!r->def->attach_input) {
                 betl_set_error(ctx,
                     "stage '%s' step '%s': component lacks attach_input",
@@ -262,25 +375,14 @@ static int run_dataflow_stage(BetlContext *ctx, BetlRegistry *reg,
                 rc = BETL_ERR_INVALID;
                 goto cleanup;
             }
-            rc = r->def->attach_input(r->state, (int)pi, &upr->output);
+            rc = r->def->attach_input(r->state, (int)pi,
+                                      &upr->outputs[port_idx]);
             if (rc != BETL_OK) goto cleanup;
-            /* Ownership transferred to downstream. */
-            upr->output_attached = 0;
-            memset(&upr->output, 0, sizeof upr->output);
-        }
-
-        /* attach_output unless this is a sink */
-        if (r->def->kind != BETL_KIND_SINK) {
-            if (!r->def->attach_output) {
-                betl_set_error(ctx,
-                    "stage '%s' step '%s': component lacks attach_output",
-                    s->id, st->id);
-                rc = BETL_ERR_INVALID;
-                goto cleanup;
-            }
-            rc = r->def->attach_output(r->state, 0, &r->output);
-            if (rc != BETL_OK) goto cleanup;
-            r->output_attached = 1;
+            /* attach_input transferred the buffers + release into the
+             * downstream's own state; mark the slot empty so cleanup
+             * doesn't double-release. */
+            upr->output_attached[port_idx] = 0;
+            memset(&upr->outputs[port_idx], 0, sizeof upr->outputs[port_idx]);
         }
     }
 
@@ -301,10 +403,14 @@ static int run_dataflow_stage(BetlContext *ctx, BetlRegistry *reg,
     }
 
 cleanup:
-    /* Release any outputs that were populated but never consumed. */
+    /* Release any per-port outputs that were attached but never
+     * consumed by a downstream step. */
     for (size_t i = 0; i < s->step_count; ++i) {
-        if (runners[i].output_attached && runners[i].output.release) {
-            runners[i].output.release(&runners[i].output);
+        for (size_t p = 0; p < runners[i].n_output_ports; ++p) {
+            if (runners[i].output_attached[p]
+                && runners[i].outputs[p].release) {
+                runners[i].outputs[p].release(&runners[i].outputs[p]);
+            }
         }
     }
     /* Destroy every initialized state, in reverse-init order. */
@@ -314,6 +420,8 @@ cleanup:
             runners[k].def->destroy(runners[k].state);
             runners[k].destroyed = 1;
         }
+        free(runners[k].outputs);
+        free(runners[k].output_attached);
     }
     free(runners);
     free(order);

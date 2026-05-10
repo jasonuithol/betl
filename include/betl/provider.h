@@ -426,8 +426,26 @@ typedef struct {
     int  (*txn_commit)(void *state);
     int  (*txn_abort) (void *state);
 
+    /* --- Optional: dynamic output port lookup --------------------------- *
+     *
+     * Components with multiple, configuration-determined output ports
+     * (canonical example: `conditional_split`) implement this to map a
+     * user-supplied port name from `from: step:port_name` into a port
+     * index suitable for `attach_output`. Returns the index on success,
+     * -1 if the name is not recognized.
+     *
+     * Components with a single, statically-named output don't need this:
+     * the host treats an empty / missing port suffix as port 0, and a
+     * named suffix that matches `outputs[0].name` as port 0.
+     *
+     * Called after init() and before any attach_output() — the state is
+     * fully populated. Must be idempotent and side-effect-free; the host
+     * may call it multiple times for the same name.
+     */
+    int  (*output_port_index)(void *state, const char *port_name);
+
     /* Reserved for forward compatibility. Must be zero-initialized. */
-    void *_reserved[8];
+    void *_reserved[7];
 } BetlComponentDef;
 
 

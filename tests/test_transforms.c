@@ -718,6 +718,140 @@ static const char PL_LIMIT_NO_N[] =
     "        type: betl.count_rows\n"
     "        from: lim\n";
 
+/* conditional_split: gen_int64(6) → ids 0..5. Cases:
+ *   hot:  row.id > 3   → ids 4, 5
+ *   cold: row.id < 2   → ids 0, 1
+ *   default: rest     → ids 2, 3
+ * Each port consumed by its own count_rows sink. */
+static const char PL_SPLIT_BASIC[] =
+    "betl: 1\n"
+    "name: tx-split-basic\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 6\n"
+    "      - id: split\n"
+    "        type: conditional_split\n"
+    "        from: source\n"
+    "        cases:\n"
+    "          - { name: hot,  where: \"row.id > 3\" }\n"
+    "          - { name: cold, where: \"row.id < 2\" }\n"
+    "        default: rest\n"
+    "      - id: sink_hot\n"
+    "        type: betl.count_rows\n"
+    "        from: split:hot\n"
+    "        expect: 2\n"
+    "      - id: sink_cold\n"
+    "        type: betl.count_rows\n"
+    "        from: split:cold\n"
+    "        expect: 2\n"
+    "      - id: sink_rest\n"
+    "        type: betl.count_rows\n"
+    "        from: split:rest\n"
+    "        expect: 2\n";
+
+/* No default port: rows that don't match any case are dropped. */
+static const char PL_SPLIT_NO_DEFAULT[] =
+    "betl: 1\n"
+    "name: tx-split-no-default\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 5\n"
+    "      - id: split\n"
+    "        type: conditional_split\n"
+    "        from: source\n"
+    "        cases:\n"
+    "          - { name: low,  where: \"row.id < 2\" }\n"
+    "          - { name: high, where: \"row.id > 3\" }\n"
+    "      - id: sink_low\n"
+    "        type: betl.count_rows\n"
+    "        from: split:low\n"
+    "        expect: 2\n"
+    "      - id: sink_high\n"
+    "        type: betl.count_rows\n"
+    "        from: split:high\n"
+    "        expect: 1\n";
+
+/* First-match wins: a row matching both cases goes only to the
+ * first one. id in [0..3]; case A is row.id < 3 (matches 0,1,2),
+ * case B is row.id < 2 (would match 0,1 but those are claimed by A
+ * already → expect 0 rows). */
+static const char PL_SPLIT_FIRST_WINS[] =
+    "betl: 1\n"
+    "name: tx-split-first-wins\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "      - id: split\n"
+    "        type: conditional_split\n"
+    "        from: source\n"
+    "        cases:\n"
+    "          - { name: a, where: \"row.id < 3\" }\n"
+    "          - { name: b, where: \"row.id < 2\" }\n"
+    "        default: rest\n"
+    "      - id: sink_a\n"
+    "        type: betl.count_rows\n"
+    "        from: split:a\n"
+    "        expect: 3\n"
+    "      - id: sink_b\n"
+    "        type: betl.count_rows\n"
+    "        from: split:b\n"
+    "        expect: 0\n"
+    "      - id: sink_rest\n"
+    "        type: betl.count_rows\n"
+    "        from: split:rest\n"
+    "        expect: 1\n";
+
+/* Reference an unknown port name from a downstream step. */
+static const char PL_SPLIT_BAD_PORT[] =
+    "betl: 1\n"
+    "name: tx-split-bad-port\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: split\n"
+    "        type: conditional_split\n"
+    "        from: source\n"
+    "        cases:\n"
+    "          - { name: a, where: \"row.id > 0\" }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: split:no_such_port\n";
+
+/* Empty cases list — must reject at init. */
+static const char PL_SPLIT_NO_CASES[] =
+    "betl: 1\n"
+    "name: tx-split-no-cases\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: split\n"
+    "        type: conditional_split\n"
+    "        from: source\n"
+    "        cases: []\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: split:any\n";
+
 /* limit with n=0 — must reject. */
 static const char PL_LIMIT_BAD_N[] =
     "betl: 1\n"
@@ -1023,6 +1157,9 @@ int main(int argc, char **argv) {
         { "distinct-keyed",        PL_DISTINCT_KEYED        },
         { "limit-trim",            PL_LIMIT_TRIM            },
         { "limit-overshoot",       PL_LIMIT_OVERSHOOT       },
+        { "split-basic",           PL_SPLIT_BASIC           },
+        { "split-no-default",      PL_SPLIT_NO_DEFAULT      },
+        { "split-first-wins",      PL_SPLIT_FIRST_WINS      },
     };
 
     /* csv.read typed: substitute the fixture path into the template. */
@@ -1156,6 +1293,10 @@ int main(int argc, char **argv) {
           "required `n:`" },
         { "limit-bad-n", PL_LIMIT_BAD_N,
           "must be a positive integer" },
+        { "split-bad-port", PL_SPLIT_BAD_PORT,
+          "no output port 'no_such_port'" },
+        { "split-no-cases", PL_SPLIT_NO_CASES,
+          "`cases:` list is empty" },
     };
     for (size_t i = 0; i < sizeof fail_cases / sizeof fail_cases[0]; ++i) {
         char err[512] = {0};

@@ -707,6 +707,22 @@ static int find_step_index(const BetlStage *s, const char *id) {
     return -1;
 }
 
+/* `from:` items are either "step_id" or "step_id:port_name" — the
+ * port suffix selects a specific output of a multi-output upstream
+ * (canonical example: conditional_split). Strip the suffix and look
+ * up the step part. Returns -1 on shape errors (empty step, oversized
+ * step name) so the caller reports a clean error. */
+static int find_step_index_ref(const BetlStage *s, const char *ref) {
+    const char *colon = strchr(ref, ':');
+    if (!colon) return find_step_index(s, ref);
+    size_t step_len = (size_t)(colon - ref);
+    if (step_len == 0 || step_len >= 128) return -1;
+    char buf[128];
+    memcpy(buf, ref, step_len);
+    buf[step_len] = '\0';
+    return find_step_index(s, buf);
+}
+
 static int check_after_refs(Ctx *ctx, const BetlPipeline *p) {
     for (size_t i = 0; i < p->stage_count; ++i) {
         const BetlStage *s = &p->stages[i];
@@ -733,16 +749,17 @@ static int check_from_refs(Ctx *ctx, const BetlStage *s) {
         const BetlDataflowStep *step = &s->steps[i];
         for (size_t k = 0; k < step->input_count; ++k) {
             const char *ref = step->inputs[k];
-            if (strcmp(ref, step->id) == 0) {
-                err_at(ctx, step->line, step->column,
-                       "stage '%s': step '%s' references itself in `from:`",
-                       s->id, step->id);
-                return -1;
-            }
-            if (find_step_index(s, ref) < 0) {
+            int up = find_step_index_ref(s, ref);
+            if (up < 0) {
                 err_at(ctx, step->line, step->column,
                        "stage '%s': step '%s' references undefined sibling '%s' in `from:`",
                        s->id, step->id, ref);
+                return -1;
+            }
+            if (up == (int)i) {
+                err_at(ctx, step->line, step->column,
+                       "stage '%s': step '%s' references itself in `from:`",
+                       s->id, step->id);
                 return -1;
             }
         }
@@ -796,7 +813,7 @@ static int dfs_step(Ctx *ctx, const BetlStage *s, int idx,
     state[idx] = 1;
     const BetlDataflowStep *step = &s->steps[idx];
     for (size_t k = 0; k < step->input_count; ++k) {
-        int nxt = find_step_index(s, step->inputs[k]);
+        int nxt = find_step_index_ref(s, step->inputs[k]);
         if (nxt >= 0 && dfs_step(ctx, s, nxt, state) != 0) return -1;
     }
     state[idx] = 2;

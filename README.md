@@ -103,6 +103,7 @@ upserts).
 | TRANSFORM | `union` | ✓ | N-input vertical concat; schemas must match |
 | TRANSFORM | `distinct` | ✓ | Drop duplicate rows; optional `keys:` subset |
 | TRANSFORM | `limit` | ✓ | Keep first N rows |
+| TRANSFORM | `conditional_split` | ✓ | Multi-output router; `from: split:case_name` |
 | TRANSFORM | `postgres.lookup` | ✓ | Cached SELECT + linear probe; on_miss error/null/drop |
 | TRANSFORM | `mssql.lookup` | ✓ | Same model over ODBC |
 | TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return |
@@ -113,10 +114,6 @@ upserts).
 ### Missing on purpose at v0.1
 
 - No `parquet.*`, no `kafka.*`.
-- No `conditional_split` (the SSIS multi-output router). The current
-  executor only attaches one output port per step — proper multi-output
-  needs a parser + executor extension. The same effect can be achieved
-  today with `map` (add a case-name column) + `filter` (one per branch).
 - No `pivot` / `unpivot` reshape, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.

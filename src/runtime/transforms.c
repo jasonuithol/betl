@@ -26,5 +26,6 @@ int betl_register_transforms(BetlRegistry *r) {
     rc = betl_tx_register_union(r);     if (rc != BETL_OK) return rc;
     rc = betl_tx_register_distinct(r);  if (rc != BETL_OK) return rc;
     rc = betl_tx_register_limit(r);     if (rc != BETL_OK) return rc;
+    rc = betl_tx_register_split(r);     if (rc != BETL_OK) return rc;
     return BETL_OK;
 }

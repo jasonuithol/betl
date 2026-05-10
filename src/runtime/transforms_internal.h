@@ -97,6 +97,7 @@ int betl_tx_register_join     (BetlRegistry *r);
 int betl_tx_register_union    (BetlRegistry *r);
 int betl_tx_register_distinct (BetlRegistry *r);
 int betl_tx_register_limit    (BetlRegistry *r);
+int betl_tx_register_split    (BetlRegistry *r);
 
 #ifdef __cplusplus
 }
