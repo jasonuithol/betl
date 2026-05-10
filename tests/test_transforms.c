@@ -538,6 +538,205 @@ static const char PL_JOIN_BAD_KIND[] =
     "        type: betl.count_rows\n"
     "        from: jn\n";
 
+/* union: three int64 streams of size 2 → 6 rows total. */
+static const char PL_UNION_INT64[] =
+    "betl: 1\n"
+    "name: tx-union-int64\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: a\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "        start: 0\n"
+    "      - id: b\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "        start: 10\n"
+    "      - id: c\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "        start: 20\n"
+    "      - id: u\n"
+    "        type: union\n"
+    "        from: [a, b, c]\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: u\n"
+    "        expect: 6\n";
+
+/* union with mismatched schemas: int64 stream + utf8 stream → error. */
+static const char PL_UNION_BAD_SCHEMA[] =
+    "betl: 1\n"
+    "name: tx-union-bad-schema\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: a\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "      - id: b\n"
+    "        type: betl.gen_strings\n"
+    "        row_count: 2\n"
+    "      - id: u\n"
+    "        type: union\n"
+    "        from: [a, b]\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: u\n";
+
+/* distinct: union the same gen twice (5 rows each → 10), then dedupe.
+ * Default keys = all columns → expect 5 unique. */
+static const char PL_DISTINCT_ALL[] =
+    "betl: 1\n"
+    "name: tx-distinct-all\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: a\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 5\n"
+    "      - id: b\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 5\n"
+    "      - id: u\n"
+    "        type: union\n"
+    "        from: [a, b]\n"
+    "      - id: dd\n"
+    "        type: distinct\n"
+    "        from: u\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: dd\n"
+    "        expect: 5\n";
+
+/* distinct with explicit keys: gen_strings has int64 id + utf8 name
+ * with prefix. Same gen twice via union → 6 rows; dedupe by `name`
+ * column → 3 unique names (row_0, row_1, row_2 each once). */
+static const char PL_DISTINCT_KEYED[] =
+    "betl: 1\n"
+    "name: tx-distinct-keyed\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: a\n"
+    "        type: betl.gen_strings\n"
+    "        row_count: 3\n"
+    "      - id: b\n"
+    "        type: betl.gen_strings\n"
+    "        row_count: 3\n"
+    "      - id: u\n"
+    "        type: union\n"
+    "        from: [a, b]\n"
+    "      - id: dd\n"
+    "        type: distinct\n"
+    "        from: u\n"
+    "        keys: [name]\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: dd\n"
+    "        expect: 3\n";
+
+/* distinct with a key that doesn't exist on the input. */
+static const char PL_DISTINCT_BAD_KEY[] =
+    "betl: 1\n"
+    "name: tx-distinct-bad-key\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: dd\n"
+    "        type: distinct\n"
+    "        from: source\n"
+    "        keys: [no_such]\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: dd\n";
+
+/* limit: 10 rows in, n=3 → 3 rows out. */
+static const char PL_LIMIT_TRIM[] =
+    "betl: 1\n"
+    "name: tx-limit-trim\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 10\n"
+    "      - id: lim\n"
+    "        type: limit\n"
+    "        from: source\n"
+    "        n: 3\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: lim\n"
+    "        expect: 3\n";
+
+/* limit n bigger than the stream — pass everything through. */
+static const char PL_LIMIT_OVERSHOOT[] =
+    "betl: 1\n"
+    "name: tx-limit-overshoot\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "      - id: lim\n"
+    "        type: limit\n"
+    "        from: source\n"
+    "        n: 100\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: lim\n"
+    "        expect: 4\n";
+
+/* limit with missing n — config error. */
+static const char PL_LIMIT_NO_N[] =
+    "betl: 1\n"
+    "name: tx-limit-no-n\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: lim\n"
+    "        type: limit\n"
+    "        from: source\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: lim\n";
+
+/* limit with n=0 — must reject. */
+static const char PL_LIMIT_BAD_N[] =
+    "betl: 1\n"
+    "name: tx-limit-bad-n\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: lim\n"
+    "        type: limit\n"
+    "        from: source\n"
+    "        n: 0\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: lim\n";
+
 /* csv.read with a `schema:` block: loads a mixed-type file and pipes
  * the utf8 column through a filter predicate. %s is replaced with the
  * absolute path to the fixture at test time. */
@@ -819,6 +1018,11 @@ int main(int argc, char **argv) {
         { "join-int64",            PL_JOIN_INT64            },
         { "join-left",             PL_JOIN_LEFT             },
         { "join-outer",            PL_JOIN_OUTER            },
+        { "union-int64",           PL_UNION_INT64           },
+        { "distinct-all",          PL_DISTINCT_ALL          },
+        { "distinct-keyed",        PL_DISTINCT_KEYED        },
+        { "limit-trim",            PL_LIMIT_TRIM            },
+        { "limit-overshoot",       PL_LIMIT_OVERSHOOT       },
     };
 
     /* csv.read typed: substitute the fixture path into the template. */
@@ -944,6 +1148,14 @@ int main(int argc, char **argv) {
           "unsupported agg" },
         { "join-bad-kind", PL_JOIN_BAD_KIND,
           "kind must be inner|left|outer" },
+        { "union-bad-schema", PL_UNION_BAD_SCHEMA,
+          "schema differs from input 0" },
+        { "distinct-bad-key", PL_DISTINCT_BAD_KEY,
+          "key column 'no_such' not found" },
+        { "limit-no-n", PL_LIMIT_NO_N,
+          "required `n:`" },
+        { "limit-bad-n", PL_LIMIT_BAD_N,
+          "must be a positive integer" },
     };
     for (size_t i = 0; i < sizeof fail_cases / sizeof fail_cases[0]; ++i) {
         char err[512] = {0};

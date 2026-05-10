@@ -118,6 +118,9 @@ add_library(betl_core STATIC
     src/runtime/transform_aggregate.c
     src/runtime/transform_sort.c
     src/runtime/transform_join.c
+    src/runtime/transform_union.c
+    src/runtime/transform_distinct.c
+    src/runtime/transform_limit.c
     src/yaml/yaml_load.c
 )
 target_include_directories(betl_core PUBLIC

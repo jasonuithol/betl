@@ -182,115 +182,8 @@ static int ensure_compiled(FilterState *f, struct ArrowSchema *schema) {
 
 /* Build a length-N int64 leaf containing only rows from `src` where
  * keep[i] != 0 (n_kept rows total). */
-static int build_int64_filtered(struct ArrowArray *out,
-                                const struct ArrowArray *src,
-                                const uint8_t *keep, size_t n_rows,
-                                size_t n_kept) {
-    int64_t *vals = malloc((n_kept ? n_kept : 1) * sizeof *vals);
-    if (!vals) return -1;
-    size_t bytes = (n_kept + 7) / 8;
-    uint8_t *vmap = malloc(bytes ? bytes : 1);
-    if (!vmap) { free(vals); return -1; }
-    memset(vmap, 0xFF, bytes ? bytes : 1);
-
-    int64_t null_count = 0;
-    const uint8_t *src_valid = (src->null_count > 0) ? src->buffers[0] : NULL;
-    const int64_t *src_vals  = src->buffers[1];
-    size_t off = (size_t)src->offset;
-    size_t w = 0;
-    for (size_t i = 0; i < n_rows; ++i) {
-        if (!keep[i]) continue;
-        size_t row = i + off;
-        int is_null = src_valid && !betl_tx_bit_at(src_valid, row);
-        if (is_null) {
-            vmap[w / 8] &= (uint8_t)~(1u << (w % 8));
-            ++null_count;
-        } else {
-            vals[w] = src_vals[row];
-        }
-        ++w;
-    }
-    if (null_count == 0) { free(vmap); vmap = NULL; }
-
-    const void **bufs = malloc(2 * sizeof *bufs);
-    if (!bufs) { free(vals); free(vmap); return -1; }
-    bufs[0] = vmap;
-    bufs[1] = vals;
-
-    out->length     = (int64_t)n_kept;
-    out->null_count = null_count;
-    out->offset     = 0;
-    out->n_buffers  = 2;
-    out->n_children = 0;
-    out->buffers    = bufs;
-    out->release    = betl_tx_release_int64_leaf;
-    return 0;
-}
-
-/* Same shape for utf8: walk kept rows, copy strings into a fresh data
- * buffer, build offsets[n_kept+1]. */
-static int build_utf8_filtered(struct ArrowArray *out,
-                               const struct ArrowArray *src,
-                               const uint8_t *keep, size_t n_rows,
-                               size_t n_kept) {
-    const uint8_t *src_valid = (src->null_count > 0) ? src->buffers[0] : NULL;
-    const int32_t *src_off   = src->buffers[1];
-    const char    *src_data  = src->buffers[2];
-    size_t off = (size_t)src->offset;
-
-    /* First pass: total bytes for kept non-null strings. */
-    size_t total = 0;
-    for (size_t i = 0; i < n_rows; ++i) {
-        if (!keep[i]) continue;
-        size_t row = i + off;
-        if (src_valid && !betl_tx_bit_at(src_valid, row)) continue;
-        total += (size_t)(src_off[row + 1] - src_off[row]);
-    }
-
-    int32_t *offs = malloc((n_kept + 1) * sizeof *offs);
-    char    *data = malloc(total ? total : 1);
-    size_t bytes  = (n_kept + 7) / 8;
-    uint8_t *vmap = malloc(bytes ? bytes : 1);
-    if (!offs || !data || !vmap) {
-        free(offs); free(data); free(vmap); return -1;
-    }
-    memset(vmap, 0xFF, bytes ? bytes : 1);
-    offs[0] = 0;
-
-    int64_t null_count = 0;
-    size_t  pos = 0;
-    size_t  w   = 0;
-    for (size_t i = 0; i < n_rows; ++i) {
-        if (!keep[i]) continue;
-        size_t row = i + off;
-        if (src_valid && !betl_tx_bit_at(src_valid, row)) {
-            vmap[w / 8] &= (uint8_t)~(1u << (w % 8));
-            ++null_count;
-        } else {
-            size_t slen = (size_t)(src_off[row + 1] - src_off[row]);
-            if (slen) memcpy(data + pos, src_data + src_off[row], slen);
-            pos += slen;
-        }
-        offs[w + 1] = (int32_t)pos;
-        ++w;
-    }
-    if (null_count == 0) { free(vmap); vmap = NULL; }
-
-    const void **bufs = malloc(3 * sizeof *bufs);
-    if (!bufs) { free(offs); free(data); free(vmap); return -1; }
-    bufs[0] = vmap;
-    bufs[1] = offs;
-    bufs[2] = data;
-
-    out->length     = (int64_t)n_kept;
-    out->null_count = null_count;
-    out->offset     = 0;
-    out->n_buffers  = 3;
-    out->n_children = 0;
-    out->buffers    = bufs;
-    out->release    = betl_tx_release_utf8_leaf;
-    return 0;
-}
+/* Row-mask leaf builders moved to transforms_common.c — shared with
+ * distinct, limit, and conditional_split. */
 
 static int filt_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
     FilterState *f = st->private_data;
@@ -376,11 +269,11 @@ static int filt_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         kids[c] = calloc(1, sizeof **kids);
         int crc;
         if (f->col_fmts[c] == 'l') {
-            crc = build_int64_filtered(kids[c], in_arr.children[c],
-                                       keep, length, n_kept);
+            crc = betl_tx_build_int64_filtered(kids[c], in_arr.children[c],
+                                               keep, length, n_kept);
         } else {
-            crc = build_utf8_filtered (kids[c], in_arr.children[c],
-                                       keep, length, n_kept);
+            crc = betl_tx_build_utf8_filtered (kids[c], in_arr.children[c],
+                                               keep, length, n_kept);
         }
         if (crc != 0) {
             free(kids[c]);

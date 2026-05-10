@@ -60,6 +60,26 @@ struct ArrowSchema *betl_tx_new_leaf_schema(const char *name,
                                             const char *format);
 
 
+/* ---- Row-mask leaf builders ------------------------------------------- */
+
+/* Build a fresh int64 / utf8 leaf containing only the rows of `src`
+ * for which `keep[i]` != 0. n_rows is the input length, n_kept the
+ * count of rows kept (caller-precomputed). Validity bits are
+ * preserved from src. Returns 0 on success, -1 on OOM.
+ *
+ * Used by filter, distinct, limit, and conditional_split — all four
+ * follow the "input batch + keep mask → smaller output batch" shape.
+ */
+int betl_tx_build_int64_filtered(struct ArrowArray *out,
+                                 const struct ArrowArray *src,
+                                 const uint8_t *keep, size_t n_rows,
+                                 size_t n_kept);
+int betl_tx_build_utf8_filtered (struct ArrowArray *out,
+                                 const struct ArrowArray *src,
+                                 const uint8_t *keep, size_t n_rows,
+                                 size_t n_kept);
+
+
 /* ---- Bit helpers ------------------------------------------------------ */
 
 static inline int betl_tx_bit_at(const uint8_t *bm, size_t i) {
@@ -74,6 +94,9 @@ int betl_tx_register_map      (BetlRegistry *r);
 int betl_tx_register_aggregate(BetlRegistry *r);
 int betl_tx_register_sort     (BetlRegistry *r);
 int betl_tx_register_join     (BetlRegistry *r);
+int betl_tx_register_union    (BetlRegistry *r);
+int betl_tx_register_distinct (BetlRegistry *r);
+int betl_tx_register_limit    (BetlRegistry *r);
 
 #ifdef __cplusplus
 }
