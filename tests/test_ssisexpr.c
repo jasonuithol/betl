@@ -1153,11 +1153,13 @@ int main(int argc, char **argv) {
     }
 
     /* --- 39: DT_DBTIME cast ------------------------------------------- *
-     * Parses HH:MM:SS to int64 micros-of-day. */
+     * Parses HH:MM:SS to int64 micros-of-day (VK_TIME_US). Output as
+     * `l` flows the raw micros; output as `u` stringifies as HH:MM:SS
+     * — matching SSIS' (DT_WSTR) (DT_DBTIME) behaviour. */
     {
         struct ArrowArray out = {0};
         rc = compile_eval(eng, ctx, &schema, &batch,
-                          "(DT_DBTIME) \"12:34:56\"", "l", &out);
+                          "(DT_I8) (DT_DBTIME) \"12:34:56\"", "l", &out);
         CHECK(rc == BETL_OK);
         if (out.length == 3) {
             /* 12*3600 + 34*60 + 56 = 45296 seconds → 45_296_000_000 us */
@@ -1166,22 +1168,58 @@ int main(int argc, char **argv) {
         if (out.release) out.release(&out);
     }
     {
-        /* With fractional seconds. */
+        /* With fractional seconds — and stringification matches SSIS. */
         struct ArrowArray out = {0};
         rc = compile_eval(eng, ctx, &schema, &batch,
-                          "(DT_DBTIME) \"00:00:01.500000\"", "l", &out);
+                          "(DT_WSTR) (DT_DBTIME) \"00:00:01.500000\"", "u", &out);
         CHECK(rc == BETL_OK);
-        if (out.length == 3) CHECK(get_i64(&out, 0) == 1500000LL);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 15);
+            CHECK(memcmp(dat + off[0], "00:00:01.500000", 15) == 0);
+        }
         if (out.release) out.release(&out);
     }
     {
-        /* DT_DBTIME2 is an alias. */
+        /* DT_DBTIME2 alias; stringify drops the fractional part when zero. */
         struct ArrowArray out = {0};
         rc = compile_eval(eng, ctx, &schema, &batch,
-                          "(DT_DBTIME2) \"23:59:59\"", "l", &out);
+                          "(DT_WSTR) (DT_DBTIME2) \"23:59:59\"", "u", &out);
         CHECK(rc == BETL_OK);
-        if (out.length == 3) {
-            CHECK(get_i64(&out, 0) == 86399000000LL);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 8);
+            CHECK(memcmp(dat + off[0], "23:59:59", 8) == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* (DT_DBTIME) on a full timestamp extracts the time-of-day. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR) (DT_DBTIME) (DT_DBTIMESTAMP) \"2025-06-01 13:30:45\"",
+                          "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 8);
+            CHECK(memcmp(dat + off[0], "13:30:45", 8) == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Time-vs-time comparison works on VK_TIME_US. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DBTIME) \"09:00:00\" < (DT_DBTIME) \"17:00:00\"",
+                          "b", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const uint8_t *bm = out.buffers[1];
+            CHECK(bit_is_set(bm, 0));
         }
         if (out.release) out.release(&out);
     }
@@ -1189,6 +1227,18 @@ int main(int argc, char **argv) {
         /* Out-of-range rejects. */
         void *h = NULL;
         rc = eng->compile(ctx, "(DT_DBTIME) \"25:00:00\"", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "u", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        /* Arithmetic on a time value is not allowed (no useful semantics). */
+        void *h = NULL;
+        rc = eng->compile(ctx,
+            "(DT_DBTIME) \"01:00:00\" + (DT_DBTIME) \"02:00:00\"",
+            &schema, &h);
         CHECK(rc == BETL_OK);
         struct ArrowArray out = {0};
         rc = eng->evaluate(h, &batch, "l", &out);

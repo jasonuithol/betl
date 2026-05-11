@@ -1189,6 +1189,7 @@ typedef enum {
     VK_INT64, VK_FLOAT64, VK_UTF8, VK_BOOL,
     VK_DATE32,         /* int32 days since 1970-01-01; stored in i64 */
     VK_TIMESTAMP_US,   /* int64 micros since 1970-01-01 UTC; stored in i64 */
+    VK_TIME_US,        /* int64 micros-of-day; stored in i64 */
     VK_DECIMAL128,     /* int128 fixed-scale; stored in d128 + dec_scale */
     VK_UUID,           /* 16 raw bytes; stored in `uuid` (zero-copy into batch) */
     VK_BYTES,          /* variable-length binary; stored in `str` + `str_n` */
@@ -1291,6 +1292,10 @@ static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, int dec_scale,
         case 'T': {
             const int64_t *v = col->buffers[1];
             out->kind = VK_TIMESTAMP_US; out->i64 = v[row]; return 0;
+        }
+        case 'M': {
+            const int64_t *v = col->buffers[1];
+            out->kind = VK_TIME_US; out->i64 = v[row]; return 0;
         }
         case 'N': {
             const i128 *v = col->buffers[1];
@@ -1422,6 +1427,14 @@ static int op_arith(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Valu
         return 0;
     }
 
+    /* After string/bool/decimal handling, only numeric kinds should
+     * reach the int/float fallthrough. Anything else (temporal, time-
+     * of-day, uuid, bytes) would silently read uninitialised f64. */
+    if ((a.kind != VK_INT64 && a.kind != VK_FLOAT64) ||
+        (b.kind != VK_INT64 && b.kind != VK_FLOAT64)) {
+        return eval_err(E, "arithmetic on this type not supported");
+    }
+
     if (a.kind == VK_INT64) {
         switch (op) {
             case OP_ADD: out->kind = VK_INT64; out->i64 = a.i64 + b.i64; return 0;
@@ -1494,6 +1507,16 @@ static int cmp_values(Eval *E, const Value *a, const Value *b, int *out_cmp) {
         double bd = decimal_to_double(b->d128, b->dec_scale);
         *out_cmp = (ad > bd) - (ad < bd);
         return 0;
+    }
+    /* Time-of-day: only compares against another time. Comparing
+     * time-of-day with a full timestamp doesn't have a defined meaning
+     * (different epochs), so we reject that explicitly. */
+    if (a->kind == VK_TIME_US && b->kind == VK_TIME_US) {
+        *out_cmp = (a->i64 > b->i64) - (a->i64 < b->i64);
+        return 0;
+    }
+    if (a->kind == VK_TIME_US || b->kind == VK_TIME_US) {
+        return eval_err(E, "cannot compare DT_DBTIME with non-time value");
     }
     /* Temporal: same kind compares i64 directly; date vs timestamp
      * promotes date → timestamp (midnight). */
@@ -1738,6 +1761,20 @@ static int fmt_ts_iso(int64_t us, char *buf, size_t cap) {
         n = snprintf(buf, cap, "%04d-%02u-%02u %02d:%02d:%02d.%06d",
                      y, m, d, hh, mm, ss, frac);
     }
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return n;
+}
+
+/* Format int64 micros-of-day as HH:MM:SS[.uuuuuu]. */
+static int fmt_time_iso(int64_t us_of_day, char *buf, size_t cap) {
+    if (us_of_day < 0 || us_of_day >= 86400000000LL) return -1;
+    int hh = (int)(us_of_day / 3600000000LL);
+    int mm = (int)((us_of_day / 60000000LL) % 60);
+    int ss = (int)((us_of_day / 1000000LL) % 60);
+    int frac = (int)(us_of_day % 1000000LL);
+    int n;
+    if (frac == 0) n = snprintf(buf, cap, "%02d:%02d:%02d", hh, mm, ss);
+    else           n = snprintf(buf, cap, "%02d:%02d:%02d.%06d", hh, mm, ss, frac);
     if (n < 0 || (size_t)n >= cap) return -1;
     return n;
 }
@@ -2006,6 +2043,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
         if (in->kind == VK_INT64)        out->i64 = in->i64;
         else if (in->kind == VK_FLOAT64) out->i64 = (int64_t)in->f64;
         else if (in->kind == VK_BOOL)    out->i64 = in->b ? 1 : 0;
+        else if (in->kind == VK_TIME_US) out->i64 = in->i64;  /* raw micros-of-day */
         else if (in->kind == VK_UTF8) {
             char tmp[64];
             size_t n = in->str_n < sizeof tmp - 1 ? in->str_n : sizeof tmp - 1;
@@ -2067,6 +2105,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
         else if (in->kind == VK_BOOL)        n = snprintf(buf, sizeof buf, "%s", in->b ? "True" : "False");
         else if (in->kind == VK_DATE32)       n = fmt_date_iso((int32_t)in->i64, buf, sizeof buf);
         else if (in->kind == VK_TIMESTAMP_US) n = fmt_ts_iso  (in->i64,           buf, sizeof buf);
+        else if (in->kind == VK_TIME_US)      n = fmt_time_iso(in->i64,           buf, sizeof buf);
         else if (in->kind == VK_DECIMAL128)   n = format_decimal(in->d128, in->dec_scale, buf, sizeof buf);
         else if (in->kind == VK_UUID) {
             n = format_uuid(in->uuid, buf, sizeof buf);
@@ -2132,13 +2171,18 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
     }
     if (to_time) {
-        /* Result is int64 micros-of-day. The engine has no distinct
-         * time-of-day kind, so stringifying via (DT_WSTR) gives the raw
-         * micros — use DATEPART or pipe to a `ttu` sink for HH:MM:SS
-         * output. ttu source columns already arrive as int64 (see
-         * cache_schema), so (DT_DBTIME) on a time column is identity. */
-        out->kind = VK_INT64;
-        if (in->kind == VK_INT64) { out->i64 = in->i64; return 0; }
+        /* VK_TIME_US holds int64 micros-of-day. (DT_WSTR) on the result
+         * formats as HH:MM:SS via fmt_time_iso, matching SSIS. */
+        out->kind = VK_TIME_US;
+        if (in->kind == VK_TIME_US)   { out->i64 = in->i64; return 0; }
+        if (in->kind == VK_INT64)     { out->i64 = in->i64; return 0; }
+        if (in->kind == VK_TIMESTAMP_US) {
+            /* Extract time-of-day from a full timestamp. */
+            int32_t days; int64_t us_of_day;
+            split_ts(in->i64, &days, &us_of_day);
+            out->i64 = us_of_day;
+            return 0;
+        }
         if (in->kind == VK_UTF8) {
             int64_t us;
             if (parse_iso_time(in->str, in->str_n, &us) != 0)
@@ -2146,7 +2190,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             out->i64 = us;
             return 0;
         }
-        return eval_err(E, "cast non-string/non-int -> DT_DBTIME not supported");
+        return eval_err(E, "cast non-string/non-temporal -> DT_DBTIME not supported");
     }
     if (to_bytes) {
         out->kind = VK_BYTES;
@@ -3061,7 +3105,7 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
         else if (strcmp(fmt, "tdD") == 0) e->col_fmts[i] = 'D';
         else if (strcmp(fmt, "tsu:") == 0) e->col_fmts[i] = 'T';
         else if (strcmp(fmt, "tsu:UTC") == 0) e->col_fmts[i] = 'T'; /* same int64 layout */
-        else if (strcmp(fmt, "ttu") == 0)     e->col_fmts[i] = 'l'; /* time = int64 micros */
+        else if (strcmp(fmt, "ttu") == 0)     e->col_fmts[i] = 'M'; /* time-of-day, int64 micros */
         else if (strcmp(fmt, "w:16") == 0)    e->col_fmts[i] = 'U';
         else if (strcmp(fmt, "z") == 0)       e->col_fmts[i] = 'B';
         else if (strncmp(fmt, "d:", 2) == 0) {
@@ -3175,6 +3219,7 @@ static int format_to_lmtype(const char *fmt, LmType *out) {
 /* Forward decls for stringify helpers used by store_value's UTF8 path. */
 static int fmt_date_iso(int32_t days, char *buf, size_t cap);
 static int fmt_ts_iso  (int64_t us,   char *buf, size_t cap);
+static int fmt_time_iso(int64_t us_of_day, char *buf, size_t cap);
 
 /* Coerce one Value into the LmCol's slot for row_idx. is_null already handled. */
 static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value *v) {
@@ -3183,6 +3228,7 @@ static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value
             if (v->kind == VK_INT64)        col->i64_vals[row_idx] = v->i64;
             else if (v->kind == VK_FLOAT64) col->i64_vals[row_idx] = (int64_t)v->f64;
             else if (v->kind == VK_BOOL)    col->i64_vals[row_idx] = v->b ? 1 : 0;
+            else if (v->kind == VK_TIME_US) col->i64_vals[row_idx] = v->i64;
             else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to int64"); return -1; }
             return 0;
         case LM_T_FLOAT64:
@@ -3229,6 +3275,7 @@ static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value
                 else if (v->kind == VK_BOOL)        n = snprintf(buf, sizeof buf, "%s", v->b ? "True" : "False");
                 else if (v->kind == VK_DATE32)       n = fmt_date_iso((int32_t)v->i64, buf, sizeof buf);
                 else if (v->kind == VK_TIMESTAMP_US) n = fmt_ts_iso  (v->i64,           buf, sizeof buf);
+                else if (v->kind == VK_TIME_US)      n = fmt_time_iso(v->i64,           buf, sizeof buf);
                 if (n < 0) { betl_set_error(ctx, "ssisexpr: stringify error"); return -1; }
                 if (lm_col_append_string(col, buf, (size_t)n, row_idx) != 0) {
                     betl_set_error(ctx, "ssisexpr: out of memory"); return -1;

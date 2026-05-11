@@ -87,7 +87,7 @@ underlying Arrow value kinds.
 | `DT_NUMERIC`     | `d:p,s` (decimal128) | decimal128 | int128 + scale. `(DT_NUMERIC, p, s)` cast accepts string / int / float / existing decimal (with rescale). `DT_DECIMAL` is an accepted alias. |
 | `DT_GUID`        | `w:16` (fixed_binary[16]) | uuid | 16 raw bytes; canonical `xxxxxxxx-xxxx-...` text form on cast to/from string. |
 | `DT_BYTES`       | `z` (binary) | bytes | Variable-length byte arrays. Lower-case hex on cast to/from string. `DT_IMAGE` is an accepted alias. |
-| `DT_DBTIME`      | `ttu` (time_us) | int64 | Time-of-day cast — parses `HH:MM:SS[.uuuuuu]` to int64 micros-of-day. Result is plain int64 (no distinct time kind), so stringifying via `(DT_WSTR)` gives the raw micros; pipe to a `ttu` sink for `HH:MM:SS` output. `DT_DBTIME2` is an accepted alias. |
+| `DT_DBTIME`      | `ttu` (time_us) | time_us | Time-of-day; int64 micros-of-day under the hood. `(DT_DBTIME)` parses `HH:MM:SS[.uuuuuu]`, extracts the time portion of a `DT_DBTIMESTAMP`, or passes a `ttu` source column through. `(DT_WSTR)` formats as `HH:MM:SS` (fractional part omitted when zero), matching SSIS. Time-vs-time comparisons work; arithmetic isn't defined. `DT_DBTIME2` is an accepted alias. |
 
 Time-zone-aware timestamps flow into the engine as the same int64
 microseconds-since-epoch UTC values as plain timestamps (Arrow
