@@ -280,9 +280,10 @@ static PgColType arrow_to_pg(const char *fmt) {
     if (strcmp(fmt, "g")    == 0) return PG_FLOAT64;
     if (strcmp(fmt, "u")    == 0) return PG_UTF8;
     if (strcmp(fmt, "b")    == 0) return PG_BOOL;
-    if (strcmp(fmt, "tdD")  == 0) return PG_DATE32;
-    if (strcmp(fmt, "tsu:") == 0) return PG_TIMESTAMP_US;
-    if (strncmp(fmt, "d:", 2) == 0) return PG_DECIMAL128;
+    if (strcmp(fmt, "tdD")     == 0) return PG_DATE32;
+    if (strcmp(fmt, "tsu:")    == 0) return PG_TIMESTAMP_US;
+    if (strcmp(fmt, "tsu:UTC") == 0) return PG_TIMESTAMP_US;  /* UTC-pinned */
+    if (strncmp(fmt, "d:", 2)  == 0) return PG_DECIMAL128;
     return PG_UNSUPPORTED;
 }
 
@@ -545,6 +546,12 @@ static int pg_sink_run(void *state) {
 
     /* --- BEGIN, PREPARE, then per-row PQexecPrepared, then COMMIT --- */
     rc = pg_exec_simple(s->conn, "BEGIN", s->ctx, "BEGIN");
+    if (rc == BETL_OK) {
+        /* Pin the transaction's TZ to UTC so text-mode TIMESTAMP /
+         * TIMESTAMPTZ parameters are interpreted deterministically. */
+        rc = pg_exec_simple(s->conn, "SET LOCAL TIME ZONE 'UTC'",
+                            s->ctx, "SET LOCAL TIME ZONE 'UTC'");
+    }
     if (rc != BETL_OK) { free(sql_buf.data); goto cleanup_pre; }
 
     {

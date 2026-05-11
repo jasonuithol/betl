@@ -47,6 +47,70 @@ int betl_parse_iso_date(const char *s, size_t n, int32_t *out_days) {
     return 0;
 }
 
+/* Find the boundary between the seconds (possibly fractional) and an
+ * optional tz suffix. Returns the length of the no-tz prefix, plus the
+ * offset-from-UTC in micros via *out_offset_us (0 if no tz / UTC). */
+static int split_tz(const char *s, size_t n, size_t *out_prefix,
+                    int64_t *out_offset_us) {
+    /* Walk from the end looking for `Z`, `+` or `-`. The earlier
+     * `YYYY-MM-DD` has `-`s but those are within the first 10 chars
+     * which we won't touch. */
+    *out_offset_us = 0;
+    if (n == 0) { *out_prefix = 0; return -1; }
+    if (s[n - 1] == 'Z') {
+        *out_prefix = n - 1;
+        return 0;
+    }
+    /* Search past position 19 (the seconds index) for + or -. */
+    size_t i = (n > 19) ? 19 : n;
+    while (i < n) {
+        char c = s[i];
+        if (c == '+' || c == '-') {
+            *out_prefix = i;
+            int sign = (c == '+') ? 1 : -1;
+            size_t r = n - i - 1;
+            int hh = 0, mm = 0;
+            if (r == 2) {                                /* +HH */
+                if (s[i+1] < '0' || s[i+1] > '9' || s[i+2] < '0' || s[i+2] > '9')
+                    return -1;
+                hh = (s[i+1]-'0')*10 + (s[i+2]-'0');
+            } else if (r == 4) {                          /* +HHMM */
+                for (int k = 0; k < 4; ++k)
+                    if (s[i+1+k] < '0' || s[i+1+k] > '9') return -1;
+                hh = (s[i+1]-'0')*10 + (s[i+2]-'0');
+                mm = (s[i+3]-'0')*10 + (s[i+4]-'0');
+            } else if (r == 5 && s[i+3] == ':') {        /* +HH:MM */
+                if (s[i+1] < '0' || s[i+1] > '9' || s[i+2] < '0' || s[i+2] > '9'
+                 || s[i+4] < '0' || s[i+4] > '9' || s[i+5] < '0' || s[i+5] > '9')
+                    return -1;
+                hh = (s[i+1]-'0')*10 + (s[i+2]-'0');
+                mm = (s[i+4]-'0')*10 + (s[i+5]-'0');
+            } else {
+                return -1;
+            }
+            if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return -1;
+            *out_offset_us = (int64_t)sign *
+                ((int64_t)hh * 3600000000LL + (int64_t)mm * 60000000LL);
+            return 0;
+        }
+        ++i;
+    }
+    /* No tz suffix found — treat input as already UTC. */
+    *out_prefix = n;
+    return 0;
+}
+
+int betl_parse_iso_tstz(const char *s, size_t n, int64_t *out_us) {
+    size_t prefix = 0;
+    int64_t offset_us = 0;
+    if (split_tz(s, n, &prefix, &offset_us) != 0) return -1;
+    int64_t local_us;
+    if (betl_parse_iso_ts(s, prefix, &local_us) != 0) return -1;
+    /* Local-with-offset → UTC: subtract the offset. */
+    *out_us = local_us - offset_us;
+    return 0;
+}
+
 int betl_parse_iso_ts(const char *s, size_t n, int64_t *out_us) {
     if (n < 19) return -1;
     int32_t days;

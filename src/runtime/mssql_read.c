@@ -127,6 +127,8 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
     case SQL_TYPE_TIMESTAMP:     /* MSSQL DATETIME / DATETIME2 */
     case SQL_TIMESTAMP:          /* older ODBC alias */
         *out = 'T'; return 0;
+    case -155:                   /* SQL_SS_TIMESTAMPOFFSET (MS extension) */
+        *out = 'Z'; return 0;
     case SQL_DECIMAL:
     case SQL_NUMERIC:
         *out = 'N'; return 0;
@@ -463,7 +465,7 @@ static int msr_resolve_schema(MsReadState *s) {
             betl_set_error(s->ctx, "mssql.read: out of memory");
             return -1;
         }
-        if (fmt == 'l' || fmt == 'T') {
+        if (fmt == 'l' || fmt == 'T' || fmt == 'Z') {
             s->cols[c].i64_vals = malloc(s->batch_size * sizeof(int64_t));
             if (!s->cols[c].i64_vals) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
@@ -664,6 +666,7 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
             case 'l': fmt = "l";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
+            case 'Z': fmt = "tsu:UTC"; break;
             case 'N':
                 fmt = strdup(s->col_fmt_strings[i]);
                 owned = 1;
@@ -712,6 +715,56 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
 /* Read one cell from the current row into the column's staging slot. */
 static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
     MsReadCol *col = &s->cols[c];
+    if (s->col_fmts[c] == 'Z') {
+        /* DATETIMEOFFSET via SQL_C_CHAR: comes back as e.g.
+         * "2026-05-11 10:30:00.123456 +05:30". Strip the offset and
+         * normalize to UTC micros. */
+        SQLCHAR buf[64];
+        SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                      SQL_C_CHAR, buf, sizeof buf, &ind))) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(datetimeoffset) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row]    = 1;
+            col->i64_vals[row] = 0;
+        } else {
+            /* SQL Server emits " " before the offset; trim trailing spaces
+             * and embed-`+` as a tz separator. The shared parser handles
+             * the space-then-sign layout too if we collapse to one space. */
+            size_t blen = (size_t)ind;
+            int64_t us;
+            if (betl_parse_iso_tstz((const char *)buf, blen, &us) != 0) {
+                /* Try after stripping the space before the offset. */
+                char tmp[80];
+                size_t out = 0;
+                int saw_sign = 0;
+                for (size_t i = 0; i < blen && out + 1 < sizeof tmp; ++i) {
+                    char ch = (char)buf[i];
+                    if (!saw_sign && (ch == '+' || ch == '-') && i >= 19) {
+                        /* drop any whitespace just before */
+                        while (out > 0 && tmp[out - 1] == ' ') --out;
+                        saw_sign = 1;
+                    }
+                    tmp[out++] = ch;
+                }
+                tmp[out] = '\0';
+                if (betl_parse_iso_tstz(tmp, out, &us) != 0) {
+                    betl_set_error(s->ctx,
+                        "mssql.read: row %zu col '%s': '%.*s' is not a "
+                        "valid DATETIMEOFFSET",
+                        row, s->col_names[c], (int)blen, (const char *)buf);
+                    return -1;
+                }
+            }
+            col->nulls[row]    = 0;
+            col->i64_vals[row] = us;
+        }
+        return 0;
+    }
     if (s->col_fmts[c] == 'N') {
         /* Fetch as text — driver formats as "[-]ddd[.ddd...]" with the
          * column's scale. Parse with our shared decimal helper. */
@@ -904,7 +957,7 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
         int rc;
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T' || s->col_fmts[c] == 'Z') {
             rc = msr_build_int64_leaf(kids[c], s->cols[c].i64_vals,
                                       s->cols[c].nulls, (size_t)n);
         } else if (s->col_fmts[c] == 'D') {

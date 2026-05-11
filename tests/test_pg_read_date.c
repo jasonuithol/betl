@@ -173,28 +173,57 @@ int main(void) {
     if (stream.release) stream.release(&stream);
     src->destroy(st);
 
-    /* And — a TIMESTAMPTZ column should be rejected with a clear error. */
+    /* TIMESTAMPTZ now comes back as Arrow "tsu:UTC" — the source's
+     * session is pinned to UTC so values normalise deterministically. */
     snprintf(ddl, sizeof ddl,
         "CREATE TABLE %s.events_tz (id bigint, ev timestamptz)", schema);
     if (pg_exec(c, ddl) == 0) {
+        snprintf(ddl, sizeof ddl,
+            "INSERT INTO %s.events_tz VALUES "
+            "  (1, TIMESTAMP WITH TIME ZONE '2026-05-11 10:30:00+00'),"
+            "  (2, TIMESTAMP WITH TIME ZONE '2026-05-11 12:00:00+05:30')",
+            schema);
+        pg_exec(c, ddl);
         char cfg2[256];
         snprintf(cfg2, sizeof cfg2,
             "{\"connection\":\"warehouse\","
-            " \"query\":\"SELECT id, ev FROM %s.events_tz\"}", schema);
+            " \"query\":\"SELECT id, ev FROM %s.events_tz ORDER BY id\"}",
+            schema);
         void *st2 = NULL;
         rc = src->init(ctx, cfg2, &st2);
+        CHECK(rc == BETL_OK);
         if (rc == BETL_OK && st2) {
-            /* init may succeed lazily; schema resolution happens on first
-             * get_schema / get_next. */
             struct ArrowArrayStream s2 = {0};
             int ar = src->attach_output(st2, 0, &s2);
+            CHECK(ar == BETL_OK);
             if (ar == BETL_OK) {
                 struct ArrowSchema sch2 = {0};
                 int gs = s2.get_schema(&s2, &sch2);
-                CHECK(gs != 0);
-                CHECK(strstr(betl_context_last_error(ctx), "TIMESTAMP WITH TIME ZONE") != NULL);
+                CHECK(gs == 0);
+                if (gs == 0 && sch2.n_children == 2) {
+                    CHECK(strcmp(sch2.children[1]->format, "tsu:UTC") == 0);
+                }
                 if (sch2.release) sch2.release(&sch2);
-                if (s2.release)   s2.release(&s2);
+
+                /* Pull a batch and verify the values are UTC. Row 1 is
+                 * "10:30:00 +00" → 10:30:00 UTC. Row 2 is "12:00:00
+                 * +05:30" → 06:30:00 UTC. */
+                struct ArrowArray batch2 = {0};
+                int gn = s2.get_next(&s2, &batch2);
+                CHECK(gn == 0);
+                if (gn == 0 && batch2.length == 2 && batch2.n_children == 2) {
+                    const int64_t *us = batch2.children[1]->buffers[1];
+                    int64_t exp1 = (int64_t)betl_days_from_civil(2026, 5, 11) * 86400000000LL
+                                 + (int64_t)10 * 3600000000LL
+                                 + (int64_t)30 * 60000000LL;
+                    int64_t exp2 = (int64_t)betl_days_from_civil(2026, 5, 11) * 86400000000LL
+                                 + (int64_t)6  * 3600000000LL
+                                 + (int64_t)30 * 60000000LL;
+                    CHECK(us[0] == exp1);
+                    CHECK(us[1] == exp2);
+                }
+                if (batch2.release) batch2.release(&batch2);
+                if (s2.release)     s2.release(&s2);
             }
             src->destroy(st2);
         }

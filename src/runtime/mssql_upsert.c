@@ -124,19 +124,21 @@ typedef enum {
     MS_BOOL,
     MS_DATE32,
     MS_TIMESTAMP_US,
+    MS_TIMESTAMP_TZ,
     MS_DECIMAL128,
     MS_UNSUPPORTED
 } MsColType;
 
 static MsColType arrow_to_ms(const char *fmt) {
     if (!fmt) return MS_UNSUPPORTED;
-    if (strcmp(fmt, "l")    == 0) return MS_INT64;
-    if (strcmp(fmt, "g")    == 0) return MS_FLOAT64;
-    if (strcmp(fmt, "u")    == 0) return MS_UTF8;
-    if (strcmp(fmt, "b")    == 0) return MS_BOOL;
-    if (strcmp(fmt, "tdD")  == 0) return MS_DATE32;
-    if (strcmp(fmt, "tsu:") == 0) return MS_TIMESTAMP_US;
-    if (strncmp(fmt, "d:", 2) == 0) return MS_DECIMAL128;
+    if (strcmp(fmt, "l")        == 0) return MS_INT64;
+    if (strcmp(fmt, "g")        == 0) return MS_FLOAT64;
+    if (strcmp(fmt, "u")        == 0) return MS_UTF8;
+    if (strcmp(fmt, "b")        == 0) return MS_BOOL;
+    if (strcmp(fmt, "tdD")      == 0) return MS_DATE32;
+    if (strcmp(fmt, "tsu:")     == 0) return MS_TIMESTAMP_US;
+    if (strcmp(fmt, "tsu:UTC")  == 0) return MS_TIMESTAMP_TZ;
+    if (strncmp(fmt, "d:", 2)   == 0) return MS_DECIMAL128;
     return MS_UNSUPPORTED;
 }
 
@@ -434,6 +436,42 @@ static int ms_fill_cell(BetlContext *ctx,
         b->ind = (SQLLEN)sizeof b->date_val;
         return BETL_OK;
     }
+    case MS_TIMESTAMP_TZ: {
+        /* Render the UTC timestamp as "YYYY-MM-DD HH:MM:SS[.uuuuuu] +00:00"
+         * — SQL Server accepts that for a DATETIMEOFFSET parameter. */
+        const int64_t *vals = col->buffers[1];
+        int32_t days; int64_t us_of_day;
+        betl_split_ts(vals[off], &days, &us_of_day);
+        int y = 0; unsigned m = 0, d = 0;
+        betl_civil_from_days(days, &y, &m, &d);
+        int hh   = (int)(us_of_day / 3600000000LL);
+        int mm   = (int)((us_of_day / 60000000LL) % 60);
+        int ss   = (int)((us_of_day / 1000000LL) % 60);
+        int frac = (int)(us_of_day % 1000000LL);
+        char tmp[48];
+        int n;
+        if (frac == 0) {
+            n = snprintf(tmp, sizeof tmp,
+                         "%04d-%02u-%02u %02d:%02d:%02d +00:00",
+                         y, m, d, hh, mm, ss);
+        } else {
+            n = snprintf(tmp, sizeof tmp,
+                         "%04d-%02u-%02u %02d:%02d:%02d.%06d +00:00",
+                         y, m, d, hh, mm, ss, frac);
+        }
+        if (n < 0 || (size_t)n >= sizeof tmp) {
+            betl_set_error(ctx, "mssql.upsert: tstz format overflow");
+            return BETL_ERR_INTERNAL;
+        }
+        if (ensure_str_cap(b, (size_t)n + 1) != 0) {
+            betl_set_error(ctx, "mssql.upsert: OOM staging tstz column '%s'",
+                           col_name);
+            return BETL_ERR_INTERNAL;
+        }
+        memcpy(b->str_buf, tmp, (size_t)n + 1);
+        b->ind = (SQLLEN)n;
+        return BETL_OK;
+    }
     case MS_DECIMAL128: {
         const betl_dec128 *vals = col->buffers[1];
         char tmp[48];
@@ -529,6 +567,14 @@ static int ms_bind_param(BetlContext *ctx, SQLHSTMT hstmt,
         rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_CHAR, SQL_DECIMAL,
                               (SQLULEN)b->dec_precision, b->dec_scale,
+                              b->str_buf, (SQLLEN)b->str_cap, &b->ind);
+        break;
+    case MS_TIMESTAMP_TZ:
+        /* Bind DATETIMEOFFSET as text — the driver coerces it. We use
+         * SQL_VARCHAR as the SQL type so the driver doesn't try to
+         * apply a tighter structured layout. */
+        rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
+                              SQL_C_CHAR, SQL_VARCHAR, 34, 7,
                               b->str_buf, (SQLLEN)b->str_cap, &b->ind);
         break;
     case MS_UNSUPPORTED:
@@ -640,7 +686,8 @@ static int ms_sink_run(void *state) {
         }
         /* Pre-allocate scratch so SQLBindParameter has a stable
          * non-NULL pointer. ms_fill_cell will grow it on demand. */
-        if ((bufs[i].type == MS_UTF8 || bufs[i].type == MS_DECIMAL128)
+        if ((bufs[i].type == MS_UTF8 || bufs[i].type == MS_DECIMAL128
+             || bufs[i].type == MS_TIMESTAMP_TZ)
             && ensure_str_cap(&bufs[i], 64) != 0) {
             rc = BETL_ERR_INTERNAL;
             goto cleanup_pre;

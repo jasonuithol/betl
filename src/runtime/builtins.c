@@ -757,11 +757,12 @@ static const BetlProvider count_provider = {
  * ============================================================== */
 
 typedef enum {
-    CSV_T_INT64        = 1,
-    CSV_T_UTF8         = 2,
-    CSV_T_DATE32       = 3,  /* Arrow tdD — int32 days since 1970-01-01 */
-    CSV_T_TIMESTAMP_US = 4,  /* Arrow tsu: — int64 micros since 1970-01-01 */
-    CSV_T_DECIMAL128   = 5,  /* Arrow d:p,s — int128 + (precision, scale) */
+    CSV_T_INT64         = 1,
+    CSV_T_UTF8          = 2,
+    CSV_T_DATE32        = 3,  /* Arrow tdD — int32 days since 1970-01-01 */
+    CSV_T_TIMESTAMP_US  = 4,  /* Arrow tsu: — int64 micros since 1970-01-01 */
+    CSV_T_DECIMAL128    = 5,  /* Arrow d:p,s — int128 + (precision, scale) */
+    CSV_T_TIMESTAMP_TZ  = 6,  /* Arrow tsu:UTC — int64 micros normalised to UTC */
 } CsvType;
 
 /* Per-column: schema fields (name, type) are set at init and live for
@@ -991,7 +992,8 @@ static int csv_alloc_staging(CsvState *s) {
     if (s->row_cap == s->batch_size) return 0;
     for (size_t c = 0; c < s->n_cols; ++c) {
         CsvCol *col = &s->cols[c];
-        if (col->type == CSV_T_INT64 || col->type == CSV_T_TIMESTAMP_US) {
+        if (col->type == CSV_T_INT64 || col->type == CSV_T_TIMESTAMP_US
+            || col->type == CSV_T_TIMESTAMP_TZ) {
             int64_t *p = realloc(col->i64_vals,
                                  s->batch_size * sizeof *p);
             if (!p) return -1;
@@ -1056,6 +1058,14 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
         } else if (col->type == CSV_T_TIMESTAMP_US) {
             int64_t us;
             if (betl_parse_iso_ts(field, flen, &us) != 0) {
+                free(field);
+                goto bad_field;
+            }
+            col->i64_vals[row_idx] = us;
+            free(field);
+        } else if (col->type == CSV_T_TIMESTAMP_TZ) {
+            int64_t us;
+            if (betl_parse_iso_tstz(field, flen, &us) != 0) {
                 free(field);
                 goto bad_field;
             }
@@ -1204,8 +1214,9 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     if      (strcmp(type, "int64")     == 0) t = CSV_T_INT64;
     else if (strcmp(type, "utf8")      == 0) t = CSV_T_UTF8;
     else if (strcmp(type, "date")      == 0) t = CSV_T_DATE32;
-    else if (strcmp(type, "timestamp") == 0) t = CSV_T_TIMESTAMP_US;
-    else if (strcmp(type, "decimal")   == 0) {
+    else if (strcmp(type, "timestamp")   == 0) t = CSV_T_TIMESTAMP_US;
+    else if (strcmp(type, "timestamptz") == 0) t = CSV_T_TIMESTAMP_TZ;
+    else if (strcmp(type, "decimal")     == 0) {
         t = CSV_T_DECIMAL128;
         /* Required: precision + scale ints in the same {} block. */
         char *vbuf2 = malloc(value_len + 1);
@@ -1415,6 +1426,7 @@ static const char *csv_format_for_col(const CsvCol *c) {
         case CSV_T_INT64:        return "l";
         case CSV_T_DATE32:       return "tdD";
         case CSV_T_TIMESTAMP_US: return "tsu:";
+        case CSV_T_TIMESTAMP_TZ: return "tsu:UTC";
         case CSV_T_UTF8:         return "u";
         case CSV_T_DECIMAL128:   return c->fmt_string ? c->fmt_string : "u";
     }
@@ -1554,7 +1566,8 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
             return 1;
         }
         if (s->cols[c].type == CSV_T_INT64
-            || s->cols[c].type == CSV_T_TIMESTAMP_US) {
+            || s->cols[c].type == CSV_T_TIMESTAMP_US
+            || s->cols[c].type == CSV_T_TIMESTAMP_TZ) {
             int64_t *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
             if (!vals) {
                 free(kids[c]);
@@ -1859,6 +1872,28 @@ static int csv_write_render_cell(FILE *fp, char delim,
         }
         return rc < 0 ? -1 : 0;
     }
+    if (strcmp(fmt, "tsu:UTC") == 0) {
+        /* UTC-pinned timestamp: same layout as `tsu:`, render with a
+         * trailing 'Z'. */
+        const int64_t *vals = col->buffers[1];
+        int32_t days; int64_t us_of_day;
+        betl_split_ts(vals[off], &days, &us_of_day);
+        int y = 0; unsigned m = 0, d = 0;
+        betl_civil_from_days(days, &y, &m, &d);
+        int hh   = (int)(us_of_day / 3600000000LL);
+        int mm   = (int)((us_of_day / 60000000LL) % 60);
+        int ss   = (int)((us_of_day / 1000000LL) % 60);
+        int frac = (int)(us_of_day % 1000000LL);
+        int rc;
+        if (frac == 0) {
+            rc = fprintf(fp, "%04d-%02u-%02u %02d:%02d:%02dZ",
+                         y, m, d, hh, mm, ss);
+        } else {
+            rc = fprintf(fp, "%04d-%02u-%02u %02d:%02d:%02d.%06dZ",
+                         y, m, d, hh, mm, ss, frac);
+        }
+        return rc < 0 ? -1 : 0;
+    }
     if (strncmp(fmt, "d:", 2) == 0) {
         int p = 0, s = 0;
         if (sscanf(fmt + 2, "%d,%d", &p, &s) != 2) return -2;
@@ -1903,11 +1938,12 @@ static int csv_write_sink_run(void *state) {
      * file so a bad type doesn't leave a half-written artefact behind. */
     for (int64_t i = 0; i < n_cols; ++i) {
         const char *fmt = schema.children[i]->format;
-        int ok = fmt && (strcmp(fmt, "l")    == 0 ||
-                         strcmp(fmt, "u")    == 0 ||
-                         strcmp(fmt, "tdD")  == 0 ||
-                         strcmp(fmt, "tsu:") == 0 ||
-                         strncmp(fmt, "d:", 2) == 0);
+        int ok = fmt && (strcmp(fmt, "l")        == 0 ||
+                         strcmp(fmt, "u")        == 0 ||
+                         strcmp(fmt, "tdD")      == 0 ||
+                         strcmp(fmt, "tsu:")     == 0 ||
+                         strcmp(fmt, "tsu:UTC")  == 0 ||
+                         strncmp(fmt, "d:", 2)   == 0);
         if (!ok) {
             betl_set_error(s->ctx,
                 "csv.write: column '%s' has unsupported Arrow format '%s' "

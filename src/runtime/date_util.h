@@ -32,4 +32,15 @@ int betl_parse_iso_date(const char *s, size_t n, int32_t *out_days);
  * Fractional seconds: up to 6 digits, missing digits treated as zero. */
 int betl_parse_iso_ts(const char *s, size_t n, int64_t *out_us);
 
+/* Parse a timestamp with an optional trailing tz suffix and normalize to
+ * UTC micros. Accepted forms:
+ *   YYYY-MM-DD HH:MM:SS[.uuuuuu]            — no tz, treated as already UTC
+ *   YYYY-MM-DDTHH:MM:SS[.uuuuuu]Z           — UTC sentinel
+ *   YYYY-MM-DD HH:MM:SS[.uuuuuu]+HH         — offset, no minutes
+ *   YYYY-MM-DD HH:MM:SS[.uuuuuu]+HH:MM      — offset with minutes
+ *   YYYY-MM-DD HH:MM:SS[.uuuuuu]+HHMM       — offset, no separator
+ * The offset is subtracted to convert into UTC. Returns 0 on success,
+ * -1 on parse error. */
+int betl_parse_iso_tstz(const char *s, size_t n, int64_t *out_us);
+
 #endif

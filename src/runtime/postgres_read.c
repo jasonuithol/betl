@@ -108,9 +108,11 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
 #define PG_OID_TIMESTAMPTZ 1184
 #define PG_OID_NUMERIC     1700
 
-/* Internal column-format tags. The 'D' / 'T' codes mirror what
- * betl-ssisexpr uses internally and map to Arrow "tdD" / "tsu:".
- * Returns 1 if `out_tztz` is filled with 1 (caller-rejected). */
+/* Internal column-format tags. Map to Arrow leaf formats:
+ *   'l' → "l"      'u' → "u"      'D' → "tdD"
+ *   'T' → "tsu:"   'Z' → "tsu:UTC"
+ *   'N' → "d:p,s"  (per-column format string assembled separately)
+ * `out_is_tztz` is no longer set — TIMESTAMPTZ is accepted now. */
 static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     *out_is_tztz = 0;
     if (t == PG_OID_INT8 || t == PG_OID_INT4 || t == PG_OID_INT2) {
@@ -119,10 +121,10 @@ static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     if (t == PG_OID_TEXT || t == PG_OID_VARCHAR || t == PG_OID_BPCHAR) {
         *out = 'u'; return 0;
     }
-    if (t == PG_OID_DATE)      { *out = 'D'; return 0; }
-    if (t == PG_OID_TIMESTAMP) { *out = 'T'; return 0; }
-    if (t == PG_OID_NUMERIC)   { *out = 'N'; return 0; }
-    if (t == PG_OID_TIMESTAMPTZ) { *out_is_tztz = 1; return -1; }
+    if (t == PG_OID_DATE)        { *out = 'D'; return 0; }
+    if (t == PG_OID_TIMESTAMP)   { *out = 'T'; return 0; }
+    if (t == PG_OID_TIMESTAMPTZ) { *out = 'Z'; return 0; }
+    if (t == PG_OID_NUMERIC)     { *out = 'N'; return 0; }
     return -1;
 }
 
@@ -314,6 +316,12 @@ static int pgr_init(BetlContext *ctx, const char *cfg, void **state) {
     if (pgr_exec_simple(s, "BEGIN", "BEGIN") != 0) goto fail;
     s->in_txn = 1;
 
+    /* Pin the session to UTC so TIMESTAMPTZ values come back as
+     * "YYYY-MM-DD HH:MM:SS+00", not the server's local TZ. The decode
+     * path then strips the offset deterministically. */
+    if (pgr_exec_simple(s, "SET LOCAL TIME ZONE 'UTC'",
+                        "SET LOCAL TIME ZONE 'UTC'") != 0) goto fail;
+
     /* DECLARE betl_read_xxx CURSOR FOR <user query>. We pass the query
      * verbatim — user is trusted (the SPEC framing has the pipeline
      * author writing the SELECT). */
@@ -414,18 +422,11 @@ static int pgr_resolve_schema(PgReadState *s) {
         char fmt;
         int is_tztz = 0;
         if (pg_oid_to_fmt(t, &fmt, &is_tztz) != 0) {
-            if (is_tztz) {
-                betl_set_error(s->ctx,
-                    "postgres.read: column '%s' is TIMESTAMP WITH TIME ZONE "
-                    "(OID 1184) — unsupported in v1; cast to TIMESTAMP in your "
-                    "query (e.g. `col AT TIME ZONE 'UTC'`)",
-                    PQfname(r, c));
-            } else {
-                betl_set_error(s->ctx,
-                    "postgres.read: column '%s' has unsupported OID %u "
-                    "(supported: int*, text/varchar/bpchar, date, timestamp, numeric)",
-                    PQfname(r, c), (unsigned)t);
-            }
+            betl_set_error(s->ctx,
+                "postgres.read: column '%s' has unsupported OID %u "
+                "(supported: int*, text/varchar/bpchar, date, timestamp, "
+                "timestamptz, numeric)",
+                PQfname(r, c), (unsigned)t);
             PQclear(r);
             return -1;
         }
@@ -627,6 +628,7 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
             case 'l': fmt = "l";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
+            case 'Z': fmt = "tsu:UTC"; break;
             case 'N':
                 /* Duplicate so the schema can outlive the source's state. */
                 fmt = strdup(s->col_fmt_strings[i]);
@@ -732,7 +734,7 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
             betl_set_error(s->ctx, "postgres.read: out of memory");
             goto cleanup;
         }
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T' || s->col_fmts[c] == 'Z') {
             i64_cols[c] = malloc((size_t)n_rows * sizeof(int64_t));
             if (!i64_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
@@ -799,6 +801,16 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                     goto cleanup;
                 }
                 i64_cols[c][row] = us;
+            } else if (s->col_fmts[c] == 'Z') {
+                int64_t us;
+                if (betl_parse_iso_tstz(v, (size_t)PQgetlength(r, row, c),
+                                        &us) != 0) {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': '%s' is not a "
+                        "valid timestamptz", row, s->col_names[c], v);
+                    goto cleanup;
+                }
+                i64_cols[c][row] = us;
             } else if (s->col_fmts[c] == 'N') {
                 betl_dec128 dv;
                 if (betl_dec128_parse(v, (size_t)PQgetlength(r, row, c),
@@ -827,7 +839,7 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
         int brc;
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T' || s->col_fmts[c] == 'Z') {
             brc = pgr_build_int64_leaf(kids[c], i64_cols[c], null_cols[c],
                                        (size_t)n_rows);
         } else if (s->col_fmts[c] == 'D') {
