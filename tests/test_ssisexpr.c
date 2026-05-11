@@ -1040,6 +1040,118 @@ int main(int argc, char **argv) {
         eng->release(h);
     }
 
+    /* --- 36: TOKEN / TOKENCOUNT --------------------------------------- *
+     * SSIS-style splitting: consecutive delimiters do not produce empty
+     * tokens, leading/trailing delimiters are skipped. */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "TOKEN(\"a,b,,c\", \",\", 3)", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 1);
+            CHECK(dat[off[0]] == 'c');  /* "a","b","c" — three tokens, #3 = "c" */
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Past end returns empty string. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "TOKEN(\"a;b\", \";\", 5)", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            CHECK(off[1] - off[0] == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "TOKENCOUNT(\"  a, b , c \", \" ,\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 3);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "TOKENCOUNT(\"\", \",\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 0);
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 37: HEX ------------------------------------------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "HEX(255)", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 2);
+            CHECK(memcmp(dat + off[0], "FF", 2) == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "HEX(0)", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 1);
+            CHECK(dat[off[0]] == '0');
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Negative is a runtime error. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "HEX(-1)", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "u", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+
+    /* --- 38: CODEPOINT ------------------------------------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "CODEPOINT(\"A\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 65);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Multi-byte UTF-8: "€" = U+20AC = 0xE2 0x82 0xAC */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "CODEPOINT(\"\xe2\x82\xac\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 0x20AC);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Empty string is a runtime error. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "CODEPOINT(\"\")", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;

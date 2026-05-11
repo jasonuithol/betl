@@ -93,6 +93,8 @@ typedef enum {
     FN_TRIM, FN_LTRIM, FN_RTRIM,
     FN_LOWER, FN_UPPER,
     FN_REPLACE, FN_FINDSTRING, FN_REVERSE,
+    FN_TOKEN, FN_TOKENCOUNT,
+    FN_HEX, FN_CODEPOINT,
     /* null */
     FN_ISNULL, FN_REPLACENULL,
     /* numeric */
@@ -433,6 +435,10 @@ static const FnSpec g_fns[] = {
     { "REPLACE",     FN_REPLACE,     3, 3 },
     { "FINDSTRING",  FN_FINDSTRING,  3, 3 },
     { "REVERSE",     FN_REVERSE,     1, 1 },
+    { "TOKEN",       FN_TOKEN,       3, 3 },
+    { "TOKENCOUNT",  FN_TOKENCOUNT,  2, 2 },
+    { "HEX",         FN_HEX,         1, 1 },
+    { "CODEPOINT",   FN_CODEPOINT,   1, 1 },
     /* null */
     { "ISNULL",      FN_ISNULL,      1, 1 },
     { "REPLACENULL", FN_REPLACENULL, 2, 2 },
@@ -2295,6 +2301,123 @@ static int fn_findstring(Eval *E, Value *vs, Value *out) {
     return 0;
 }
 
+/* TOKEN(str, delimiters, n): return the N-th (1-based) substring of
+ * `str` after splitting on ANY character in `delimiters`. Matches
+ * SSIS-EL: consecutive delimiters do NOT produce empty tokens, and
+ * leading/trailing delimiters are skipped. Returns "" if N is past
+ * the end. N < 1 is an error.
+ *
+ * TOKENCOUNT(str, delimiters): same splitting rules, returns count. */
+static int fn_token_split(const char *s, size_t sn,
+                          const char *d, size_t dn,
+                          int64_t want_n,
+                          const char **out_start, size_t *out_len,
+                          int64_t *out_count) {
+    int64_t n = 0;
+    size_t i = 0;
+    const char *cur_start = NULL;
+    size_t      cur_len   = 0;
+    /* Quick membership test via a 256-bit bitmap. */
+    unsigned char is_delim[32] = {0};
+    if (dn == 0) {
+        /* SSIS treats an empty delimiter list as "no splits" — the
+         * whole string is token #1. */
+        if (out_count) *out_count = sn > 0 ? 1 : 0;
+        if (want_n == 1 && sn > 0) { *out_start = s; *out_len = sn; return 1; }
+        return 0;
+    }
+    for (size_t k = 0; k < dn; ++k) {
+        unsigned char c = (unsigned char)d[k];
+        is_delim[c >> 3] |= (unsigned char)(1u << (c & 7));
+    }
+    while (i < sn) {
+        while (i < sn && (is_delim[(unsigned char)s[i] >> 3] & (1u << ((unsigned char)s[i] & 7)))) ++i;
+        if (i >= sn) break;
+        size_t start = i;
+        while (i < sn && !(is_delim[(unsigned char)s[i] >> 3] & (1u << ((unsigned char)s[i] & 7)))) ++i;
+        ++n;
+        if (n == want_n) { cur_start = s + start; cur_len = i - start; }
+    }
+    if (out_count) *out_count = n;
+    if (cur_start) { *out_start = cur_start; *out_len = cur_len; return 1; }
+    return 0;
+}
+
+static int fn_token(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "TOKEN") != 0) return -1;
+    if (require_str(E, &vs[1], "TOKEN") != 0) return -1;
+    if (require_int(E, &vs[2], "TOKEN") != 0) return -1;
+    if (vs[2].i64 < 1) return eval_err(E, "TOKEN: index must be >= 1");
+    const char *p = NULL; size_t pn = 0;
+    int found = fn_token_split(vs[0].str, vs[0].str_n, vs[1].str, vs[1].str_n,
+                               vs[2].i64, &p, &pn, NULL);
+    if (!found) {
+        char *buf = malloc(1);
+        if (!buf) return eval_err(E, "out of memory");
+        buf[0] = '\0';
+        return emit_str(E, buf, 0, out);
+    }
+    char *buf = malloc(pn + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    memcpy(buf, p, pn);
+    buf[pn] = '\0';
+    return emit_str(E, buf, pn, out);
+}
+
+static int fn_tokencount(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "TOKENCOUNT") != 0) return -1;
+    if (require_str(E, &vs[1], "TOKENCOUNT") != 0) return -1;
+    int64_t n = 0;
+    const char *p = NULL; size_t pn = 0;
+    (void)fn_token_split(vs[0].str, vs[0].str_n, vs[1].str, vs[1].str_n,
+                         -1, &p, &pn, &n);
+    out->kind = VK_INT64; out->i64 = n;
+    return 0;
+}
+
+/* HEX(n): canonical SSIS-style uppercase hex of a non-negative int,
+ * no leading zeros, no "0x" prefix. HEX(0) = "0". Negative inputs
+ * error (SSIS rejects them too — there's no two's-complement
+ * convention for variable-width DT_I8 in the spec). */
+static int fn_hex(Eval *E, Value *vs, Value *out) {
+    if (require_int(E, &vs[0], "HEX") != 0) return -1;
+    if (vs[0].i64 < 0) return eval_err(E, "HEX: input must be non-negative");
+    uint64_t v = (uint64_t)vs[0].i64;
+    char tmp[17];
+    int n = 0;
+    if (v == 0) { tmp[n++] = '0'; }
+    else {
+        while (v) {
+            unsigned d = (unsigned)(v & 0xf);
+            tmp[n++] = (char)(d < 10 ? '0' + d : 'A' + (d - 10));
+            v >>= 4;
+        }
+    }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    for (int i = 0; i < n; ++i) buf[i] = tmp[n - 1 - i];
+    buf[n] = '\0';
+    return emit_str(E, buf, (size_t)n, out);
+}
+
+/* CODEPOINT(s): return the unsigned codepoint of the first character.
+ * SSIS docs phrase this as "UNICODE codepoint", and we decode UTF-8
+ * to match. Empty string is an error. */
+static int fn_codepoint(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "CODEPOINT") != 0) return -1;
+    if (vs[0].str_n == 0) return eval_err(E, "CODEPOINT: empty string");
+    const unsigned char *p = (const unsigned char *)vs[0].str;
+    size_t n = vs[0].str_n;
+    uint32_t cp;
+    if      ((p[0] & 0x80) == 0x00) cp = p[0];
+    else if ((p[0] & 0xe0) == 0xc0 && n >= 2) cp = (uint32_t)((p[0] & 0x1f) << 6) | (p[1] & 0x3f);
+    else if ((p[0] & 0xf0) == 0xe0 && n >= 3) cp = (uint32_t)((p[0] & 0x0f) << 12) | (uint32_t)((p[1] & 0x3f) << 6) | (p[2] & 0x3f);
+    else if ((p[0] & 0xf8) == 0xf0 && n >= 4) cp = (uint32_t)((p[0] & 0x07) << 18) | (uint32_t)((p[1] & 0x3f) << 12) | (uint32_t)((p[2] & 0x3f) << 6) | (p[3] & 0x3f);
+    else return eval_err(E, "CODEPOINT: malformed UTF-8");
+    out->kind = VK_INT64; out->i64 = (int64_t)cp;
+    return 0;
+}
+
 /* Numeric — ABS preserves the input's numeric kind; the rest return float. */
 static double as_double(const Value *v) {
     return v->kind == VK_INT64 ? (double)v->i64 : v->f64;
@@ -2642,6 +2765,10 @@ static int eval_call(Eval *E, Par *P, const Node *n, Value *out) {
         case FN_REPLACE:    return fn_replace   (E, vs, out);
         case FN_FINDSTRING: return fn_findstring(E, vs, out);
         case FN_REVERSE:    return fn_reverse   (E, vs, out);
+        case FN_TOKEN:      return fn_token     (E, vs, out);
+        case FN_TOKENCOUNT: return fn_tokencount(E, vs, out);
+        case FN_HEX:        return fn_hex       (E, vs, out);
+        case FN_CODEPOINT:  return fn_codepoint (E, vs, out);
         case FN_ABS:        return fn_abs       (E, vs, out);
         case FN_POWER:      return fn_power     (E, vs, out);
         case FN_SQUARE:     return fn_square    (E, vs, out);

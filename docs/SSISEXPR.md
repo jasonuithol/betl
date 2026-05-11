@@ -181,6 +181,10 @@ NULL-propagation behaviour is as described above unless noted.
 | `REPLACE(s, find, replacement)` | `(DT_WSTR, DT_WSTR, DT_WSTR) → DT_WSTR` | Replace all non-overlapping matches. `find = ""` returns `s` unchanged. |
 | `FINDSTRING(s, needle, occurrence)` | `(DT_WSTR, DT_WSTR, DT_I8) → DT_I8` | 1-based position of the N-th match; `0` if not found. |
 | `REVERSE(s)` | `(DT_WSTR) → DT_WSTR` | Byte-level reverse. |
+| `TOKEN(s, delim, n)` | `(DT_WSTR, DT_WSTR, DT_I8) → DT_WSTR` | 1-based N-th token. Split on ANY character in `delim`. Consecutive delimiters do not create empty tokens; leading/trailing delimiters are skipped. N past end → `""`. `n < 1` errors. Empty delimiter list returns the whole string as token #1. |
+| `TOKENCOUNT(s, delim)` | `(DT_WSTR, DT_WSTR) → DT_I8` | Same splitting rules as `TOKEN`. |
+| `HEX(n)` | `(DT_I8) → DT_WSTR` | Uppercase hex, no leading zeros, no prefix. `HEX(0) = "0"`. Negative input errors (no two's-complement convention). |
+| `CODEPOINT(s)` | `(DT_WSTR) → DT_I8` | UTF-8 codepoint of the first character. Empty string errors. |
 
 ### NULL handling
 
@@ -249,9 +253,6 @@ for v2.
   `DATEPART("hour"/"minute"/"second", ts)` for extraction; embed
   in a timestamp for arithmetic.
 - **Bitwise operators** — `&` `|` `^` `<<` `>>`.
-- **`TOKEN(str, delim, n)`, `TOKENCOUNT(str, delim)`** — string
-  splitting.
-- **`HEX(n)`, `CODEPOINT(s)`** — value introspection.
 - **Locale-aware parsing** — date / number parsers are ASCII /
   invariant-culture only. SSIS' `LocaleID` setting doesn't apply.
 - **Narrow-width Arrow integers.** `int8`/`int16`/`int32` are
