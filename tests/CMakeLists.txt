@@ -23,6 +23,9 @@ add_test(NAME validate_example_02
 add_test(NAME validate_example_03
     COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/03-crm-migration/pipeline.betl.yml
 )
+add_test(NAME validate_example_04
+    COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/04-ssis-orders-by-month/pipeline.betl.yml
+)
 add_test(NAME validate_connections_bundle
     COMMAND betl validate ${CMAKE_SOURCE_DIR}/examples/03-crm-migration/connections.betl.yml
 )

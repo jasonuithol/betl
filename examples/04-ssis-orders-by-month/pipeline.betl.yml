@@ -1,0 +1,119 @@
+# =============================================================================
+# Example 04 — SSIS-style date enrichment with the betl-ssisexpr engine.
+#
+# This pipeline shows the migration path for SSIS Data Flow expressions
+# that derive columns from DATE / DT_DBTIMESTAMP fields: month buckets,
+# rolling-window flags, due-date arithmetic, and uppercase normalisation.
+# Every derived column is computed via `lang: ssisexpr`, so the original
+# SSIS expression text carries over verbatim (no Lua rewrites).
+#
+# Demonstrates:
+#   - csv.read with `type: date` and `type: timestamp` schema columns
+#   - `map` add: blocks using `lang: ssisexpr` for derived columns
+#   - SSIS-EL date functions: MONTH, YEAR, DATEADD, DATEDIFF, GETDATE
+#   - String normalization via UPPER
+#   - Ternary expression for boolean tagging
+#   - `filter` using a typed comparison on the derived month column
+#   - postgres.upsert writing DATE / TIMESTAMP columns
+#
+# Setup (one-time):
+#   psql -f sql/ddl_target.sql                     # creates analytics.orders_by_month
+#
+# Run:
+#   cp ../.env.example ../.env && edit WAREHOUSE_DSN
+#   export $(grep -v '^#' ../.env | xargs)
+#   betl run pipeline.betl.yml --param src_dir=fixtures
+#
+# NB: `lang: ssisexpr` requires the betl-ssisexpr provider plugin to be
+# loaded by the host. The plugin source is under providers/betl-ssisexpr;
+# auto-loading from a provider directory is on the CLI roadmap. The tests
+# under tests/test_ssisexpr.c exercise every expression form used below.
+# =============================================================================
+
+betl: 1
+name: orders-monthly-enrichment
+description: |
+  Read a day of orders.csv, derive month/year/due_date/is_overdue with
+  SSIS expressions, then upsert into analytics.orders_by_month. Re-runs
+  are idempotent (upsert keyed on order_id).
+
+parameters:
+  src_dir:
+    type: string
+    required: true
+    doc: Directory containing orders.csv.
+  overdue_after_days:
+    type: int64
+    default: "30"
+    doc: A delivered_at older than this is_overdue = 1.
+
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.WAREHOUSE_DSN}
+
+pipeline:
+
+  - id: enrich_orders
+    type: dataflow
+    on_failure: stop
+    steps:
+
+      - id: read
+        type: csv.read
+        path: ${params.src_dir}/orders.csv
+        delimiter: ","
+        header: true
+        schema:
+          columns:
+            - { name: order_id,      type: int64     }
+            - { name: customer_name, type: utf8      }
+            - { name: order_date,    type: date      }   # YYYY-MM-DD
+            - { name: delivered_at,  type: timestamp }   # YYYY-MM-DD HH:MM:SS
+            - { name: total_cents,   type: int64     }
+
+      # -- Pure SSIS-EL derivations. Each `add:` block runs the expression
+      #    text through the ssisexpr engine, the same one a converted
+      #    .dtsx Data Flow expression would target.
+      - id: enrich
+        type: map
+        from: read
+        add:
+          order_month:
+            lang: ssisexpr
+            expr: MONTH(order_date)
+          order_year:
+            lang: ssisexpr
+            expr: YEAR(order_date)
+          # 7-day delivery target; falls back to NULL if order_date is NULL.
+          due_date:
+            lang: ssisexpr
+            expr: DATEADD("day", 7, order_date)
+          # `(DT_BOOL)` cast on the comparison keeps the column boolean-typed
+          # rather than int — matches a typical SSIS derived-column shape.
+          is_overdue:
+            lang: ssisexpr
+            expr: (DT_BOOL) (DATEDIFF("day", delivered_at, GETDATE()) > 30)
+          # Customer name canonicalisation. Uses SSIS-EL's UPPER, which is
+          # ASCII-only in v1 (same as Lua's string.upper).
+          customer_upper:
+            lang: ssisexpr
+            expr: UPPER(customer_name)
+
+      # -- Filter to the current calendar year so the monthly mart only
+      #    sees in-year rows. The `where` shorthand defaults to lua, so we
+      #    spell out lang+expr explicitly for ssisexpr.
+      - id: this_year_only
+        type: filter
+        from: enrich
+        where:
+          lang: ssisexpr
+          expr: order_year == YEAR(GETDATE())
+
+      - id: write
+        type: postgres.upsert
+        from: this_year_only
+        connection: warehouse
+        table: analytics.orders_by_month
+        key: [order_id]
+        on_conflict: update

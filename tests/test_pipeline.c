@@ -46,7 +46,7 @@ static void test_example_01(const char *path) {
     }
 
     CHECK_STREQ(betl_pipeline_name(p), "orders-daily-ingest");
-    CHECK(betl_pipeline_stage_count(p) == 2);
+    CHECK(betl_pipeline_stage_count(p) == 1);
     CHECK(betl_pipeline_total_steps(p) == 5);
 
     const BetlStage *ingest = betl_pipeline_find_stage(p, "ingest_orders");
@@ -65,16 +65,6 @@ static void test_example_01(const char *path) {
         CHECK_STREQ(ingest->steps[4].id, "write");
         CHECK_STREQ(ingest->steps[4].type, "postgres.upsert");
         CHECK_STREQ(ingest->steps[4].inputs[0], "tag_load");
-    }
-
-    const BetlStage *check = betl_pipeline_find_stage(p, "row_count_check");
-    CHECK(check != NULL);
-    if (check) {
-        CHECK(check->kind == BETL_STAGE_TASK);
-        CHECK_STREQ(check->task_type, "sql.execute");
-        CHECK(check->step_count == 0);
-        CHECK(check->after_count == 1);
-        CHECK_STREQ(check->after[0], "ingest_orders");
     }
 
     /* Lookup of an unknown id returns NULL. */
@@ -133,14 +123,6 @@ static void test_example_01(const char *path) {
             CHECK(strstr(cfg, "\"type\":\"csv.read\"")  != NULL);
             CHECK(strstr(cfg, "\"header\":true")        != NULL);  /* plain `true` */
             CHECK(strstr(cfg, "\"delimiter\":\",\"")    != NULL);  /* quoted "," */
-        }
-    }
-    /* Task stages also carry config_json. */
-    if (check) {
-        CHECK(check->task_config_json != NULL);
-        if (check->task_config_json) {
-            CHECK(strstr(check->task_config_json, "\"sql.execute\"") != NULL);
-            CHECK(strstr(check->task_config_json, "\"connection\":\"warehouse\"") != NULL);
         }
     }
 

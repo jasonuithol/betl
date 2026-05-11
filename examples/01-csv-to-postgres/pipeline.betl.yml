@@ -56,15 +56,18 @@ pipeline:
         path: ${params.src_dir}/orders-${params.load_date}.csv
         delimiter: ","
         header: true
-        # Schema is declared up front. Arrow logical types throughout.
+        # Schema declares each column's logical type. csv.read currently
+        # supports: int64, utf8, date, timestamp. unit_price is in whole
+        # cents to stay inside int64 (decimal types are a future addition).
         schema:
-          - { name: order_id,    type: int64,                  nullable: false }
-          - { name: customer_id, type: int64,                  nullable: false }
-          - { name: sku,         type: string,                 nullable: false }
-          - { name: quantity,    type: int32,                  nullable: false }
-          - { name: unit_price,  type: "decimal128(12,2)",     nullable: false }
-          - { name: ordered_at,  type: "timestamp[us, UTC]",   nullable: false }
-          - { name: notes,       type: string,                 nullable: true  }
+          columns:
+            - { name: order_id,    type: int64     }
+            - { name: customer_id, type: int64     }
+            - { name: sku,         type: utf8      }
+            - { name: quantity,    type: int64     }
+            - { name: unit_price,  type: int64     }    # cents
+            - { name: ordered_at,  type: timestamp }    # YYYY-MM-DD HH:MM:SS[.uuuuuu]
+            - { name: notes,       type: utf8      }
 
       - id: clean
         type: lua.map
@@ -107,18 +110,9 @@ pipeline:
         on_conflict: update     # update | ignore | error
 
   # ---------------------------------------------------------------------------
-  # Post-load sanity check. If zero rows landed for the load date, fail
-  # the run loudly so the orchestrator (cron / Airflow / whatever) sees it.
+  # The upsert sink already errors if it can't write a row, so a simple
+  # idempotent ingest doesn't need a separate post-load check. For more
+  # involved validation (row counts, SLA assertions), drive a follow-up
+  # `dataflow` stage with `after: [ingest_orders]` and use `postgres.read`
+  # + `betl.count_rows` (which can fail on an unexpected total).
   # ---------------------------------------------------------------------------
-  - id: row_count_check
-    type: sql.execute
-    connection: warehouse
-    after: [ingest_orders]
-    sql: |
-      SELECT COUNT(*) AS rows_loaded
-      FROM stg.orders
-      WHERE load_date = :load_date
-    params:
-      load_date: ${params.load_date}
-    expect:
-      rows_loaded: { min: 1 }
