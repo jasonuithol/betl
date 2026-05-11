@@ -301,6 +301,85 @@ int main(void) {
         unlink(out_path);
     }
 
+    /* --- 6. Schema-annotated DATE / TIMESTAMP columns ----------------- */
+    {
+        char in_path[64], out_path[64], yaml[1024], err[512] = {0};
+        unique_path(in_path,  sizeof in_path,  "dt-in");
+        unique_path(out_path, sizeof out_path, "dt-out");
+        /* Mix of plain seconds and fractional, plus a leap-day. */
+        const char input[] =
+            "id,ev_date,ev_at\n"
+            "1,2026-05-11,2026-05-11 10:30:00.123456\n"
+            "2,2024-02-29,2024-02-29 23:59:59\n";
+        CHECK(write_file(in_path, input) == 0);
+        snprintf(yaml, sizeof yaml,
+            "betl: 1\n"
+            "name: csvr-date\n"
+            "pipeline:\n"
+            "  - id: stage_one\n"
+            "    type: dataflow\n"
+            "    steps:\n"
+            "      - id: source\n"
+            "        type: csv.read\n"
+            "        path: %s\n"
+            "        schema:\n"
+            "          columns:\n"
+            "            - { name: id,      type: int64     }\n"
+            "            - { name: ev_date, type: date      }\n"
+            "            - { name: ev_at,   type: timestamp }\n"
+            "      - id: sink\n"
+            "        type: csv.write\n"
+            "        from: source\n"
+            "        path: %s\n", in_path, out_path);
+        int rc = run_yaml(yaml, err, sizeof err);
+        if (rc != BETL_OK) fprintf(stderr, "date case: %s\n", err);
+        CHECK(rc == BETL_OK);
+        char *got = slurp(out_path);
+        CHECK(got != NULL);
+        if (got) {
+            /* csv.write should stringify date/ts in the same ISO format
+             * csv.read parsed, giving a clean roundtrip. */
+            CHECK(strcmp(got,
+                "id,ev_date,ev_at\n"
+                "1,2026-05-11,2026-05-11 10:30:00.123456\n"
+                "2,2024-02-29,2024-02-29 23:59:59\n") == 0);
+            free(got);
+        }
+        unlink(in_path);
+        unlink(out_path);
+    }
+
+    /* --- 7. Schema-annotated DATE rejects a malformed value ----------- */
+    {
+        char in_path[64], yaml[1024], err[512] = {0};
+        unique_path(in_path, sizeof in_path, "dt-bad");
+        const char input[] =
+            "id,ev_date\n"
+            "1,not-a-date\n";
+        CHECK(write_file(in_path, input) == 0);
+        snprintf(yaml, sizeof yaml,
+            "betl: 1\n"
+            "name: csvr-date-bad\n"
+            "pipeline:\n"
+            "  - id: stage_one\n"
+            "    type: dataflow\n"
+            "    steps:\n"
+            "      - id: source\n"
+            "        type: csv.read\n"
+            "        path: %s\n"
+            "        schema:\n"
+            "          columns:\n"
+            "            - { name: id,      type: int64 }\n"
+            "            - { name: ev_date, type: date  }\n"
+            "      - id: sink\n"
+            "        type: betl.count_rows\n"
+            "        from: source\n"
+            "        expect: 1\n", in_path);
+        int rc = run_yaml(yaml, err, sizeof err);
+        CHECK(rc != BETL_OK);   /* parse error should fail the run */
+        unlink(in_path);
+    }
+
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
