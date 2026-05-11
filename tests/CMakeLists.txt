@@ -118,6 +118,20 @@ set_tests_properties(cli_run PROPERTIES
     PASS_REGULAR_EXPRESSION "run ok"
 )
 
+# Verifies the CLI auto-loads provider plugins from the dev build tree
+# (build/providers/PLUGIN/betl-PLUGIN.so). The pipeline uses `lang:
+# ssisexpr` in a `map add:` block — if the plugin didn't load, the run
+# would fail with "expression engine 'ssisexpr' not found".
+if(BETL_SSISEXPR_FOUND)
+    add_test(NAME cli_run_ssisexpr
+        COMMAND betl run ${CMAKE_SOURCE_DIR}/tests/fixtures/run_ssisexpr.yml
+    )
+    set_tests_properties(cli_run_ssisexpr PROPERTIES
+        PASS_REGULAR_EXPRESSION "run ok"
+        DEPENDS ${BETL_SSISEXPR_TARGET}
+    )
+endif()
+
 # csv.read end-to-end via the CLI. Demonstrates a real `parameters:`
 # block + ${params.X} substitution: --param fixtures_dir=... is passed
 # in, the YAML interpolates it into the csv.read step's `path:`.

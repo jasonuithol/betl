@@ -1,0 +1,28 @@
+betl: 1
+name: cli-run-ssisexpr
+description: |
+  End-to-end pipeline that exercises the betl-ssisexpr provider via
+  `lang: ssisexpr` in a `map add:` block. Used by the cli_run_ssisexpr
+  ctest case to verify that `betl run` auto-loads provider plugins
+  from the dev build tree.
+pipeline:
+  - id: only_stage
+    type: dataflow
+    steps:
+      - id: source
+        type: betl.gen_strings
+        row_count: 3
+      - id: enrich
+        type: map
+        from: source
+        add:
+          name_len:
+            lang: ssisexpr
+            expr: LEN([name])
+          name_upper:
+            lang: ssisexpr
+            expr: UPPER([name])
+      - id: sink
+        type: betl.count_rows
+        from: enrich
+        expect: 3

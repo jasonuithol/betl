@@ -24,10 +24,11 @@
 #   export $(grep -v '^#' ../.env | xargs)
 #   betl run pipeline.betl.yml --param src_dir=fixtures
 #
-# NB: `lang: ssisexpr` requires the betl-ssisexpr provider plugin to be
-# loaded by the host. The plugin source is under providers/betl-ssisexpr;
-# auto-loading from a provider directory is on the CLI roadmap. The tests
-# under tests/test_ssisexpr.c exercise every expression form used below.
+# NB: `lang: ssisexpr` resolves against the betl-ssisexpr provider
+# plugin. `betl run` auto-loads plugins from <exe_dir>/providers/*/
+# in the dev build tree, from each colon-separated entry of
+# $BETL_PROVIDER_DIR, and from any `--provider <path>` you pass on
+# the command line. The plugin source lives at providers/betl-ssisexpr.
 # =============================================================================
 
 betl: 1
