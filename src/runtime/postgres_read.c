@@ -122,12 +122,11 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
  * `out_is_tztz` is no longer set — TIMESTAMPTZ is accepted now. */
 static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     *out_is_tztz = 0;
-    if (t == PG_OID_INT8 || t == PG_OID_INT4 || t == PG_OID_INT2) {
-        *out = 'l'; return 0;
-    }
-    if (t == PG_OID_FLOAT4 || t == PG_OID_FLOAT8) {
-        *out = 'g'; return 0;
-    }
+    if (t == PG_OID_INT8) { *out = 'l'; return 0; }
+    if (t == PG_OID_INT4) { *out = 'i'; return 0; }
+    if (t == PG_OID_INT2) { *out = 's'; return 0; }
+    if (t == PG_OID_FLOAT4) { *out = 'f'; return 0; }
+    if (t == PG_OID_FLOAT8) { *out = 'g'; return 0; }
     if (t == PG_OID_TEXT || t == PG_OID_VARCHAR || t == PG_OID_BPCHAR) {
         *out = 'u'; return 0;
     }
@@ -576,6 +575,59 @@ static int pgr_build_int64_leaf(struct ArrowArray *out,
     return 0;
 }
 
+/* Build a narrowed fixed-width leaf from the int64 stash. PG INT2/INT4
+ * values are always parsed into int64 first; this writes them out at
+ * the advertised Arrow width. elem_size is 2 / 4 / 8. */
+static int pgr_build_narrow_int_leaf(struct ArrowArray *out,
+                                     const int64_t *vals,
+                                     const uint8_t *nulls,
+                                     size_t n, size_t elem_size) {
+    if (elem_size != 2 && elem_size != 4 && elem_size != 8) return -1;
+    uint8_t *vbuf = malloc((n ? n : 1) * elem_size);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        int64_t v = nulls[i] ? 0 : vals[i];
+        if (elem_size == 2)      { int16_t b = (int16_t)v; memcpy(vbuf + i * 2, &b, 2); }
+        else if (elem_size == 4) { int32_t b = (int32_t)v; memcpy(vbuf + i * 4, &b, 4); }
+        else                     {                          memcpy(vbuf + i * 8, &v, 8); }
+    }
+    int64_t null_count = 0;
+    uint8_t *vmap = pgr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = pgr_release_int64_leaf;  /* same shape: frees bufs[0,1] */
+    return 0;
+}
+
+/* Float32 leaf — values are stashed as doubles (widened from PG TEXT
+ * parse) and downcast at emit. */
+static int pgr_build_float32_leaf(struct ArrowArray *out,
+                                  const double *vals,
+                                  const uint8_t *nulls,
+                                  size_t n) {
+    float *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0.0f : (float)vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = pgr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = pgr_release_int64_leaf;
+    return 0;
+}
+
 static int pgr_build_date32_leaf(struct ArrowArray *out,
                                  const int32_t *vals,
                                  const uint8_t *nulls,
@@ -707,7 +759,10 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
         int owned_format = 0;
         switch (s->col_fmts[i]) {
             case 'l': fmt = "l";    break;
+            case 'i': fmt = "i";    break;
+            case 's': fmt = "s";    break;
             case 'g': fmt = "g";    break;
+            case 'f': fmt = "f";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
             case 'Z': fmt = "tsu:UTC"; break;
@@ -828,8 +883,11 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
             betl_set_error(s->ctx, "postgres.read: out of memory");
             goto cleanup;
         }
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T'
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'i' || s->col_fmts[c] == 's'
+            || s->col_fmts[c] == 'T'
             || s->col_fmts[c] == 'Z' || s->col_fmts[c] == 'M') {
+            /* PG INT2/INT4 are still parsed into int64 staging; the
+             * emit-time builder narrows the buffer. */
             i64_cols[c] = malloc((size_t)n_rows * sizeof(int64_t));
             if (!i64_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
@@ -853,7 +911,8 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                 betl_set_error(s->ctx, "postgres.read: out of memory");
                 goto cleanup;
             }
-        } else if (s->col_fmts[c] == 'g') {
+        } else if (s->col_fmts[c] == 'g' || s->col_fmts[c] == 'f') {
+            /* FLOAT4 is parsed as double, downcast to float at emit. */
             f64_cols[c] = malloc((size_t)n_rows * sizeof(double));
             if (!f64_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
@@ -884,7 +943,7 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
             }
             null_cols[c][row] = 0;
             const char *v = PQgetvalue(r, row, c);
-            if (s->col_fmts[c] == 'l') {
+            if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'i' || s->col_fmts[c] == 's') {
                 char *end = NULL;
                 long long iv = strtoll(v, &end, 10);
                 if (end == v || *end != '\0') {
@@ -983,7 +1042,7 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                 }
                 bin_cols[c][row] = raw;
                 bin_lens[c][row] = (size_t)nb;
-            } else if (s->col_fmts[c] == 'g') {
+            } else if (s->col_fmts[c] == 'g' || s->col_fmts[c] == 'f') {
                 char *end = NULL;
                 double dv = strtod(v, &end);
                 if (end == v || *end != '\0') {
@@ -1014,6 +1073,12 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
             || s->col_fmts[c] == 'Z' || s->col_fmts[c] == 'M') {
             brc = pgr_build_int64_leaf(kids[c], i64_cols[c], null_cols[c],
                                        (size_t)n_rows);
+        } else if (s->col_fmts[c] == 'i') {
+            brc = pgr_build_narrow_int_leaf(kids[c], i64_cols[c], null_cols[c],
+                                            (size_t)n_rows, 4);
+        } else if (s->col_fmts[c] == 's') {
+            brc = pgr_build_narrow_int_leaf(kids[c], i64_cols[c], null_cols[c],
+                                            (size_t)n_rows, 2);
         } else if (s->col_fmts[c] == 'D') {
             brc = pgr_build_date32_leaf(kids[c], d32_cols[c], null_cols[c],
                                         (size_t)n_rows);
@@ -1025,6 +1090,9 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                                       null_cols[c], (size_t)n_rows);
         } else if (s->col_fmts[c] == 'g') {
             brc = pgr_build_float64_leaf(kids[c], f64_cols[c],
+                                         null_cols[c], (size_t)n_rows);
+        } else if (s->col_fmts[c] == 'f') {
+            brc = pgr_build_float32_leaf(kids[c], f64_cols[c],
                                          null_cols[c], (size_t)n_rows);
         } else if (s->col_fmts[c] == 'B') {
             /* Arrow `z` and `u` share the same buffer layout

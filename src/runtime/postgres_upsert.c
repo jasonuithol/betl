@@ -267,7 +267,12 @@ static int pg_attach_input(void *state, int port,
 
 typedef enum {
     PG_INT64,
+    PG_INT8,  PG_UINT8,
+    PG_INT16, PG_UINT16,
+    PG_INT32, PG_UINT32,
+    PG_UINT64,
     PG_FLOAT64,
+    PG_FLOAT32,
     PG_UTF8,
     PG_BOOL,
     PG_DATE32,
@@ -282,7 +287,15 @@ typedef enum {
 static PgColType arrow_to_pg(const char *fmt) {
     if (!fmt) return PG_UNSUPPORTED;
     if (strcmp(fmt, "l")    == 0) return PG_INT64;
+    if (strcmp(fmt, "L")    == 0) return PG_UINT64;
+    if (strcmp(fmt, "c")    == 0) return PG_INT8;
+    if (strcmp(fmt, "C")    == 0) return PG_UINT8;
+    if (strcmp(fmt, "s")    == 0) return PG_INT16;
+    if (strcmp(fmt, "S")    == 0) return PG_UINT16;
+    if (strcmp(fmt, "i")    == 0) return PG_INT32;
+    if (strcmp(fmt, "I")    == 0) return PG_UINT32;
     if (strcmp(fmt, "g")    == 0) return PG_FLOAT64;
+    if (strcmp(fmt, "f")    == 0) return PG_FLOAT32;
     if (strcmp(fmt, "u")    == 0) return PG_UTF8;
     if (strcmp(fmt, "b")    == 0) return PG_BOOL;
     if (strcmp(fmt, "tdD")     == 0) return PG_DATE32;
@@ -325,10 +338,30 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
     }
     int64_t off = col->offset + row;
     switch (type) {
-    case PG_INT64: {
-        const int64_t *vals = col->buffers[1];
+    case PG_INT64:
+    case PG_UINT64:
+    case PG_INT8: case PG_UINT8:
+    case PG_INT16: case PG_UINT16:
+    case PG_INT32: case PG_UINT32: {
+        int64_t v = 0;
+        switch (type) {
+            case PG_INT64:  v = ((const int64_t  *)col->buffers[1])[off]; break;
+            case PG_UINT64: v = (int64_t)((const uint64_t *)col->buffers[1])[off]; break;
+            case PG_INT8:   v = ((const int8_t   *)col->buffers[1])[off]; break;
+            case PG_UINT8:  v = ((const uint8_t  *)col->buffers[1])[off]; break;
+            case PG_INT16:  v = ((const int16_t  *)col->buffers[1])[off]; break;
+            case PG_UINT16: v = ((const uint16_t *)col->buffers[1])[off]; break;
+            case PG_INT32:  v = ((const int32_t  *)col->buffers[1])[off]; break;
+            case PG_UINT32: v = (int64_t)((const uint32_t *)col->buffers[1])[off]; break;
+            default: break;
+        }
         char  buf[32];
-        int n = snprintf(buf, sizeof buf, "%" PRId64, vals[off]);
+        int n;
+        if (type == PG_UINT64) {
+            n = snprintf(buf, sizeof buf, "%" PRIu64, (uint64_t)v);
+        } else {
+            n = snprintf(buf, sizeof buf, "%" PRId64, v);
+        }
         if (n < 0 || (size_t)n >= sizeof buf) return -2;
         char *s = malloc((size_t)n + 1);
         if (!s) return -2;
@@ -336,10 +369,13 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
         *out = s;
         return 0;
     }
-    case PG_FLOAT64: {
-        const double *vals = col->buffers[1];
+    case PG_FLOAT64:
+    case PG_FLOAT32: {
+        double v = (type == PG_FLOAT32)
+                       ? (double)((const float *)col->buffers[1])[off]
+                       : ((const double *)col->buffers[1])[off];
         char  buf[64];
-        int n = snprintf(buf, sizeof buf, "%.17g", vals[off]);
+        int n = snprintf(buf, sizeof buf, "%.17g", v);
         if (n < 0 || (size_t)n >= sizeof buf) return -2;
         char *s = malloc((size_t)n + 1);
         if (!s) return -2;

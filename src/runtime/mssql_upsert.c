@@ -121,7 +121,12 @@ static void free_string_array(char **arr, size_t n) {
 
 typedef enum {
     MS_INT64,
+    MS_INT8,  MS_UINT8,
+    MS_INT16, MS_UINT16,
+    MS_INT32, MS_UINT32,
+    MS_UINT64,
     MS_FLOAT64,
+    MS_FLOAT32,
     MS_UTF8,
     MS_BOOL,
     MS_DATE32,
@@ -137,7 +142,15 @@ typedef enum {
 static MsColType arrow_to_ms(const char *fmt) {
     if (!fmt) return MS_UNSUPPORTED;
     if (strcmp(fmt, "l")        == 0) return MS_INT64;
+    if (strcmp(fmt, "L")        == 0) return MS_UINT64;
+    if (strcmp(fmt, "c")        == 0) return MS_INT8;
+    if (strcmp(fmt, "C")        == 0) return MS_UINT8;
+    if (strcmp(fmt, "s")        == 0) return MS_INT16;
+    if (strcmp(fmt, "S")        == 0) return MS_UINT16;
+    if (strcmp(fmt, "i")        == 0) return MS_INT32;
+    if (strcmp(fmt, "I")        == 0) return MS_UINT32;
     if (strcmp(fmt, "g")        == 0) return MS_FLOAT64;
+    if (strcmp(fmt, "f")        == 0) return MS_FLOAT32;
     if (strcmp(fmt, "u")        == 0) return MS_UTF8;
     if (strcmp(fmt, "b")        == 0) return MS_BOOL;
     if (strcmp(fmt, "tdD")      == 0) return MS_DATE32;
@@ -400,15 +413,33 @@ static int ms_fill_cell(BetlContext *ctx,
     }
     int64_t off = col->offset + row;
     switch (b->type) {
-    case MS_INT64: {
-        const int64_t *vals = col->buffers[1];
-        b->i64_val = (SQLBIGINT)vals[off];
+    case MS_INT64:
+    case MS_UINT64:
+    case MS_INT8:  case MS_UINT8:
+    case MS_INT16: case MS_UINT16:
+    case MS_INT32: case MS_UINT32: {
+        int64_t v = 0;
+        switch (b->type) {
+            case MS_INT64:  v = ((const int64_t  *)col->buffers[1])[off]; break;
+            case MS_UINT64: v = (int64_t)((const uint64_t *)col->buffers[1])[off]; break;
+            case MS_INT8:   v = ((const int8_t   *)col->buffers[1])[off]; break;
+            case MS_UINT8:  v = ((const uint8_t  *)col->buffers[1])[off]; break;
+            case MS_INT16:  v = ((const int16_t  *)col->buffers[1])[off]; break;
+            case MS_UINT16: v = ((const uint16_t *)col->buffers[1])[off]; break;
+            case MS_INT32:  v = ((const int32_t  *)col->buffers[1])[off]; break;
+            case MS_UINT32: v = (int64_t)((const uint32_t *)col->buffers[1])[off]; break;
+            default: break;
+        }
+        b->i64_val = (SQLBIGINT)v;
         b->ind = 0;
         return BETL_OK;
     }
-    case MS_FLOAT64: {
-        const double *vals = col->buffers[1];
-        b->f64_val = (SQLDOUBLE)vals[off];
+    case MS_FLOAT64:
+    case MS_FLOAT32: {
+        double v = (b->type == MS_FLOAT32)
+                       ? (double)((const float *)col->buffers[1])[off]
+                       : ((const double *)col->buffers[1])[off];
+        b->f64_val = (SQLDOUBLE)v;
         b->ind = 0;
         return BETL_OK;
     }
@@ -584,11 +615,18 @@ static int ms_bind_param(BetlContext *ctx, SQLHSTMT hstmt,
     SQLRETURN rc;
     switch (b->type) {
     case MS_INT64:
+    case MS_UINT64:
+    case MS_INT8:  case MS_UINT8:
+    case MS_INT16: case MS_UINT16:
+    case MS_INT32: case MS_UINT32:
+        /* All integer widths bound through the SBIGINT slot; SQL Server
+         * narrows during INSERT if the target column is narrower. */
         rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
                               &b->i64_val, 0, &b->ind);
         break;
     case MS_FLOAT64:
+    case MS_FLOAT32:
         rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_DOUBLE, SQL_DOUBLE, 0, 0,
                               &b->f64_val, 0, &b->ind);

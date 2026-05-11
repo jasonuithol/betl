@@ -72,15 +72,15 @@ underlying Arrow value kinds.
 
 | SSIS type        | Arrow leaf format | Internal kind     | Notes |
 |---|---|---|---|
-| `DT_I1`          | `l` (int64) | int64 | All integer widths collapse to int64 in memory, but **the cast checks the target range** and errors on overflow — `(DT_I1) 200` fails. Matches SSIS. |
-| `DT_I2`          | `l` (int64) | int64 | Range `[-32768, 32767]`. |
-| `DT_I4`          | `l` (int64) | int64 | Range `[-2³¹, 2³¹-1]`. |
-| `DT_I8`          | `l` (int64) | int64 | No narrowing — full int64 range. |
-| `DT_UI1`         | `l` (int64) | int64 | Unsigned narrowing cast, range `[0, 255]`. |
-| `DT_UI2`         | `l` (int64) | int64 | Range `[0, 65535]`. |
-| `DT_UI4`         | `l` (int64) | int64 | Range `[0, 4294967295]`. |
-| `DT_UI8`         | `l` (int64) | int64 | Range `[0, INT64_MAX]` — we store as signed int64, so the upper half of UINT64 is rejected (cast errors). |
-| `DT_R4`          | `g` (float64) | float64 | Both float widths collapse to float64. |
+| `DT_I1`          | `c` (int8)   | int8   | Cast errors on overflow — `(DT_I1) 200` fails. Matches SSIS. |
+| `DT_I2`          | `s` (int16)  | int16  | Range `[-32768, 32767]`. |
+| `DT_I4`          | `i` (int32)  | int32  | Range `[-2³¹, 2³¹-1]`. |
+| `DT_I8`          | `l` (int64)  | int64  | No narrowing — full int64 range. |
+| `DT_UI1`         | `C` (uint8)  | uint8  | Unsigned narrowing cast, range `[0, 255]`. |
+| `DT_UI2`         | `S` (uint16) | uint16 | Range `[0, 65535]`. |
+| `DT_UI4`         | `I` (uint32) | uint32 | Range `[0, 4294967295]`. |
+| `DT_UI8`         | `L` (uint64) | uint64 | Range `[0, INT64_MAX]` — internal int64 ceiling; values above wrap, expressions on uint64 column data treat the slot as int64 with overflow. |
+| `DT_R4`          | `f` (float32) | float32 | Stored at native width; expressions promote to double internally. |
 | `DT_R8`          | `g` (float64) | float64 | |
 | `DT_BOOL`        | `b` (bit) | bool | |
 | `DT_WSTR`        | `u` (utf8) | utf8 | `(DT_WSTR, N)` accepted; the length is parsed and ignored — betl strings are variable-length. |
@@ -258,10 +258,6 @@ for v2.
 
 - **Locale-aware parsing** — date / number parsers are ASCII /
   invariant-culture only. SSIS' `LocaleID` setting doesn't apply.
-- **Narrow-width Arrow integers.** `int8`/`int16`/`int32` are
-  accepted at the schema layer and round-trip correctly through
-  databases (target column widths are preserved by the driver) but
-  widen to int64 in betl's in-memory representation.
 
 ## Error handling
 

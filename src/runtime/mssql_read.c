@@ -111,11 +111,11 @@ static void copy_diag(SQLSMALLINT type, SQLHANDLE h, char *out, size_t cap) {
 
 static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
     switch (t) {
-    case SQL_BIGINT:
-    case SQL_INTEGER:
-    case SQL_SMALLINT:
-    case SQL_TINYINT:
-        *out = 'l'; return 0;
+    case SQL_BIGINT:   *out = 'l'; return 0;
+    case SQL_INTEGER:  *out = 'i'; return 0;
+    case SQL_SMALLINT: *out = 's'; return 0;
+    /* MSSQL TINYINT is unsigned 0..255 */
+    case SQL_TINYINT:  *out = 'C'; return 0;
     case SQL_CHAR:
     case SQL_VARCHAR:
     case SQL_LONGVARCHAR:
@@ -136,10 +136,9 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
     case SQL_TYPE_TIME:          /* MSSQL TIME */
     case SQL_TIME:               /* older alias */
         *out = 'M'; return 0;
-    case SQL_REAL:
+    case SQL_REAL:   *out = 'f'; return 0;
     case SQL_FLOAT:
-    case SQL_DOUBLE:
-        *out = 'g'; return 0;
+    case SQL_DOUBLE: *out = 'g'; return 0;
     case SQL_BINARY:
     case SQL_VARBINARY:
     case SQL_LONGVARBINARY:
@@ -485,7 +484,9 @@ static int msr_resolve_schema(MsReadState *s) {
             betl_set_error(s->ctx, "mssql.read: out of memory");
             return -1;
         }
-        if (fmt == 'l' || fmt == 'T' || fmt == 'Z' || fmt == 'M') {
+        if (fmt == 'l' || fmt == 'i' || fmt == 's' || fmt == 'C'
+            || fmt == 'T' || fmt == 'Z' || fmt == 'M') {
+            /* MSSQL narrow ints go through int64 staging, narrowed at emit. */
             s->cols[c].i64_vals = malloc(s->batch_size * sizeof(int64_t));
             if (!s->cols[c].i64_vals) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
@@ -509,7 +510,8 @@ static int msr_resolve_schema(MsReadState *s) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
                 return -1;
             }
-        } else if (fmt == 'g') {
+        } else if (fmt == 'g' || fmt == 'f') {
+            /* REAL is stashed as double, downcast to float at emit. */
             s->cols[c].f64_vals = malloc(s->batch_size * sizeof(double));
             if (!s->cols[c].f64_vals) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
@@ -624,6 +626,54 @@ static int msr_build_float64_leaf(struct ArrowArray *out,
     double *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
     if (!vbuf) return -1;
     for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0.0 : vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = msr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = msr_release_float64_leaf;
+    return 0;
+}
+
+/* Narrow integer / float32 emit from the int64 / double stash. fmt
+ * selects which width to produce. */
+static int msr_build_narrow_int_leaf(struct ArrowArray *out, size_t elem_size,
+                                     const int64_t *vals,
+                                     const uint8_t *nulls, size_t n) {
+    if (elem_size != 1 && elem_size != 2 && elem_size != 4) return -1;
+    uint8_t *vbuf = malloc((n ? n : 1) * elem_size);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        int64_t v = nulls[i] ? 0 : vals[i];
+        if (elem_size == 1)      vbuf[i] = (uint8_t)v;
+        else if (elem_size == 2) { int16_t b = (int16_t)v; memcpy(vbuf + i * 2, &b, 2); }
+        else                     { int32_t b = (int32_t)v; memcpy(vbuf + i * 4, &b, 4); }
+    }
+    int64_t null_count = 0;
+    uint8_t *vmap = msr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = msr_release_int64_leaf;
+    return 0;
+}
+
+static int msr_build_float32_leaf(struct ArrowArray *out,
+                                  const double *vals,
+                                  const uint8_t *nulls, size_t n) {
+    float *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0.0f : (float)vals[i];
     int64_t null_count = 0;
     uint8_t *vmap = msr_build_validity(nulls, n, &null_count);
     if (null_count > 0 && !vmap) { free(vbuf); return -1; }
@@ -769,7 +819,11 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
         int owned = 0;
         switch (s->col_fmts[i]) {
             case 'l': fmt = "l";    break;
+            case 'i': fmt = "i";    break;
+            case 's': fmt = "s";    break;
+            case 'C': fmt = "C";    break;
             case 'g': fmt = "g";    break;
+            case 'f': fmt = "f";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
             case 'Z': fmt = "tsu:UTC"; break;
@@ -901,7 +955,7 @@ static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
         }
         return 0;
     }
-    if (s->col_fmts[c] == 'g') {
+    if (s->col_fmts[c] == 'g' || s->col_fmts[c] == 'f') {
         SQLDOUBLE v = 0;
         SQLLEN ind = 0;
         if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
@@ -977,7 +1031,10 @@ static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
         }
         return 0;
     }
-    if (s->col_fmts[c] == 'l') {
+    if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'i' ||
+        s->col_fmts[c] == 's' || s->col_fmts[c] == 'C') {
+        /* Use SBIGINT regardless of source width — MSSQL converts upward
+         * during fetch; the emit-time builder will narrow it back. */
         SQLBIGINT v = 0;
         SQLLEN ind = 0;
         if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
@@ -1196,6 +1253,15 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
             || s->col_fmts[c] == 'Z' || s->col_fmts[c] == 'M') {
             rc = msr_build_int64_leaf(kids[c], s->cols[c].i64_vals,
                                       s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 'i') {
+            rc = msr_build_narrow_int_leaf(kids[c], 4, s->cols[c].i64_vals,
+                                           s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 's') {
+            rc = msr_build_narrow_int_leaf(kids[c], 2, s->cols[c].i64_vals,
+                                           s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 'C') {
+            rc = msr_build_narrow_int_leaf(kids[c], 1, s->cols[c].i64_vals,
+                                           s->cols[c].nulls, (size_t)n);
         } else if (s->col_fmts[c] == 'D') {
             rc = msr_build_date32_leaf(kids[c], s->cols[c].d32_vals,
                                        s->cols[c].nulls, (size_t)n);
@@ -1207,6 +1273,9 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
                                      s->cols[c].nulls, (size_t)n);
         } else if (s->col_fmts[c] == 'g') {
             rc = msr_build_float64_leaf(kids[c], s->cols[c].f64_vals,
+                                        s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 'f') {
+            rc = msr_build_float32_leaf(kids[c], s->cols[c].f64_vals,
                                         s->cols[c].nulls, (size_t)n);
         } else {
             rc = msr_build_utf8_leaf(kids[c], s->cols[c].u8_strs,

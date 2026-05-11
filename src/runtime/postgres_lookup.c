@@ -428,9 +428,15 @@ static void lookup_destroy(void *state) {
 #define PG_OID_BPCHAR   1042
 
 static int pg_oid_to_fmt(Oid t, char *out) {
-    if (t == PG_OID_INT8 || t == PG_OID_INT4 || t == PG_OID_INT2) { *out = 'l'; return 0; }
+    if (t == PG_OID_INT8) { *out = 'l'; return 0; }
+    if (t == PG_OID_INT4) { *out = 'i'; return 0; }
+    if (t == PG_OID_INT2) { *out = 's'; return 0; }
     if (t == PG_OID_TEXT || t == PG_OID_VARCHAR || t == PG_OID_BPCHAR) { *out = 'u'; return 0; }
     return -1;
+}
+
+static int pg_fmt_is_int(char fmt) {
+    return fmt == 'l' || fmt == 'i' || fmt == 's';
 }
 
 /* Look up the dsn from the connection registry, open libpq. */
@@ -578,7 +584,7 @@ static int lookup_build_cache(LookupState *l) {
         free(fmts); PQclear(res); lset_err(l, "lookup: out of memory"); return -1;
     }
     for (int c = 0; c < n_total; ++c) {
-        if (fmts[c] == 'l') {
+        if (pg_fmt_is_int(fmts[c])) {
             l->cache_i64[c] = malloc((size_t)((n_rows ? n_rows : 1)) * sizeof(int64_t));
             if (!l->cache_i64[c]) {
                 free(fmts); PQclear(res); lset_err(l, "lookup: out of memory"); return -1;
@@ -598,11 +604,11 @@ static int lookup_build_cache(LookupState *l) {
                 free(fmts); PQclear(res); return -1;
             }
             const char *v = PQgetvalue(res, r, c);
-            if (fmts[c] == 'l') {
+            if (pg_fmt_is_int(fmts[c])) {
                 char *end = NULL;
                 long long iv = strtoll(v, &end, 10);
                 if (end == v || *end != '\0') {
-                    lset_err(l, "lookup: row %d col %d not a valid int64 ('%s')", r, c, v);
+                    lset_err(l, "lookup: row %d col %d not a valid int ('%s')", r, c, v);
                     free(fmts); PQclear(res); return -1;
                 }
                 l->cache_i64[c][r] = (int64_t)iv;
@@ -653,7 +659,10 @@ static int lookup_resolve_schema(LookupState *l) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = sch.children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_int = fmt && (fmt[0] == 'l' || fmt[0] == 'i' || fmt[0] == 's')
+                     && fmt[1] == '\0';
+        int is_utf = fmt && strcmp(fmt, "u") == 0;
+        if (!is_int && !is_utf) {
             lset_err(l, "lookup: input column '%s' has unsupported format '%s'",
                      (c && c->name) ? c->name : "?", fmt ? fmt : "(none)");
             for (size_t k = 0; k < i; ++k) free(names[k]);
@@ -728,7 +737,14 @@ static int lookup_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *ou
     struct ArrowSchema **kids = calloc(n_total, sizeof *kids);
     if (!kids) return ENOMEM;
     for (size_t i = 0; i < l->n_input_cols; ++i) {
-        const char *fmt = (l->input_col_fmts[i] == 'l') ? "l" : "u";
+        const char *fmt = "u";
+        switch (l->input_col_fmts[i]) {
+            case 'l': fmt = "l"; break;
+            case 'i': fmt = "i"; break;
+            case 's': fmt = "s"; break;
+            case 'u': fmt = "u"; break;
+            default:  fmt = "u"; break;
+        }
         kids[i] = new_leaf(l->input_col_names[i], fmt);
         if (!kids[i]) {
             for (size_t k = 0; k < i; ++k) {
@@ -739,7 +755,14 @@ static int lookup_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *ou
         }
     }
     for (size_t i = 0; i < l->n_selects; ++i) {
-        const char *fmt = (l->selects[i].fmt == 'l') ? "l" : "u";
+        const char *fmt = "u";
+        switch (l->selects[i].fmt) {
+            case 'l': fmt = "l"; break;
+            case 'i': fmt = "i"; break;
+            case 's': fmt = "s"; break;
+            case 'u': fmt = "u"; break;
+            default:  fmt = "u"; break;
+        }
         kids[l->n_input_cols + i] = new_leaf(l->selects[i].output_col, fmt);
         if (!kids[l->n_input_cols + i]) {
             for (size_t k = 0; k < l->n_input_cols + i; ++k) {
@@ -769,7 +792,7 @@ static int lookup_probe(const LookupState *l,
     for (size_t r = 0; r < l->cache_rows; ++r) {
         int eq = 1;
         for (size_t k = 0; k < l->n_matches; ++k) {
-            if (l->matches[k].fmt == 'l') {
+            if (pg_fmt_is_int(l->matches[k].fmt)) {
                 if (l->cache_i64[k][r] != l_i64_at_match[k]) { eq = 0; break; }
             } else {
                 size_t la = l->cache_u8l[k][r];
@@ -787,11 +810,17 @@ static int lookup_probe(const LookupState *l,
     return found;
 }
 
-/* Read a typed cell out of an Arrow leaf at row r (no offset already
- * applied). Used to extract input match values. */
-static void read_int64_cell_at(const struct ArrowArray *col, size_t r, int64_t *out) {
+/* Read a typed int cell out of an Arrow leaf at row r (offsets handled).
+ * Widens narrow int leaves (s/i/l) into int64. */
+static void read_int_cell_at(const struct ArrowArray *col, char fmt,
+                             size_t r, int64_t *out) {
     size_t row = r + (size_t)col->offset;
-    *out = ((const int64_t *)col->buffers[1])[row];
+    switch (fmt) {
+        case 'l': *out = ((const int64_t *)col->buffers[1])[row]; return;
+        case 'i': *out = ((const int32_t *)col->buffers[1])[row]; return;
+        case 's': *out = ((const int16_t *)col->buffers[1])[row]; return;
+        default:  *out = 0; return;
+    }
 }
 
 static void read_utf8_cell_at(const struct ArrowArray *col, size_t r,
@@ -835,6 +864,44 @@ static int build_int64_leaf(struct ArrowArray *out,
     out->n_buffers  = 2;
     out->buffers    = bufs;
     out->release    = pgl_release_int64_leaf;
+    return 0;
+}
+
+/* Narrow-int leaf: vals[] is the int64 stash, elem_size selects 2/4/8. */
+static int build_narrow_int_leaf(struct ArrowArray *out, size_t elem_size,
+                                 const int64_t *vals, const uint8_t *nulls,
+                                 size_t n) {
+    if (elem_size == 8) return build_int64_leaf(out, vals, nulls, n);
+    if (elem_size != 2 && elem_size != 4) return -1;
+    uint8_t *vbuf = malloc((n ? n : 1) * elem_size);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        int64_t v = (nulls && nulls[i]) ? 0 : vals[i];
+        if (elem_size == 2) { int16_t b = (int16_t)v; memcpy(vbuf + i * 2, &b, 2); }
+        else                { int32_t b = (int32_t)v; memcpy(vbuf + i * 4, &b, 4); }
+    }
+    int64_t  null_count = 0;
+    uint8_t *vmap = NULL;
+    if (nulls) {
+        for (size_t i = 0; i < n; ++i) if (nulls[i]) ++null_count;
+        if (null_count > 0) {
+            size_t bytes = (n + 7) / 8;
+            vmap = malloc(bytes ? bytes : 1);
+            if (!vmap) { free(vbuf); return -1; }
+            memset(vmap, 0xFF, bytes ? bytes : 1);
+            for (size_t i = 0; i < n; ++i) {
+                if (nulls[i]) vmap[i / 8] &= (uint8_t)~(1u << (i % 8));
+            }
+        }
+    }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = pgl_release_int64_leaf;  /* same shape */
     return 0;
 }
 
@@ -933,8 +1000,8 @@ static int lookup_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) 
     for (size_t r = 0; r < length; ++r) {
         for (size_t k = 0; k < l->n_matches; ++k) {
             const struct ArrowArray *col = batch.children[l->matches[k].input_idx];
-            if (l->matches[k].fmt == 'l') {
-                read_int64_cell_at(col, r, &l_i64[k]);
+            if (pg_fmt_is_int(l->matches[k].fmt)) {
+                read_int_cell_at(col, l->matches[k].fmt, r, &l_i64[k]);
             } else {
                 read_utf8_cell_at(col, r, &l_str[k], &l_len[k]);
             }
@@ -980,17 +1047,19 @@ static int lookup_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) 
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) goto fail;
         const struct ArrowArray *src = batch.children[c];
-        if (l->input_col_fmts[c] == 'l') {
+        char fmt = l->input_col_fmts[c];
+        if (pg_fmt_is_int(fmt)) {
             int64_t *v = malloc((n_kept ? n_kept : 1) * sizeof *v);
             if (!v) goto fail;
             size_t w = 0;
             for (size_t r = 0; r < length; ++r) {
                 if (!keep[r]) continue;
                 int64_t cell;
-                read_int64_cell_at(src, r, &cell);
+                read_int_cell_at(src, fmt, r, &cell);
                 v[w++] = cell;
             }
-            if (build_int64_leaf(kids[c], v, NULL, n_kept) != 0) {
+            size_t elem = (fmt == 's') ? 2 : (fmt == 'i') ? 4 : 8;
+            if (build_narrow_int_leaf(kids[c], elem, v, NULL, n_kept) != 0) {
                 free(v); goto fail;
             }
             free(v);
@@ -1019,7 +1088,7 @@ static int lookup_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) 
         kids[out_idx] = calloc(1, sizeof **kids);
         if (!kids[out_idx]) goto fail;
         size_t cache_col = l->n_matches + s;
-        if (l->selects[s].fmt == 'l') {
+        if (pg_fmt_is_int(l->selects[s].fmt)) {
             int64_t *v = malloc((n_kept ? n_kept : 1) * sizeof *v);
             uint8_t *nulls = calloc(n_kept ? n_kept : 1, 1);
             if (!v || !nulls) { free(v); free(nulls); goto fail; }
@@ -1034,7 +1103,9 @@ static int lookup_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) 
                 }
                 ++w;
             }
-            int rc = build_int64_leaf(kids[out_idx], v, nulls, n_kept);
+            size_t elem = (l->selects[s].fmt == 's') ? 2
+                        : (l->selects[s].fmt == 'i') ? 4 : 8;
+            int rc = build_narrow_int_leaf(kids[out_idx], elem, v, nulls, n_kept);
             free(v); free(nulls);
             if (rc != 0) goto fail;
         } else {
