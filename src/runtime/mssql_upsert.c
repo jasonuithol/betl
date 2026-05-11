@@ -30,6 +30,7 @@
 #include <sqltypes.h>
 
 #include "betl/provider.h"
+#include "runtime/date_util.h"
 #include "runtime/mssql_sql.h"
 
 /* ============================================================== *
@@ -120,15 +121,19 @@ typedef enum {
     MS_FLOAT64,
     MS_UTF8,
     MS_BOOL,
+    MS_DATE32,
+    MS_TIMESTAMP_US,
     MS_UNSUPPORTED
 } MsColType;
 
 static MsColType arrow_to_ms(const char *fmt) {
     if (!fmt) return MS_UNSUPPORTED;
-    if (strcmp(fmt, "l") == 0) return MS_INT64;
-    if (strcmp(fmt, "g") == 0) return MS_FLOAT64;
-    if (strcmp(fmt, "u") == 0) return MS_UTF8;
-    if (strcmp(fmt, "b") == 0) return MS_BOOL;
+    if (strcmp(fmt, "l")    == 0) return MS_INT64;
+    if (strcmp(fmt, "g")    == 0) return MS_FLOAT64;
+    if (strcmp(fmt, "u")    == 0) return MS_UTF8;
+    if (strcmp(fmt, "b")    == 0) return MS_BOOL;
+    if (strcmp(fmt, "tdD")  == 0) return MS_DATE32;
+    if (strcmp(fmt, "tsu:") == 0) return MS_TIMESTAMP_US;
     return MS_UNSUPPORTED;
 }
 
@@ -142,6 +147,8 @@ typedef struct {
     SQLCHAR   bool_val;        /* SQL_BIT — 0/1 */
     char     *str_buf;         /* utf8 scratch */
     size_t    str_cap;
+    SQL_DATE_STRUCT      date_val;
+    SQL_TIMESTAMP_STRUCT ts_val;
     SQLLEN    ind;             /* SQL_NULL_DATA or column length */
 } MsColBuf;
 
@@ -408,6 +415,33 @@ static int ms_fill_cell(BetlContext *ctx,
         b->ind = (SQLLEN)len;
         return BETL_OK;
     }
+    case MS_DATE32: {
+        const int32_t *vals = col->buffers[1];
+        int y = 0; unsigned m = 0, d = 0;
+        betl_civil_from_days(vals[off], &y, &m, &d);
+        b->date_val.year  = (SQLSMALLINT)y;
+        b->date_val.month = (SQLUSMALLINT)m;
+        b->date_val.day   = (SQLUSMALLINT)d;
+        b->ind = (SQLLEN)sizeof b->date_val;
+        return BETL_OK;
+    }
+    case MS_TIMESTAMP_US: {
+        const int64_t *vals = col->buffers[1];
+        int32_t days; int64_t us_of_day;
+        betl_split_ts(vals[off], &days, &us_of_day);
+        int y = 0; unsigned m = 0, d = 0;
+        betl_civil_from_days(days, &y, &m, &d);
+        b->ts_val.year     = (SQLSMALLINT)y;
+        b->ts_val.month    = (SQLUSMALLINT)m;
+        b->ts_val.day      = (SQLUSMALLINT)d;
+        b->ts_val.hour     = (SQLUSMALLINT)(us_of_day / 3600000000LL);
+        b->ts_val.minute   = (SQLUSMALLINT)((us_of_day / 60000000LL) % 60);
+        b->ts_val.second   = (SQLUSMALLINT)((us_of_day / 1000000LL) % 60);
+        /* ODBC fraction is nanoseconds; we have microseconds. */
+        b->ts_val.fraction = (SQLUINTEGER)((us_of_day % 1000000LL) * 1000);
+        b->ind = (SQLLEN)sizeof b->ts_val;
+        return BETL_OK;
+    }
     case MS_UNSUPPORTED:
     default:
         betl_set_error(ctx,
@@ -447,6 +481,18 @@ static int ms_bind_param(BetlContext *ctx, SQLHSTMT hstmt,
         rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_CHAR, SQL_VARCHAR, 4000, 0,
                               b->str_buf, (SQLLEN)b->str_cap, &b->ind);
+        break;
+    case MS_DATE32:
+        rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
+                              SQL_C_TYPE_DATE, SQL_TYPE_DATE, 10, 0,
+                              &b->date_val, 0, &b->ind);
+        break;
+    case MS_TIMESTAMP_US:
+        /* SQL Server DATETIME2(6) — 26 chars wide, scale 6. The driver
+         * accepts SQL_TIMESTAMP for DATETIME / DATETIME2 columns. */
+        rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
+                              SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 26, 6,
+                              &b->ts_val, 0, &b->ind);
         break;
     case MS_UNSUPPORTED:
     default:

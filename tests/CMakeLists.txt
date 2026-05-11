@@ -359,6 +359,15 @@ if(ODBC_FOUND)
         PASS_REGULAR_EXPRESSION "ok: mssql_read date/timestamp integration test passed"
     )
 
+    # --- mssql.upsert date / datetime2 roundtrip test -----------------------
+    add_executable(test_mssql_upsert_date test_mssql_upsert_date.c)
+    target_link_libraries(test_mssql_upsert_date PRIVATE betl_core betl_odbc)
+    add_test(NAME mssql_upsert_date COMMAND test_mssql_upsert_date)
+    set_tests_properties(mssql_upsert_date PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: mssql_upsert date/datetime2 roundtrip test passed"
+    )
+
     # --- mssql.read streaming stress test (no Lua) --------------------------
     # Verifies VmHWM stays bounded across a 2MB result set with a small
     # batch_size — proves nothing along ODBC / FreeTDS silently buffers
