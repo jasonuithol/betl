@@ -2563,6 +2563,7 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
         else if (strcmp(fmt, "tdD") == 0) e->col_fmts[i] = 'D';
         else if (strcmp(fmt, "tsu:") == 0) e->col_fmts[i] = 'T';
         else if (strcmp(fmt, "tsu:UTC") == 0) e->col_fmts[i] = 'T'; /* same int64 layout */
+        else if (strcmp(fmt, "ttu") == 0)     e->col_fmts[i] = 'l'; /* time = int64 micros */
         else if (strcmp(fmt, "w:16") == 0)    e->col_fmts[i] = 'U';
         else if (strncmp(fmt, "d:", 2) == 0) {
             /* "d:precision,scale" — extract scale (precision is metadata). */

@@ -43,4 +43,10 @@ int betl_parse_iso_ts(const char *s, size_t n, int64_t *out_us);
  * -1 on parse error. */
 int betl_parse_iso_tstz(const char *s, size_t n, int64_t *out_us);
 
+/* Parse "HH:MM:SS[.uuuuuu]" → micros of day (0..86399999999). */
+int betl_parse_iso_time(const char *s, size_t n, int64_t *out_us);
+
+/* Format micros-of-day as "HH:MM:SS[.uuuuuu]". Returns bytes written. */
+int betl_format_iso_time(int64_t us_of_day, char *buf, size_t cap);
+
 #endif

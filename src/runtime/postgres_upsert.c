@@ -273,6 +273,7 @@ typedef enum {
     PG_TIMESTAMP_US,
     PG_DECIMAL128,
     PG_UUID,
+    PG_TIME_US,
     PG_UNSUPPORTED
 } PgColType;
 
@@ -286,6 +287,7 @@ static PgColType arrow_to_pg(const char *fmt) {
     if (strcmp(fmt, "tsu:")    == 0) return PG_TIMESTAMP_US;
     if (strcmp(fmt, "tsu:UTC") == 0) return PG_TIMESTAMP_US;  /* UTC-pinned */
     if (strcmp(fmt, "w:16")    == 0) return PG_UUID;
+    if (strcmp(fmt, "ttu")     == 0) return PG_TIME_US;
     if (strncmp(fmt, "d:", 2)  == 0) return PG_DECIMAL128;
     return PG_UNSUPPORTED;
 }
@@ -397,6 +399,17 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
         char *str = malloc(37);
         if (!str) return -2;
         memcpy(str, buf, 37);
+        *out = str;
+        return 0;
+    }
+    case PG_TIME_US: {
+        const int64_t *vals = col->buffers[1];
+        char buf[20];
+        int n = betl_format_iso_time(vals[off], buf, sizeof buf);
+        if (n < 0) return -2;
+        char *str = malloc((size_t)n + 1);
+        if (!str) return -2;
+        memcpy(str, buf, (size_t)n + 1);
         *out = str;
         return 0;
     }

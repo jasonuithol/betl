@@ -111,6 +111,7 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
 #define PG_OID_UUID        2950
 #define PG_OID_FLOAT4      700
 #define PG_OID_FLOAT8      701
+#define PG_OID_TIME        1083
 
 /* Internal column-format tags. Map to Arrow leaf formats:
  *   'l' → "l"      'u' → "u"      'D' → "tdD"
@@ -131,6 +132,7 @@ static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     if (t == PG_OID_DATE)        { *out = 'D'; return 0; }
     if (t == PG_OID_TIMESTAMP)   { *out = 'T'; return 0; }
     if (t == PG_OID_TIMESTAMPTZ) { *out = 'Z'; return 0; }
+    if (t == PG_OID_TIME)        { *out = 'M'; return 0; }
     if (t == PG_OID_NUMERIC)     { *out = 'N'; return 0; }
     if (t == PG_OID_UUID)        { *out = 'U'; return 0; }
     return -1;
@@ -706,6 +708,7 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
             case 'Z': fmt = "tsu:UTC"; break;
+            case 'M': fmt = "ttu"; break;
             case 'U': fmt = "w:16"; break;
             case 'N':
                 /* Duplicate so the schema can outlive the source's state. */
@@ -815,7 +818,8 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
             betl_set_error(s->ctx, "postgres.read: out of memory");
             goto cleanup;
         }
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T' || s->col_fmts[c] == 'Z') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T'
+            || s->col_fmts[c] == 'Z' || s->col_fmts[c] == 'M') {
             i64_cols[c] = malloc((size_t)n_rows * sizeof(int64_t));
             if (!i64_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
@@ -894,6 +898,16 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                     goto cleanup;
                 }
                 i64_cols[c][row] = us;
+            } else if (s->col_fmts[c] == 'M') {
+                int64_t us;
+                if (betl_parse_iso_time(v, (size_t)PQgetlength(r, row, c),
+                                        &us) != 0) {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': '%s' is not a valid time",
+                        row, s->col_names[c], v);
+                    goto cleanup;
+                }
+                i64_cols[c][row] = us;
             } else if (s->col_fmts[c] == 'Z') {
                 int64_t us;
                 if (betl_parse_iso_tstz(v, (size_t)PQgetlength(r, row, c),
@@ -950,7 +964,8 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
         int brc;
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T' || s->col_fmts[c] == 'Z') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T'
+            || s->col_fmts[c] == 'Z' || s->col_fmts[c] == 'M') {
             brc = pgr_build_int64_leaf(kids[c], i64_cols[c], null_cols[c],
                                        (size_t)n_rows);
         } else if (s->col_fmts[c] == 'D') {

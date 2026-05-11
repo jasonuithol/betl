@@ -1,5 +1,7 @@
 #include "runtime/date_util.h"
 
+#include <stdio.h>     /* snprintf */
+
 int32_t betl_days_from_civil(int y, unsigned m, unsigned d) {
     y -= m <= 2;
     int era = (y >= 0 ? y : y - 399) / 400;
@@ -98,6 +100,52 @@ static int split_tz(const char *s, size_t n, size_t *out_prefix,
     /* No tz suffix found — treat input as already UTC. */
     *out_prefix = n;
     return 0;
+}
+
+int betl_parse_iso_time(const char *s, size_t n, int64_t *out_us) {
+    if (n < 8) return -1;
+    for (size_t i = 0; i < 8; ++i) {
+        char c = s[i];
+        int digit = (i != 2 && i != 5);
+        if (digit && !(c >= '0' && c <= '9')) return -1;
+        if (!digit && c != ':') return -1;
+    }
+    int hh = (s[0]-'0')*10 + (s[1]-'0');
+    int mm = (s[3]-'0')*10 + (s[4]-'0');
+    int ss = (s[6]-'0')*10 + (s[7]-'0');
+    if (hh > 23 || mm > 59 || ss > 59) return -1;
+    int64_t us = (int64_t)hh * 3600000000LL
+               + (int64_t)mm *   60000000LL
+               + (int64_t)ss *    1000000LL;
+    if (n > 8) {
+        if (s[8] != '.') return -1;
+        if (n > 15) return -1;
+        int frac = 0, mult = 100000;
+        for (size_t i = 9; i < n; ++i) {
+            char c = s[i];
+            if (c < '0' || c > '9') return -1;
+            frac += (c - '0') * mult;
+            mult /= 10;
+        }
+        us += frac;
+    }
+    *out_us = us;
+    return 0;
+}
+
+int betl_format_iso_time(int64_t us_of_day, char *buf, size_t cap) {
+    int hh = (int)(us_of_day / 3600000000LL);
+    int mm = (int)((us_of_day / 60000000LL) % 60);
+    int ss = (int)((us_of_day / 1000000LL) % 60);
+    int frac = (int)(us_of_day % 1000000LL);
+    int n;
+    if (frac == 0) {
+        n = snprintf(buf, cap, "%02d:%02d:%02d", hh, mm, ss);
+    } else {
+        n = snprintf(buf, cap, "%02d:%02d:%02d.%06d", hh, mm, ss, frac);
+    }
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return n;
 }
 
 int betl_parse_iso_tstz(const char *s, size_t n, int64_t *out_us) {

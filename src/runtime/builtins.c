@@ -782,6 +782,7 @@ typedef enum {
     CSV_T_TIMESTAMP_TZ  = 6,  /* Arrow tsu:UTC — int64 micros normalised to UTC */
     CSV_T_UUID          = 7,  /* Arrow w:16   — fixed 16 bytes per cell */
     CSV_T_FLOAT64       = 8,  /* Arrow g      — 64-bit IEEE float */
+    CSV_T_TIME_US       = 9,  /* Arrow ttu    — int64 micros of day */
 } CsvType;
 
 /* Per-column: schema fields (name, type) are set at init and live for
@@ -1014,7 +1015,7 @@ static int csv_alloc_staging(CsvState *s) {
     for (size_t c = 0; c < s->n_cols; ++c) {
         CsvCol *col = &s->cols[c];
         if (col->type == CSV_T_INT64 || col->type == CSV_T_TIMESTAMP_US
-            || col->type == CSV_T_TIMESTAMP_TZ) {
+            || col->type == CSV_T_TIMESTAMP_TZ || col->type == CSV_T_TIME_US) {
             int64_t *p = realloc(col->i64_vals,
                                  s->batch_size * sizeof *p);
             if (!p) return -1;
@@ -1095,6 +1096,14 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
         } else if (col->type == CSV_T_TIMESTAMP_TZ) {
             int64_t us;
             if (betl_parse_iso_tstz(field, flen, &us) != 0) {
+                free(field);
+                goto bad_field;
+            }
+            col->i64_vals[row_idx] = us;
+            free(field);
+        } else if (col->type == CSV_T_TIME_US) {
+            int64_t us;
+            if (betl_parse_iso_time(field, flen, &us) != 0) {
                 free(field);
                 goto bad_field;
             }
@@ -1275,6 +1284,7 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     else if (strcmp(type, "date")      == 0) t = CSV_T_DATE32;
     else if (strcmp(type, "timestamp")   == 0) t = CSV_T_TIMESTAMP_US;
     else if (strcmp(type, "timestamptz") == 0) t = CSV_T_TIMESTAMP_TZ;
+    else if (strcmp(type, "time")        == 0) t = CSV_T_TIME_US;
     else if (strcmp(type, "uuid")        == 0) t = CSV_T_UUID;
     else if (strcmp(type, "decimal")     == 0) {
         t = CSV_T_DECIMAL128;
@@ -1487,6 +1497,7 @@ static const char *csv_format_for_col(const CsvCol *c) {
         case CSV_T_DATE32:       return "tdD";
         case CSV_T_TIMESTAMP_US: return "tsu:";
         case CSV_T_TIMESTAMP_TZ: return "tsu:UTC";
+        case CSV_T_TIME_US:      return "ttu";
         case CSV_T_UTF8:         return "u";
         case CSV_T_UUID:         return "w:16";
         case CSV_T_FLOAT64:      return "g";
@@ -1629,7 +1640,8 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
         }
         if (s->cols[c].type == CSV_T_INT64
             || s->cols[c].type == CSV_T_TIMESTAMP_US
-            || s->cols[c].type == CSV_T_TIMESTAMP_TZ) {
+            || s->cols[c].type == CSV_T_TIMESTAMP_TZ
+            || s->cols[c].type == CSV_T_TIME_US) {
             int64_t *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
             if (!vals) {
                 free(kids[c]);
@@ -1995,6 +2007,13 @@ static int csv_write_render_cell(FILE *fp, char delim,
         }
         return rc < 0 ? -1 : 0;
     }
+    if (strcmp(fmt, "ttu") == 0) {
+        const int64_t *vals = col->buffers[1];
+        char buf[20];
+        int n = betl_format_iso_time(vals[off], buf, sizeof buf);
+        if (n < 0) return -1;
+        return csv_write_utf8_cell(fp, delim, buf, (size_t)n);
+    }
     if (strcmp(fmt, "tsu:UTC") == 0) {
         /* UTC-pinned timestamp: same layout as `tsu:`, render with a
          * trailing 'Z'. */
@@ -2073,6 +2092,7 @@ static int csv_write_sink_run(void *state) {
                          strcmp(fmt, "tdD")      == 0 ||
                          strcmp(fmt, "tsu:")     == 0 ||
                          strcmp(fmt, "tsu:UTC")  == 0 ||
+                         strcmp(fmt, "ttu")      == 0 ||
                          strcmp(fmt, "w:16")     == 0 ||
                          strncmp(fmt, "d:", 2)   == 0);
         if (!ok) {

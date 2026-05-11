@@ -132,6 +132,9 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
         *out = 'Z'; return 0;
     case SQL_GUID:               /* UNIQUEIDENTIFIER */
         *out = 'U'; return 0;
+    case SQL_TYPE_TIME:          /* MSSQL TIME */
+    case SQL_TIME:               /* older alias */
+        *out = 'M'; return 0;
     case SQL_REAL:
     case SQL_FLOAT:
     case SQL_DOUBLE:
@@ -477,7 +480,7 @@ static int msr_resolve_schema(MsReadState *s) {
             betl_set_error(s->ctx, "mssql.read: out of memory");
             return -1;
         }
-        if (fmt == 'l' || fmt == 'T' || fmt == 'Z') {
+        if (fmt == 'l' || fmt == 'T' || fmt == 'Z' || fmt == 'M') {
             s->cols[c].i64_vals = malloc(s->batch_size * sizeof(int64_t));
             if (!s->cols[c].i64_vals) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
@@ -756,6 +759,7 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
             case 'Z': fmt = "tsu:UTC"; break;
+            case 'M': fmt = "ttu"; break;
             case 'U': fmt = "w:16"; break;
             case 'N':
                 fmt = strdup(s->col_fmt_strings[i]);
@@ -849,6 +853,33 @@ static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
                         row, s->col_names[c], (int)blen, (const char *)buf);
                     return -1;
                 }
+            }
+            col->nulls[row]    = 0;
+            col->i64_vals[row] = us;
+        }
+        return 0;
+    }
+    if (s->col_fmts[c] == 'M') {
+        /* Fetch as text — "HH:MM:SS[.uuuuuu]". */
+        SQLCHAR buf[24];
+        SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                      SQL_C_CHAR, buf, sizeof buf, &ind))) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(time) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row]    = 1;
+            col->i64_vals[row] = 0;
+        } else {
+            int64_t us;
+            if (betl_parse_iso_time((const char *)buf, (size_t)ind, &us) != 0) {
+                betl_set_error(s->ctx,
+                    "mssql.read: row %zu col '%s': '%.*s' is not a valid time",
+                    row, s->col_names[c], (int)ind, (const char *)buf);
+                return -1;
             }
             col->nulls[row]    = 0;
             col->i64_vals[row] = us;
@@ -1093,7 +1124,8 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
         int rc;
-        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T' || s->col_fmts[c] == 'Z') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T'
+            || s->col_fmts[c] == 'Z' || s->col_fmts[c] == 'M') {
             rc = msr_build_int64_leaf(kids[c], s->cols[c].i64_vals,
                                       s->cols[c].nulls, (size_t)n);
         } else if (s->col_fmts[c] == 'D') {
