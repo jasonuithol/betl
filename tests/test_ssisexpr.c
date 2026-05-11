@@ -891,6 +891,155 @@ int main(int argc, char **argv) {
 
 #undef EXPECT_STR
 
+    /* --- 35: decimal arithmetic --------------------------------------- *
+     * Exercises add/sub/mul/div/mod on DT_NUMERIC values through
+     * op_arith. Result is cast to DT_R8 for easy double comparison;
+     * the decimal layer does the work in i128 with scale alignment. */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 2) \"1.50\" + (DT_NUMERIC, 18, 2) \"2.25\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 3.7499 && v[0] < 3.7501);  /* 3.75 */
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Scale alignment: 10.0000 (scale 4) - 3.50 (scale 2) → 6.5000 */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 4) \"10.0000\" - (DT_NUMERIC, 18, 2) \"3.50\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 6.4999 && v[0] < 6.5001);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Multiply: 2.50 * 0.500 → 1.25000 (scale 5 = 2+3) */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 2) \"2.50\" * (DT_NUMERIC, 18, 3) \"0.500\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 1.2499 && v[0] < 1.2501);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Divide: 10.00 / 4.00 → 2.500000 (scale = max(2,6) = 6) */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 2) \"10.00\" / (DT_NUMERIC, 18, 2) \"4.00\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 2.4999 && v[0] < 2.5001);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Divide producing repeating decimal: 1 / 3 at scale 6 → 0.333333 */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 0) \"1\" / (DT_NUMERIC, 18, 0) \"3\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 0.333332 && v[0] < 0.333334);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Modulo: 10.00 % 3.00 → 1.00 */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 2) \"10.00\" % (DT_NUMERIC, 18, 2) \"3.00\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 0.9999 && v[0] < 1.0001);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Decimal + int: 1.50 + 2 → 3.50  (int promoted to scale-0 dec) */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 2) \"1.50\" + 2)",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 3.4999 && v[0] < 3.5001);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Decimal + float: 1.50 + 0.25 (DT_R8) → goes via doubles → 1.75 */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_NUMERIC, 18, 2) \"1.50\" + (DT_R8) 0.25",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > 1.7499 && v[0] < 1.7501);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Negative result: 1.00 - 5.00 → -4.00 */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+            "(DT_R8) ((DT_NUMERIC, 18, 2) \"1.00\" - (DT_NUMERIC, 18, 2) \"5.00\")",
+            "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] > -4.0001 && v[0] < -3.9999);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Divide by zero is a run-time error. */
+        void *h = NULL;
+        rc = eng->compile(ctx,
+            "(DT_NUMERIC, 18, 2) \"1.00\" / (DT_NUMERIC, 18, 2) \"0\"",
+            &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "d:18,2", &out);
+        CHECK(rc != BETL_OK);
+        CHECK(out.release == NULL);
+        eng->release(h);
+    }
+    {
+        /* Overflow on multiply: ~10^37 * 100 won't fit in i128 even
+         * after scale clipping (i128 max ≈ 1.7 * 10^38). */
+        void *h = NULL;
+        rc = eng->compile(ctx,
+            "(DT_NUMERIC, 38, 0) \"9999999999999999999999999999999999999\" "
+            "* (DT_NUMERIC, 18, 0) \"100\"",
+            &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "d:38,0", &out);
+        CHECK(rc != BETL_OK);
+        CHECK(out.release == NULL);
+        eng->release(h);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;

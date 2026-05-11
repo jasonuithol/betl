@@ -153,8 +153,8 @@ is NULL.
 | Operator | Notes |
 |---|---|
 | `-x`, `!x`, `~x` | Unary negate, logical NOT, bitwise NOT (int only). |
-| `*` `/` `%` | Multiplicative. Integer divide-by-zero is an error; float `0/0` follows IEEE 754. |
-| `+` `-` | Additive. **`+` on two strings is concatenation**, matching SSIS. |
+| `*` `/` `%` | Multiplicative. Integer divide-by-zero is an error; float `0/0` follows IEEE 754. Decimal `*` produces scale = sa + sb (clipped at 38); decimal `/` lands at scale = max(sa, 6) with half-away-from-zero rounding; decimal `%` aligns to the wider scale. |
+| `+` `-` | Additive. **`+` on two strings is concatenation**, matching SSIS. Decimal `+` / `-` align operand scales to the wider side; result fits in i128 or errors. Decimal mixed with int promotes the int to a scale-0 decimal; decimal mixed with float falls back to IEEE 754 doubles. |
 | `<` `<=` `>` `>=` | Numeric / string / temporal / decimal / uuid compare. Mixed temporal (date vs timestamp) promotes the date to midnight; mixed decimal scales promote to the wider scale; decimal vs int / float falls back to a double-precision compare (~16 decimal digits of precision). UUIDs compare byte-wise. |
 | `==` `!=` | Equality, same rules as ordering. |
 | `&&` `\|\|` | 3VL logical AND / OR (see above). |
@@ -243,11 +243,6 @@ for v2.
   now, expose project variables as pipeline parameters and reference
   them with `${params.foo}` substitution before the expression is
   compiled.
-- **Decimal arithmetic.** Decimals can be read, cast, compared,
-  rescaled, and rendered — but `+ - * /` between two `DT_NUMERIC`
-  operands isn't wired. Workaround: cast both sides to `(DT_R8)`,
-  compute, and (DT_NUMERIC, p, s) back. Lossy but adequate for
-  typical SSIS migrations where decimal math happens in SQL.
 - **`DT_DBTIME` / `DT_DBTIME2` casts.** Time columns flow through
   the engine as int64 micros-of-day (Arrow `ttu`), but the
   `(DT_DBTIME)` cast syntax isn't recognised. Workaround:
@@ -277,9 +272,10 @@ for v2.
 
 ## See also
 
-- `tests/test_ssisexpr.c` — 34 subtests covering literals, casts,
-  3VL operators, every function, NULL propagation, and parse / type
-  errors. The most precise spec of what the engine accepts.
+- `tests/test_ssisexpr.c` — the comprehensive subtest suite, covering
+  literals, casts, 3VL operators (incl. decimal arithmetic), every
+  function, NULL propagation, and parse / type errors. The most
+  precise spec of what the engine accepts.
 - `examples/04-ssis-orders-by-month/` — a complete pipeline using
   `ssisexpr` end-to-end (csv.read → ssisexpr → postgres.upsert).
 - `docs/EXPR_ABI.md` — the C ABI the engine implements. Read this

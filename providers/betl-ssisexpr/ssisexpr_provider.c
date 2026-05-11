@@ -1239,6 +1239,11 @@ static int parse_decimal(const char *s, size_t n, int scale, i128 *out);
 static int format_decimal(i128 v, int scale, char *buf, size_t cap);
 static double decimal_to_double(i128 v, int scale);
 static int compare_decimals(i128 a, int sa, i128 b, int sb);
+static int dec_add(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
+static int dec_sub(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
+static int dec_mul(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
+static int dec_div(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
+static int dec_mod(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
 
 static int op_arith(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Value *out) {
     Value a, b;
@@ -1266,6 +1271,40 @@ static int op_arith(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Valu
         return eval_err(E, "arithmetic on string/bool is not allowed");
     }
     promote_numeric(&a, &b);
+
+    /* Decimal arithmetic. Mixed-with-float goes via doubles (lossy but
+     * matches the comparison-mixing rule); mixed-with-int promotes the
+     * int side to a scale-0 decimal so all-i128 paths stay exact. */
+    if (a.kind == VK_DECIMAL128 || b.kind == VK_DECIMAL128) {
+        if (a.kind == VK_FLOAT64 || b.kind == VK_FLOAT64) {
+            double ad = (a.kind == VK_DECIMAL128) ? decimal_to_double(a.d128, a.dec_scale) : a.f64;
+            double bd = (b.kind == VK_DECIMAL128) ? decimal_to_double(b.d128, b.dec_scale) : b.f64;
+            out->kind = VK_FLOAT64;
+            switch (op) {
+                case OP_ADD: out->f64 = ad + bd; return 0;
+                case OP_SUB: out->f64 = ad - bd; return 0;
+                case OP_MUL: out->f64 = ad * bd; return 0;
+                case OP_DIV: out->f64 = ad / bd; return 0;
+                case OP_MOD: out->f64 = fmod(ad, bd); return 0;
+                default:     return eval_err(E, "internal: bad arith op");
+            }
+        }
+        if (a.kind == VK_INT64) { a.d128 = (i128)a.i64; a.dec_scale = 0; a.kind = VK_DECIMAL128; }
+        if (b.kind == VK_INT64) { b.d128 = (i128)b.i64; b.dec_scale = 0; b.kind = VK_DECIMAL128; }
+        i128 r; int rs; int rc;
+        switch (op) {
+            case OP_ADD: rc = dec_add(a.d128, a.dec_scale, b.d128, b.dec_scale, &r, &rs); break;
+            case OP_SUB: rc = dec_sub(a.d128, a.dec_scale, b.d128, b.dec_scale, &r, &rs); break;
+            case OP_MUL: rc = dec_mul(a.d128, a.dec_scale, b.d128, b.dec_scale, &r, &rs); break;
+            case OP_DIV: rc = dec_div(a.d128, a.dec_scale, b.d128, b.dec_scale, &r, &rs); break;
+            case OP_MOD: rc = dec_mod(a.d128, a.dec_scale, b.d128, b.dec_scale, &r, &rs); break;
+            default:     return eval_err(E, "internal: bad arith op");
+        }
+        if (rc != 0) return eval_err(E, "decimal arithmetic: overflow or divide-by-zero");
+        out->kind = VK_DECIMAL128; out->d128 = r; out->dec_scale = rs;
+        return 0;
+    }
+
     if (a.kind == VK_INT64) {
         switch (op) {
             case OP_ADD: out->kind = VK_INT64; out->i64 = a.i64 + b.i64; return 0;
@@ -1703,6 +1742,95 @@ static int compare_decimals(i128 a, int sa, i128 b, int sb) {
     if (sa < sb) ax *= mul; else bx *= mul;
     if (ax < bx) return -1;
     if (ax > bx) return 1;
+    return 0;
+}
+
+/* Decimal arithmetic. All return 0 on success, -1 on overflow or
+ * divide-by-zero. Overflow detection uses __builtin_*_overflow on
+ * __int128 (gcc/clang). */
+
+static int dec_pow10(int n, i128 *out) {
+    if (n < 0 || n > 38) return -1;
+    i128 r = 1;
+    for (int i = 0; i < n; ++i) {
+        if (__builtin_mul_overflow(r, (i128)10, &r)) return -1;
+    }
+    *out = r;
+    return 0;
+}
+
+static int dec_scale_up(i128 v, int n, i128 *out) {
+    i128 m;
+    if (dec_pow10(n, &m) != 0) return -1;
+    if (__builtin_mul_overflow(v, m, out)) return -1;
+    return 0;
+}
+
+static int dec_add(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale) {
+    int r = sa > sb ? sa : sb;
+    i128 ax, bx;
+    if (dec_scale_up(a, r - sa, &ax) != 0) return -1;
+    if (dec_scale_up(b, r - sb, &bx) != 0) return -1;
+    if (__builtin_add_overflow(ax, bx, out)) return -1;
+    *out_scale = r;
+    return 0;
+}
+
+static int dec_sub(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale) {
+    int r = sa > sb ? sa : sb;
+    i128 ax, bx;
+    if (dec_scale_up(a, r - sa, &ax) != 0) return -1;
+    if (dec_scale_up(b, r - sb, &bx) != 0) return -1;
+    if (__builtin_sub_overflow(ax, bx, out)) return -1;
+    *out_scale = r;
+    return 0;
+}
+
+static int dec_mul(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale) {
+    i128 r;
+    if (__builtin_mul_overflow(a, b, &r)) return -1;
+    int rs = sa + sb;
+    /* Cap result scale at 38 by truncating trailing digits — keeps the
+     * value renderable (format_decimal tops out at 38) without losing
+     * any magnitude. */
+    while (rs > 38) { r /= 10; --rs; }
+    *out = r;
+    *out_scale = rs;
+    return 0;
+}
+
+static int dec_div(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale) {
+    if (b == 0) return -1;
+    /* Result scale: keep at least 6 fractional digits, never less than sa.
+     * Mirrors SQL Server's "min 6" rule without the full precision math —
+     * sufficient for round-tripping SSIS expression semantics. */
+    int rs = sa > 6 ? sa : 6;
+    int shift = rs + sb - sa;
+    i128 num = a;
+    if (shift > 0) {
+        if (dec_scale_up(a, shift, &num) != 0) return -1;
+    } else if (shift < 0) {
+        for (int i = 0; i < -shift; ++i) num /= 10;
+    }
+    int neg = ((num < 0) ^ (b < 0));
+    i128 anum = num < 0 ? -num : num;
+    i128 ab   = b   < 0 ? -b   : b;
+    i128 q   = anum / ab;
+    i128 rem = anum - q * ab;
+    if (rem * 2 >= ab) q += 1;  /* half-away-from-zero */
+    *out = neg ? -q : q;
+    *out_scale = rs;
+    return 0;
+}
+
+static int dec_mod(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale) {
+    if (b == 0) return -1;
+    int r = sa > sb ? sa : sb;
+    i128 ax, bx;
+    if (dec_scale_up(a, r - sa, &ax) != 0) return -1;
+    if (dec_scale_up(b, r - sb, &bx) != 0) return -1;
+    *out = ax % bx;
+    *out_scale = r;
     return 0;
 }
 
