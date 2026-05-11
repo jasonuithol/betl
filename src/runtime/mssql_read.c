@@ -28,6 +28,7 @@
 
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
+#include "runtime/uuid_util.h"
 
 #include "betl/provider.h"
 
@@ -129,6 +130,8 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
         *out = 'T'; return 0;
     case -155:                   /* SQL_SS_TIMESTAMPOFFSET (MS extension) */
         *out = 'Z'; return 0;
+    case SQL_GUID:               /* UNIQUEIDENTIFIER */
+        *out = 'U'; return 0;
     case SQL_DECIMAL:
     case SQL_NUMERIC:
         *out = 'N'; return 0;
@@ -197,10 +200,12 @@ static void msr_release_schema_struct(struct ArrowSchema *sch) {
 typedef struct {
     /* Per-batch staging — capacity = batch_size; current row count
      * tracked at the state level. i64_vals is used for both 'l' and
-     * 'T' (timestamp_us); d32_vals for 'D'; d128_vals for 'N'. */
+     * 'T' (timestamp_us); d32_vals for 'D'; d128_vals for 'N';
+     * uuid_vals for 'U' (16 bytes per row, packed). */
     int64_t      *i64_vals;
     int32_t      *d32_vals;
     betl_dec128  *d128_vals;
+    uint8_t      *uuid_vals;
     char        **u8_strs;
     size_t       *u8_lens;
     uint8_t      *nulls;       /* 1 = null, 0 = valid */
@@ -362,6 +367,7 @@ static void msr_destroy(void *state) {
             free(s->cols[c].i64_vals);
             free(s->cols[c].d32_vals);
             free(s->cols[c].d128_vals);
+            free(s->cols[c].uuid_vals);
             free(s->cols[c].u8_strs);
             free(s->cols[c].u8_lens);
             free(s->cols[c].nulls);
@@ -483,6 +489,12 @@ static int msr_resolve_schema(MsReadState *s) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
                 return -1;
             }
+        } else if (fmt == 'U') {
+            s->cols[c].uuid_vals = malloc(s->batch_size * 16);
+            if (!s->cols[c].uuid_vals) {
+                betl_set_error(s->ctx, "mssql.read: out of memory");
+                return -1;
+            }
         } else {
             s->cols[c].u8_strs = calloc(s->batch_size, sizeof(char *));
             s->cols[c].u8_lens = calloc(s->batch_size, sizeof(size_t));
@@ -556,6 +568,40 @@ static void msr_release_decimal128_leaf(struct ArrowArray *arr) {
     }
     free(arr->buffers);
     arr->release = NULL;
+}
+
+static void msr_release_uuid_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static int msr_build_uuid_leaf(struct ArrowArray *out,
+                               const uint8_t *vals, /* n*16 bytes */
+                               const uint8_t *nulls,
+                               size_t n) {
+    size_t bytes = (n ? n : 1) * 16;
+    uint8_t *vbuf = malloc(bytes);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        if (nulls[i]) memset(vbuf + i * 16, 0, 16);
+        else          memcpy(vbuf + i * 16, vals + i * 16, 16);
+    }
+    int64_t null_count = 0;
+    uint8_t *vmap = msr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = msr_release_uuid_leaf;
+    return 0;
 }
 
 static int msr_build_decimal128_leaf(struct ArrowArray *out,
@@ -667,6 +713,7 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
             case 'Z': fmt = "tsu:UTC"; break;
+            case 'U': fmt = "w:16"; break;
             case 'N':
                 fmt = strdup(s->col_fmt_strings[i]);
                 owned = 1;
@@ -762,6 +809,33 @@ static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
             }
             col->nulls[row]    = 0;
             col->i64_vals[row] = us;
+        }
+        return 0;
+    }
+    if (s->col_fmts[c] == 'U') {
+        /* UNIQUEIDENTIFIER as text: standard 36-char form (sometimes
+         * upper-case). Our parser is case-insensitive. */
+        SQLCHAR buf[64];
+        SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                      SQL_C_CHAR, buf, sizeof buf, &ind))) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(uuid) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row] = 1;
+            memset(&col->uuid_vals[row * 16], 0, 16);
+        } else {
+            if (betl_uuid_parse((const char *)buf, (size_t)ind,
+                                &col->uuid_vals[row * 16]) != 0) {
+                betl_set_error(s->ctx,
+                    "mssql.read: row %zu col '%s': '%.*s' is not a valid UUID",
+                    row, s->col_names[c], (int)ind, (const char *)buf);
+                return -1;
+            }
+            col->nulls[row] = 0;
         }
         return 0;
     }
@@ -966,6 +1040,9 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'N') {
             rc = msr_build_decimal128_leaf(kids[c], s->cols[c].d128_vals,
                                            s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 'U') {
+            rc = msr_build_uuid_leaf(kids[c], s->cols[c].uuid_vals,
+                                     s->cols[c].nulls, (size_t)n);
         } else {
             rc = msr_build_utf8_leaf(kids[c], s->cols[c].u8_strs,
                                      s->cols[c].u8_lens,

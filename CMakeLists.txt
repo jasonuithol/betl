@@ -112,6 +112,7 @@ add_library(betl_core STATIC
     src/runtime/date_util.c
     src/runtime/decimal_util.c
     src/runtime/exec.c
+    src/runtime/uuid_util.c
     src/runtime/literal_expr.c
     src/runtime/mssql_sql.c
     src/runtime/parameters.c

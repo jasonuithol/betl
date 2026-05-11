@@ -32,6 +32,7 @@
 #include "betl/provider.h"
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
+#include "runtime/uuid_util.h"
 #include "runtime/mssql_sql.h"
 
 /* ============================================================== *
@@ -126,6 +127,7 @@ typedef enum {
     MS_TIMESTAMP_US,
     MS_TIMESTAMP_TZ,
     MS_DECIMAL128,
+    MS_UUID,
     MS_UNSUPPORTED
 } MsColType;
 
@@ -138,6 +140,7 @@ static MsColType arrow_to_ms(const char *fmt) {
     if (strcmp(fmt, "tdD")      == 0) return MS_DATE32;
     if (strcmp(fmt, "tsu:")     == 0) return MS_TIMESTAMP_US;
     if (strcmp(fmt, "tsu:UTC")  == 0) return MS_TIMESTAMP_TZ;
+    if (strcmp(fmt, "w:16")     == 0) return MS_UUID;
     if (strncmp(fmt, "d:", 2)   == 0) return MS_DECIMAL128;
     return MS_UNSUPPORTED;
 }
@@ -472,6 +475,24 @@ static int ms_fill_cell(BetlContext *ctx,
         b->ind = (SQLLEN)n;
         return BETL_OK;
     }
+    case MS_UUID: {
+        const uint8_t *vals = col->buffers[1];
+        char tmp[37];
+        if (betl_uuid_format(&vals[off * 16], tmp, 36) < 0) {
+            betl_set_error(ctx, "mssql.upsert: uuid format failed for col '%s'",
+                           col_name);
+            return BETL_ERR_INTERNAL;
+        }
+        tmp[36] = '\0';
+        if (ensure_str_cap(b, 37) != 0) {
+            betl_set_error(ctx, "mssql.upsert: OOM staging uuid column '%s'",
+                           col_name);
+            return BETL_ERR_INTERNAL;
+        }
+        memcpy(b->str_buf, tmp, 37);
+        b->ind = 36;
+        return BETL_OK;
+    }
     case MS_DECIMAL128: {
         const betl_dec128 *vals = col->buffers[1];
         char tmp[48];
@@ -575,6 +596,11 @@ static int ms_bind_param(BetlContext *ctx, SQLHSTMT hstmt,
          * apply a tighter structured layout. */
         rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_CHAR, SQL_VARCHAR, 34, 7,
+                              b->str_buf, (SQLLEN)b->str_cap, &b->ind);
+        break;
+    case MS_UUID:
+        rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
+                              SQL_C_CHAR, SQL_GUID, 36, 0,
                               b->str_buf, (SQLLEN)b->str_cap, &b->ind);
         break;
     case MS_UNSUPPORTED:
@@ -687,7 +713,7 @@ static int ms_sink_run(void *state) {
         /* Pre-allocate scratch so SQLBindParameter has a stable
          * non-NULL pointer. ms_fill_cell will grow it on demand. */
         if ((bufs[i].type == MS_UTF8 || bufs[i].type == MS_DECIMAL128
-             || bufs[i].type == MS_TIMESTAMP_TZ)
+             || bufs[i].type == MS_TIMESTAMP_TZ || bufs[i].type == MS_UUID)
             && ensure_str_cap(&bufs[i], 64) != 0) {
             rc = BETL_ERR_INTERNAL;
             goto cleanup_pre;

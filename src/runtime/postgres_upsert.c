@@ -35,6 +35,7 @@
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
 #include "runtime/pg_sql.h"
+#include "runtime/uuid_util.h"
 
 /* ============================================================== *
  *  JSON value extractor                                            *
@@ -271,6 +272,7 @@ typedef enum {
     PG_DATE32,
     PG_TIMESTAMP_US,
     PG_DECIMAL128,
+    PG_UUID,
     PG_UNSUPPORTED
 } PgColType;
 
@@ -283,6 +285,7 @@ static PgColType arrow_to_pg(const char *fmt) {
     if (strcmp(fmt, "tdD")     == 0) return PG_DATE32;
     if (strcmp(fmt, "tsu:")    == 0) return PG_TIMESTAMP_US;
     if (strcmp(fmt, "tsu:UTC") == 0) return PG_TIMESTAMP_US;  /* UTC-pinned */
+    if (strcmp(fmt, "w:16")    == 0) return PG_UUID;
     if (strncmp(fmt, "d:", 2)  == 0) return PG_DECIMAL128;
     return PG_UNSUPPORTED;
 }
@@ -383,6 +386,17 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
         char *str = malloc((size_t)n + 1);
         if (!str) return -2;
         memcpy(str, buf, (size_t)n + 1);
+        *out = str;
+        return 0;
+    }
+    case PG_UUID: {
+        const uint8_t *vals = col->buffers[1];
+        char buf[37];
+        if (betl_uuid_format(&vals[off * 16], buf, sizeof buf - 1) < 0) return -2;
+        buf[36] = '\0';
+        char *str = malloc(37);
+        if (!str) return -2;
+        memcpy(str, buf, 37);
         *out = str;
         return 0;
     }

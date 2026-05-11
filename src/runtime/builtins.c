@@ -12,6 +12,7 @@
 #include "runtime/decimal_util.h"
 #include "runtime/literal_expr.h"
 #include "runtime/transforms.h"
+#include "runtime/uuid_util.h"
 
 #ifdef BETL_HAVE_LIBPQ
 #include "runtime/postgres_upsert.h"
@@ -125,6 +126,14 @@ static void release_array_date32_leaf(struct ArrowArray *arr) {
 }
 
 static void release_array_decimal128_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static void release_array_uuid_leaf(struct ArrowArray *arr) {
     if (arr->n_buffers >= 2 && arr->buffers) {
         free((void *)arr->buffers[1]);
     }
@@ -763,6 +772,7 @@ typedef enum {
     CSV_T_TIMESTAMP_US  = 4,  /* Arrow tsu: — int64 micros since 1970-01-01 */
     CSV_T_DECIMAL128    = 5,  /* Arrow d:p,s — int128 + (precision, scale) */
     CSV_T_TIMESTAMP_TZ  = 6,  /* Arrow tsu:UTC — int64 micros normalised to UTC */
+    CSV_T_UUID          = 7,  /* Arrow w:16   — fixed 16 bytes per cell */
 } CsvType;
 
 /* Per-column: schema fields (name, type) are set at init and live for
@@ -777,6 +787,7 @@ typedef struct {
     int64_t *i64_vals;       /* [row_cap] — int64 + timestamp_us */
     int32_t *d32_vals;       /* [row_cap] — date32 */
     betl_dec128 *d128_vals;  /* [row_cap] — decimal128 */
+    uint8_t *uuid_vals;      /* [row_cap*16] — uuid */
     char   **u8_strs;        /* [row_cap] heap strings (NUL-terminated) */
     size_t  *u8_lens;        /* [row_cap] cached string lengths */
 } CsvCol;
@@ -1008,6 +1019,10 @@ static int csv_alloc_staging(CsvState *s) {
                                      s->batch_size * sizeof *p);
             if (!p) return -1;
             col->d128_vals = p;
+        } else if (col->type == CSV_T_UUID) {
+            uint8_t *p = realloc(col->uuid_vals, s->batch_size * 16);
+            if (!p) return -1;
+            col->uuid_vals = p;
         } else {
             char **sp = realloc(col->u8_strs,
                                 s->batch_size * sizeof *sp);
@@ -1079,6 +1094,13 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
             }
             col->d128_vals[row_idx] = v;
             free(field);
+        } else if (col->type == CSV_T_UUID) {
+            if (betl_uuid_parse(field, flen,
+                                &col->uuid_vals[row_idx * 16]) != 0) {
+                free(field);
+                goto bad_field;
+            }
+            free(field);
         } else {
             col->u8_strs[row_idx] = field;
             col->u8_lens[row_idx] = flen;
@@ -1123,6 +1145,7 @@ static void csv_state_clear_columns(CsvState *s) {
             free(col->i64_vals);
             free(col->d32_vals);
             free(col->d128_vals);
+            free(col->uuid_vals);
             if (col->u8_strs) {
                 for (size_t r = 0; r < s->n_rows; ++r) free(col->u8_strs[r]);
                 free(col->u8_strs);
@@ -1216,6 +1239,7 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     else if (strcmp(type, "date")      == 0) t = CSV_T_DATE32;
     else if (strcmp(type, "timestamp")   == 0) t = CSV_T_TIMESTAMP_US;
     else if (strcmp(type, "timestamptz") == 0) t = CSV_T_TIMESTAMP_TZ;
+    else if (strcmp(type, "uuid")        == 0) t = CSV_T_UUID;
     else if (strcmp(type, "decimal")     == 0) {
         t = CSV_T_DECIMAL128;
         /* Required: precision + scale ints in the same {} block. */
@@ -1428,6 +1452,7 @@ static const char *csv_format_for_col(const CsvCol *c) {
         case CSV_T_TIMESTAMP_US: return "tsu:";
         case CSV_T_TIMESTAMP_TZ: return "tsu:UTC";
         case CSV_T_UTF8:         return "u";
+        case CSV_T_UUID:         return "w:16";
         case CSV_T_DECIMAL128:   return c->fmt_string ? c->fmt_string : "u";
     }
     return "u";
@@ -1651,6 +1676,34 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
             kids[c]->n_buffers  = 2;
             kids[c]->buffers    = bufs;
             kids[c]->release    = release_array_decimal128_leaf;
+        } else if (s->cols[c].type == CSV_T_UUID) {
+            size_t bytes = (size_t)((n > 0 ? n : 1)) * 16;
+            uint8_t *vals = malloc(bytes);
+            if (!vals) {
+                free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            if (n > 0) memcpy(vals, s->cols[c].uuid_vals, (size_t)n * 16);
+            const void **bufs = malloc(2 * sizeof *bufs);
+            if (!bufs) {
+                free(vals); free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            bufs[0] = NULL;
+            bufs[1] = vals;
+            kids[c]->length     = n;
+            kids[c]->null_count = 0;
+            kids[c]->n_buffers  = 2;
+            kids[c]->buffers    = bufs;
+            kids[c]->release    = release_array_uuid_leaf;
         } else {
             if (csv_build_utf8_leaf(kids[c], s->cols[c].u8_strs,
                                     s->cols[c].u8_lens, (size_t)n) != 0) {
@@ -1903,6 +1956,12 @@ static int csv_write_render_cell(FILE *fp, char delim,
         if (n < 0) return -1;
         return csv_write_utf8_cell(fp, delim, buf, (size_t)n);
     }
+    if (strcmp(fmt, "w:16") == 0) {
+        const uint8_t *vals = col->buffers[1];
+        char buf[37];
+        if (betl_uuid_format(&vals[off * 16], buf, 36) < 0) return -1;
+        return csv_write_utf8_cell(fp, delim, buf, 36);
+    }
     return -2; /* unsupported format */
 }
 
@@ -1943,6 +2002,7 @@ static int csv_write_sink_run(void *state) {
                          strcmp(fmt, "tdD")      == 0 ||
                          strcmp(fmt, "tsu:")     == 0 ||
                          strcmp(fmt, "tsu:UTC")  == 0 ||
+                         strcmp(fmt, "w:16")     == 0 ||
                          strncmp(fmt, "d:", 2)   == 0);
         if (!ok) {
             betl_set_error(s->ctx,

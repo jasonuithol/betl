@@ -72,6 +72,7 @@ typedef enum {
     DT_DBTIMESTAMP2,    /* alias for DT_DBTIMESTAMP (SSIS distinguishes
                          * by precision; we treat both as us-precision) */
     DT_NUMERIC,         /* Arrow d:p,s — int128 + (precision, scale) */
+    DT_GUID,            /* Arrow w:16 — 16-byte UUID */
 } SsisDt;
 
 typedef enum {
@@ -518,6 +519,7 @@ static int parse_dt(const char *name, SsisDt *out) {
     else if (strcasecmp(name, "DT_DBTIMESTAMP2") == 0) { *out = DT_DBTIMESTAMP2; return 1; }
     else if (strcasecmp(name, "DT_NUMERIC")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_DECIMAL")      == 0) { *out = DT_NUMERIC;      return 1; }
+    else if (strcasecmp(name, "DT_GUID")         == 0) { *out = DT_GUID;         return 1; }
     return 0;
 }
 
@@ -1086,6 +1088,7 @@ typedef enum {
     VK_DATE32,         /* int32 days since 1970-01-01; stored in i64 */
     VK_TIMESTAMP_US,   /* int64 micros since 1970-01-01 UTC; stored in i64 */
     VK_DECIMAL128,     /* int128 fixed-scale; stored in d128 + dec_scale */
+    VK_UUID,           /* 16 raw bytes; stored in `uuid` (zero-copy into batch) */
 } VKind;
 
 typedef struct {
@@ -1100,6 +1103,8 @@ typedef struct {
      * owns the buffer until evaluate() exits. */
     const char *str;
     size_t      str_n;
+    /* uuid: 16-byte pointer. Same lifetime model as `str`. */
+    const uint8_t *uuid;
     VKind       kind;
     int         is_null;
     int         b;
@@ -1191,6 +1196,12 @@ static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, int dec_scale,
             out->dec_scale = dec_scale;
             return 0;
         }
+        case 'U': {
+            const uint8_t *v = col->buffers[1];
+            out->kind = VK_UUID;
+            out->uuid = &v[row * 16];     /* zero-copy into the batch */
+            return 0;
+        }
         default:
             return eval_err(E, "unsupported column format '%c'", col_fmt);
     }
@@ -1277,6 +1288,12 @@ static int cmp_values(Eval *E, const Value *a, const Value *b, int *out_cmp) {
     }
     if (a->kind == VK_BOOL && b->kind == VK_BOOL) {
         *out_cmp = (a->b > b->b) - (a->b < b->b);
+        return 0;
+    }
+    /* UUID equality / ordering: lexicographic byte compare. */
+    if (a->kind == VK_UUID && b->kind == VK_UUID) {
+        int c = memcmp(a->uuid, b->uuid, 16);
+        *out_cmp = c < 0 ? -1 : (c > 0 ? 1 : 0);
         return 0;
     }
     /* Decimal vs decimal — direct compare with scale promotion. */
@@ -1590,6 +1607,41 @@ static int format_decimal(i128 v, int scale, char *buf, size_t cap) {
     return (int)(p - buf);
 }
 
+/* UUID inline helpers, same shape as src/runtime/uuid_util. */
+static int uuid_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static int parse_uuid(const char *s, size_t n, uint8_t out[16]) {
+    if (n != 36) return -1;
+    if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') return -1;
+    int byte = 0;
+    for (size_t i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) continue;
+        int h = uuid_hex(s[i]);     if (h < 0) return -1;
+        int l = uuid_hex(s[i + 1]); if (l < 0) return -1;
+        out[byte++] = (uint8_t)((h << 4) | l);
+        ++i;
+    }
+    return byte == 16 ? 0 : -1;
+}
+static int format_uuid(const uint8_t in[16], char *buf, size_t cap) {
+    if (cap < 36) return -1;
+    static const char hex[] = "0123456789abcdef";
+    int byte = 0;
+    for (size_t i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { buf[i] = '-'; continue; }
+        uint8_t b = in[byte++];
+        buf[i]     = hex[b >> 4];
+        buf[i + 1] = hex[b & 0xF];
+        ++i;
+    }
+    return 36;
+}
+
+
 static double decimal_to_double(i128 v, int scale) {
     int neg = (v < 0);
     i128 mag = neg ? -v : v;
@@ -1645,6 +1697,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     int to_date  = (dt == DT_DBDATE);
     int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2);
     int to_dec   = (dt == DT_NUMERIC);
+    int to_uuid  = (dt == DT_GUID);
 
     if (to_int) {
         out->kind = VK_INT64;
@@ -1713,6 +1766,9 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
         else if (in->kind == VK_DATE32)       n = fmt_date_iso((int32_t)in->i64, buf, sizeof buf);
         else if (in->kind == VK_TIMESTAMP_US) n = fmt_ts_iso  (in->i64,           buf, sizeof buf);
         else if (in->kind == VK_DECIMAL128)   n = format_decimal(in->d128, in->dec_scale, buf, sizeof buf);
+        else if (in->kind == VK_UUID) {
+            n = format_uuid(in->uuid, buf, sizeof buf);
+        }
         if (n < 0 || (size_t)n >= sizeof buf) return eval_err(E, "cast -> string overflow");
         char *cp = malloc((size_t)n + 1);
         if (!cp) return eval_err(E, "out of memory");
@@ -1755,6 +1811,24 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             return 0;
         }
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
+    }
+    if (to_uuid) {
+        out->kind = VK_UUID;
+        if (in->kind == VK_UUID) { out->uuid = in->uuid; return 0; }
+        if (in->kind == VK_UTF8) {
+            uint8_t *buf = malloc(16);
+            if (!buf) return eval_err(E, "out of memory");
+            if (parse_uuid(in->str, in->str_n, buf) != 0) {
+                free(buf);
+                return eval_err(E, "cast string -> DT_GUID: "
+                                   "expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
+            }
+            if (scratch_add(E->scratch, (char *)buf) != 0)
+                return eval_err(E, "out of memory");
+            out->uuid = buf;
+            return 0;
+        }
+        return eval_err(E, "cast non-string -> DT_GUID not supported");
     }
     if (to_dec) {
         /* `(DT_NUMERIC, p, s)`: precision is metadata only; scale is the
@@ -2489,6 +2563,7 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
         else if (strcmp(fmt, "tdD") == 0) e->col_fmts[i] = 'D';
         else if (strcmp(fmt, "tsu:") == 0) e->col_fmts[i] = 'T';
         else if (strcmp(fmt, "tsu:UTC") == 0) e->col_fmts[i] = 'T'; /* same int64 layout */
+        else if (strcmp(fmt, "w:16") == 0)    e->col_fmts[i] = 'U';
         else if (strncmp(fmt, "d:", 2) == 0) {
             /* "d:precision,scale" — extract scale (precision is metadata). */
             int p = 0, s = 0;
