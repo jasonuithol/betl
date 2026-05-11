@@ -76,6 +76,8 @@ typedef enum {
     DT_DBTIMESTAMP2,    /* alias for DT_DBTIMESTAMP (SSIS distinguishes
                          * by precision; we treat both as us-precision) */
     DT_DBTIME,          /* time-of-day; result is int64 micros-of-day */
+    DT_DATE,            /* OLE-Auto-Date: numeric input = days since
+                         * 1899-12-30; otherwise same as DT_DBTIMESTAMP */
     DT_NUMERIC,         /* Arrow d:p,s — int128 + (precision, scale) */
     DT_GUID,            /* Arrow w:16 — 16-byte UUID */
     DT_BYTES,           /* Arrow z — variable-length bytes */
@@ -571,6 +573,7 @@ static int parse_dt(const char *name, SsisDt *out) {
     else if (strcasecmp(name, "DT_DBTIMESTAMPOFFSET") == 0) { *out = DT_DBTIMESTAMP; return 1; }
     else if (strcasecmp(name, "DT_DBTIME")       == 0) { *out = DT_DBTIME;       return 1; }
     else if (strcasecmp(name, "DT_DBTIME2")      == 0) { *out = DT_DBTIME;       return 1; }
+    else if (strcasecmp(name, "DT_DATE")         == 0) { *out = DT_DATE;         return 1; }
     else if (strcasecmp(name, "DT_NUMERIC")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_DECIMAL")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_GUID")         == 0) { *out = DT_GUID;         return 1; }
@@ -2041,7 +2044,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     int to_str   = (dt == DT_WSTR || dt == DT_STR);
     int to_bool  = (dt == DT_BOOL);
     int to_date  = (dt == DT_DBDATE);
-    int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2);
+    int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2 || dt == DT_DATE);
     int to_time  = (dt == DT_DBTIME);
     int to_dec   = (dt == DT_NUMERIC);
     int to_uuid  = (dt == DT_GUID);
@@ -2199,6 +2202,17 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             if (parse_iso_ts(in->str, in->str_n, &us) != 0)
                 return eval_err(E, "cast string -> DT_DBTIMESTAMP: expected YYYY-MM-DD HH:MM:SS[.uuuuuu]");
             out->i64 = us;
+            return 0;
+        }
+        if (dt == DT_DATE &&
+            (in->kind == VK_FLOAT64 || in->kind == VK_INT64 || in->kind == VK_DECIMAL128)) {
+            /* OLE-Auto-Date: days since 1899-12-30, fractional part = time-of-day.
+             * Unix epoch is 25569 days later. */
+            double days;
+            if (in->kind == VK_FLOAT64)      days = in->f64;
+            else if (in->kind == VK_INT64)   days = (double)in->i64;
+            else                             days = decimal_to_double(in->d128, in->dec_scale);
+            out->i64 = (int64_t)((days - 25569.0) * 86400000000.0);
             return 0;
         }
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");

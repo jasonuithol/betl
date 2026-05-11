@@ -1481,6 +1481,63 @@ int main(int argc, char **argv) {
         if (out.release) out.release(&out);
     }
 
+    /* --- 44: DT_DATE (OLE-Auto-Date) cast ----------------------------- *
+     * SSIS' (DT_DATE) is the obsolete OLE Automation DATE: a double
+     * counting days since 1899-12-30, fractional part = time-of-day.
+     * String / date / timestamp inputs work like (DT_DBTIMESTAMP). */
+    {
+        /* 45809.5 = 2025-06-01 12:00:00 UTC.
+         *   45809 days after 1899-12-30 → 2025-06-01 (Unix epoch is +25569).
+         *   0.5 day                      → 12:00:00. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DATE) 45809.5", "tsu:", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int64_t *v = out.buffers[1];
+            CHECK(v[0] == 1748779200000000LL);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* (DT_DATE) on an int — 45809 = 2025-06-01 00:00. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DATE) 45809", "tsu:", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int64_t *v = out.buffers[1];
+            CHECK(v[0] == 1748736000000000LL);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* (DT_DATE) on a string is the same as (DT_DBTIMESTAMP). */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DATE) \"2025-06-01 12:00:00\"", "tsu:", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int64_t *v = out.buffers[1];
+            CHECK(v[0] == 1748779200000000LL);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* (DT_WSTR) of a DT_DATE roundtrips via ISO timestamp form. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 40) (DT_DATE) 45809.5", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 19);
+            CHECK(memcmp(dat + off[0], "2025-06-01 12:00:00", 19) == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;

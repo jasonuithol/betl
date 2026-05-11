@@ -102,9 +102,11 @@ microseconds-since-epoch UTC values as plain timestamps (Arrow
 `DT_NTEXT` is an accepted alias for `DT_WSTR`; `DT_TEXT` an alias
 for `DT_STR`.
 
-Not yet supported (the cast / typed-NULL will produce a parse error):
-
-- `DT_DATE` (the obsolete float-of-days form) — use `DT_DBDATE`.
+`DT_DATE` (OLE Automation Date) is also accepted. A numeric input is
+interpreted as days since 1899-12-30 with the fractional part as
+time-of-day (e.g. `45809.5` → `2025-06-01 12:00:00`); string / date /
+timestamp inputs behave like `(DT_DBTIMESTAMP)`. The result is
+`timestamp_us`.
 
 ## Casts
 
