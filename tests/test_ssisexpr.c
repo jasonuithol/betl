@@ -1300,6 +1300,70 @@ int main(int argc, char **argv) {
         eng->release(h);
     }
 
+    /* --- 42: SSIS variable references --------------------------------- *
+     * @[scope::name] resolves at compile time against the host's
+     * parameter table. Variables are constants for the duration of a
+     * run, so they fold into string literal nodes; cast at the call
+     * site for numeric types. */
+    {
+        rc = betl_context_set_param(ctx, "User::Name", "Alice");
+        CHECK(rc == BETL_OK);
+        rc = betl_context_set_param(ctx, "User::Count", "42");
+        CHECK(rc == BETL_OK);
+        rc = betl_context_set_param(ctx, "$Project::Env", "prod");
+        CHECK(rc == BETL_OK);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "@[User::Name]", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 5);
+            CHECK(memcmp(dat + off[0], "Alice", 5) == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Cast to int via (DT_I8) wrap. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_I8) @[User::Count] + 1", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 43);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Project-scope variables use the $Project:: prefix. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "@[$Project::Env]", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 4);
+            CHECK(memcmp(dat + off[0], "prod", 4) == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Unknown variable is a compile-time error. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "@[User::Missing]", &schema, &h);
+        CHECK(rc != BETL_OK);
+        CHECK(h == NULL);
+    }
+    {
+        /* Empty @[] is a lex-time error. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "@[]", &schema, &h);
+        CHECK(rc != BETL_OK);
+        CHECK(h == NULL);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;

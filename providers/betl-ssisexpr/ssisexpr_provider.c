@@ -166,6 +166,7 @@ static void arena_free(Arena *a) {
 typedef enum {
     T_EOF,
     T_INT, T_FLOAT, T_STR, T_IDENT, T_BR_IDENT,
+    T_VAR_REF,
     T_LPAREN, T_RPAREN, T_COMMA,
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
     T_BANG, T_TILDE,
@@ -352,6 +353,28 @@ static int lex_bracket_ident(Lex *L) {
     return rc;
 }
 
+/* SSIS variable reference: @[scope::name] or @[$Project::name].
+ * The bracketed content is captured verbatim; compile-time
+ * resolution happens in p_primary via betl_get_param. */
+static int lex_var_ref(Lex *L) {
+    ++L->p;                                /* skip @ */
+    if (*L->p != '[') return lex_err(L, "expected '[' after '@'");
+    ++L->p;                                /* skip [ */
+    const char *start = L->p;
+    while (*L->p && *L->p != ']') ++L->p;
+    if (*L->p != ']') return lex_err(L, "unterminated variable reference");
+    size_t n = (size_t)(L->p - start);
+    if (n == 0) return lex_err(L, "empty variable reference '@[]'");
+    char *cp = malloc(n + 1);
+    if (!cp) return -1;
+    memcpy(cp, start, n); cp[n] = '\0';
+    ++L->p;                                /* closing ] */
+    Tok t = { .kind = T_VAR_REF, .str = cp };
+    int rc = lex_push(L, t);
+    if (rc != 0) free(cp);
+    return rc;
+}
+
 static int lex_all(Lex *L) {
     while (*L->p) {
         unsigned char c = (unsigned char)*L->p;
@@ -359,6 +382,7 @@ static int lex_all(Lex *L) {
         if (isdigit(c)) { if (lex_number(L) != 0) return -1; continue; }
         if (c == '"')   { if (lex_string(L) != 0) return -1; continue; }
         if (c == '[')   { if (lex_bracket_ident(L) != 0) return -1; continue; }
+        if (c == '@')   { if (lex_var_ref(L) != 0) return -1; continue; }
         if (isalpha(c) || c == '_') { if (lex_ident(L) != 0) return -1; continue; }
 
         Tok t = { 0 };
@@ -484,6 +508,7 @@ typedef struct {
     Tok        *toks;
     size_t      pos;
     Arena      *arena;
+    BetlContext *ctx;            /* for compile-time @[...] resolution */
     /* Column-name → index resolution table. */
     char      **col_names;
     char       *col_fmts;        /* parallel: 'l'/'g'/'u'/'b'/'D'/'T'/'N' */
@@ -884,6 +909,27 @@ static Node *p_primary(Par *P) {
             Node *n = arena_new(P->arena, N_COLREF);
             if (!n) return NULL;
             n->colref.col_idx = idx;
+            return n;
+        }
+        case T_VAR_REF: {
+            /* @[User::Foo] / @[$Project::Bar]. Resolved once at compile
+             * time against the host's parameter table — variables are
+             * constants for the duration of a run, so this folds into
+             * a string literal. Cast at the call site if a different
+             * type is needed: (DT_I8) @[User::Count]. */
+            advance(P);
+            const char *val = P->ctx ? betl_get_param(P->ctx, t->str) : NULL;
+            if (!val) {
+                par_err(P, "unknown variable '@[%s]' (not in pipeline params)", t->str);
+                return NULL;
+            }
+            Node *n = arena_new(P->arena, N_LIT_STR);
+            if (!n) return NULL;
+            size_t blen = strlen(val);
+            n->str.s = malloc(blen + 1);
+            if (!n->str.s) return NULL;
+            memcpy(n->str.s, val, blen + 1);
+            n->str.n = blen;
             return n;
         }
         case T_LPAREN:
@@ -3076,7 +3122,7 @@ static int ssisexpr_compile(BetlContext *ctx,
     }
 
     Par P = {
-        .toks = L.toks, .pos = 0, .arena = &e->arena,
+        .toks = L.toks, .pos = 0, .arena = &e->arena, .ctx = ctx,
         .col_names = e->col_names, .col_fmts = e->col_fmts,
         .col_scales = e->col_scales, .n_cols = e->n_cols,
     };

@@ -54,6 +54,13 @@ so on.
 Column references can be bare (`order_date`) or bracketed
 (`[order_date]`); both forms are case-insensitive, matching SSIS.
 
+SSIS variable references — `@[User::Foo]`, `@[$Project::Bar]` — are
+resolved at compile time against the pipeline's parameter table.
+Set the value with `betl_context_set_param(ctx, "User::Foo", "...")`
+(or the YAML `params:` block, which goes through the same table).
+Variables fold into string literals — cast at the call site if a
+different type is wanted: `(DT_I8) @[User::Count] + 1`.
+
 See `examples/04-ssis-orders-by-month/pipeline.betl.yml` for a full
 worked pipeline.
 
@@ -243,10 +250,6 @@ implemented.
 These tend to be the high-value migration blockers. They're tracked
 for v2.
 
-- **Variables.** `@[User::Foo]` and `@[$Project::Bar]` parse-fail. For
-  now, expose project variables as pipeline parameters and reference
-  them with `${params.foo}` substitution before the expression is
-  compiled.
 - **Locale-aware parsing** — date / number parsers are ASCII /
   invariant-culture only. SSIS' `LocaleID` setting doesn't apply.
 - **Narrow-width Arrow integers.** `int8`/`int16`/`int32` are
