@@ -32,6 +32,7 @@
 #include <libpq-fe.h>
 
 #include "betl/provider.h"
+#include "runtime/date_util.h"
 #include "runtime/pg_sql.h"
 
 /* ============================================================== *
@@ -266,15 +267,19 @@ typedef enum {
     PG_FLOAT64,
     PG_UTF8,
     PG_BOOL,
+    PG_DATE32,
+    PG_TIMESTAMP_US,
     PG_UNSUPPORTED
 } PgColType;
 
 static PgColType arrow_to_pg(const char *fmt) {
     if (!fmt) return PG_UNSUPPORTED;
-    if (strcmp(fmt, "l") == 0) return PG_INT64;
-    if (strcmp(fmt, "g") == 0) return PG_FLOAT64;
-    if (strcmp(fmt, "u") == 0) return PG_UTF8;
-    if (strcmp(fmt, "b") == 0) return PG_BOOL;
+    if (strcmp(fmt, "l")    == 0) return PG_INT64;
+    if (strcmp(fmt, "g")    == 0) return PG_FLOAT64;
+    if (strcmp(fmt, "u")    == 0) return PG_UTF8;
+    if (strcmp(fmt, "b")    == 0) return PG_BOOL;
+    if (strcmp(fmt, "tdD")  == 0) return PG_DATE32;
+    if (strcmp(fmt, "tsu:") == 0) return PG_TIMESTAMP_US;
     return PG_UNSUPPORTED;
 }
 
@@ -341,6 +346,45 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
         if (!s) return -2;
         memcpy(s, data + start, len);
         s[len] = '\0';
+        *out = s;
+        return 0;
+    }
+    case PG_DATE32: {
+        const int32_t *vals = col->buffers[1];
+        int y = 0; unsigned m = 0, d = 0;
+        betl_civil_from_days(vals[off], &y, &m, &d);
+        char buf[16];
+        int n = snprintf(buf, sizeof buf, "%04d-%02u-%02u", y, m, d);
+        if (n < 0 || (size_t)n >= sizeof buf) return -2;
+        char *s = malloc((size_t)n + 1);
+        if (!s) return -2;
+        memcpy(s, buf, (size_t)n + 1);
+        *out = s;
+        return 0;
+    }
+    case PG_TIMESTAMP_US: {
+        const int64_t *vals = col->buffers[1];
+        int32_t days; int64_t us_of_day;
+        betl_split_ts(vals[off], &days, &us_of_day);
+        int y = 0; unsigned m = 0, d = 0;
+        betl_civil_from_days(days, &y, &m, &d);
+        int hh   = (int)(us_of_day / 3600000000LL);
+        int mm   = (int)((us_of_day / 60000000LL) % 60);
+        int ss   = (int)((us_of_day / 1000000LL) % 60);
+        int frac = (int)(us_of_day % 1000000LL);
+        char buf[40];
+        int n;
+        if (frac == 0) {
+            n = snprintf(buf, sizeof buf, "%04d-%02u-%02u %02d:%02d:%02d",
+                         y, m, d, hh, mm, ss);
+        } else {
+            n = snprintf(buf, sizeof buf, "%04d-%02u-%02u %02d:%02d:%02d.%06d",
+                         y, m, d, hh, mm, ss, frac);
+        }
+        if (n < 0 || (size_t)n >= sizeof buf) return -2;
+        char *s = malloc((size_t)n + 1);
+        if (!s) return -2;
+        memcpy(s, buf, (size_t)n + 1);
         *out = s;
         return 0;
     }
