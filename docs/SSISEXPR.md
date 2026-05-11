@@ -156,11 +156,12 @@ is NULL.
 | `+` `-` | Additive. **`+` on two strings is concatenation**, matching SSIS. Decimal `+` / `-` align operand scales to the wider side; result fits in i128 or errors. Decimal mixed with int promotes the int to a scale-0 decimal; decimal mixed with float falls back to IEEE 754 doubles. |
 | `<` `<=` `>` `>=` | Numeric / string / temporal / decimal / uuid compare. Mixed temporal (date vs timestamp) promotes the date to midnight; mixed decimal scales promote to the wider scale; decimal vs int / float falls back to a double-precision compare (~16 decimal digits of precision). UUIDs compare byte-wise. |
 | `==` `!=` | Equality, same rules as ordering. |
+| `&` `^` `\|` | Bitwise AND / XOR / OR on int64. C-style precedence: tighter than `&&` / `\|\|` but looser than `==` / `!=`, so `(5 & 6) == 4` needs the parens. Non-int operands error at runtime. |
+| `~` (unary) | Bitwise NOT on int64. |
 | `&&` `\|\|` | 3VL logical AND / OR (see above). |
 | `? :` | Ternary: cond must be DT_BOOL (or NULL → result is NULL). |
 
-Bitwise `&` / `|` / `^` / `<<` / `>>` are reserved syntactically but
-not implemented (parser rejects with a clear message).
+`<<` and `>>` are not part of SSIS-EL; the parser rejects them.
 
 ## Functions
 
@@ -246,7 +247,6 @@ for v2.
   now, expose project variables as pipeline parameters and reference
   them with `${params.foo}` substitution before the expression is
   compiled.
-- **Bitwise operators** — `&` `|` `^` `<<` `>>`.
 - **Locale-aware parsing** — date / number parsers are ASCII /
   invariant-culture only. SSIS' `LocaleID` setting doesn't apply.
 - **Narrow-width Arrow integers.** `int8`/`int16`/`int32` are

@@ -1225,6 +1225,81 @@ int main(int argc, char **argv) {
         if (out.release) out.release(&out);
     }
 
+    /* --- 41: bitwise operators ---------------------------------------- *
+     * Operands must be int; precedence places &/^/| below comparisons
+     * but above && / ||. */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "0x0F & 0xAA", "l", &out);
+        /* Hex literals aren't supported by the lexer; use decimals. */
+        if (rc != BETL_OK) {
+            if (out.release) out.release(&out);
+            rc = compile_eval(eng, ctx, &schema, &batch,
+                              "15 & 170", "l", &out);
+        }
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == (15 & 170));
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "12 | 5", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 13);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "12 ^ 10", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 6);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Unary ~ was already wired but never tested. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "~0", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == -1);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Precedence: 1 | 2 & 3  →  1 | (2 & 3) = 1 | 2 = 3 */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "1 | 2 & 3", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 3);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* C-style precedence: `==` binds tighter than `&`, so the
+         * "intuitive" form needs parens. (5 & 6) == 4 → true. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(5 & 6) == 4", "b", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const uint8_t *bm = out.buffers[1];
+            CHECK(bit_is_set(bm, 0));
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Float operand is a runtime error. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "1.5 & 2", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;

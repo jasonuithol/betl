@@ -82,6 +82,7 @@ typedef enum {
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD,
     OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
     OP_AND, OP_OR,
+    OP_BAND, OP_BOR, OP_BXOR,
 } Op;
 
 /* Built-in functions. ISNULL / REPLACENULL are special-cased in the
@@ -169,6 +170,7 @@ typedef enum {
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
     T_BANG, T_TILDE,
     T_EQ, T_NE, T_LT, T_LE, T_GT, T_GE,
+    T_AMP, T_PIPE, T_CARET,
     T_AMPAMP, T_PIPEPIPE,
     T_QMARK, T_COLON,
     T_KW_TRUE, T_KW_FALSE, T_KW_NULL,
@@ -389,12 +391,15 @@ static int lex_all(Lex *L) {
                 else                { t.kind = T_GT; ++L->p; }
                 break;
             case '&':
-                if (L->p[1] == '&') { t.kind = T_AMPAMP;   L->p += 2; }
-                else                { return lex_err(L, "bitwise & not supported in v0.1"); }
+                if (L->p[1] == '&') { t.kind = T_AMPAMP; L->p += 2; }
+                else                { t.kind = T_AMP;    ++L->p; }
                 break;
             case '|':
                 if (L->p[1] == '|') { t.kind = T_PIPEPIPE; L->p += 2; }
-                else                { return lex_err(L, "bitwise | not supported in v0.1"); }
+                else                { t.kind = T_PIPE;    ++L->p; }
+                break;
+            case '^':
+                t.kind = T_CARET; ++L->p;
                 break;
             default:
                 return lex_err(L, "unexpected character '%c'", (int)c);
@@ -503,6 +508,9 @@ static int  match(Par *P, TokKind k) { if (check(P, k)) { ++P->pos; return 1; } 
 static Node *p_ternary(Par *P);
 static Node *p_or(Par *P);
 static Node *p_and(Par *P);
+static Node *p_bor(Par *P);
+static Node *p_bxor(Par *P);
+static Node *p_band(Par *P);
 static Node *p_eq(Par *P);
 static Node *p_rel(Par *P);
 static Node *p_add(Par *P);
@@ -582,12 +590,45 @@ static Node *p_or(Par *P) {
 }
 
 static Node *p_and(Par *P) {
-    Node *a = p_eq(P);
+    Node *a = p_bor(P);
     while (a && check(P, T_AMPAMP)) {
+        advance(P);
+        Node *b = p_bor(P);
+        if (!b) return NULL;
+        a = mk_binop(P, OP_AND, a, b);
+    }
+    return a;
+}
+
+static Node *p_bor(Par *P) {
+    Node *a = p_bxor(P);
+    while (a && check(P, T_PIPE)) {
+        advance(P);
+        Node *b = p_bxor(P);
+        if (!b) return NULL;
+        a = mk_binop(P, OP_BOR, a, b);
+    }
+    return a;
+}
+
+static Node *p_bxor(Par *P) {
+    Node *a = p_band(P);
+    while (a && check(P, T_CARET)) {
+        advance(P);
+        Node *b = p_band(P);
+        if (!b) return NULL;
+        a = mk_binop(P, OP_BXOR, a, b);
+    }
+    return a;
+}
+
+static Node *p_band(Par *P) {
+    Node *a = p_eq(P);
+    while (a && check(P, T_AMP)) {
         advance(P);
         Node *b = p_eq(P);
         if (!b) return NULL;
-        a = mk_binop(P, OP_AND, a, b);
+        a = mk_binop(P, OP_BAND, a, b);
     }
     return a;
 }
@@ -1256,6 +1297,24 @@ static int dec_sub(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
 static int dec_mul(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
 static int dec_div(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
 static int dec_mod(i128 a, int sa, i128 b, int sb, i128 *out, int *out_scale);
+
+static int op_bitwise(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Value *out) {
+    Value a, b;
+    if (eval_node(E, P, na, &a) != 0) return -1;
+    if (eval_node(E, P, nb, &b) != 0) return -1;
+    memset(out, 0, sizeof *out);
+    if (a.is_null || b.is_null) { out->is_null = 1; return 0; }
+    if (a.kind != VK_INT64 || b.kind != VK_INT64)
+        return eval_err(E, "bitwise operators require integer operands");
+    out->kind = VK_INT64;
+    uint64_t au = (uint64_t)a.i64, bu = (uint64_t)b.i64;
+    switch (op) {
+        case OP_BAND: out->i64 = (int64_t)(au & bu); return 0;
+        case OP_BOR:  out->i64 = (int64_t)(au | bu); return 0;
+        case OP_BXOR: out->i64 = (int64_t)(au ^ bu); return 0;
+        default:      return eval_err(E, "internal: bad bitwise op");
+    }
+}
 
 static int op_arith(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Value *out) {
     Value a, b;
@@ -2884,6 +2943,8 @@ static int eval_node(Eval *E, Par *P, const Node *n, Value *out) {
         case N_BINOP: {
             Op op = n->binop.op;
             if (op == OP_AND || op == OP_OR) return op_and_or(E, P, op, n->binop.a, n->binop.b, out);
+            if (op == OP_BAND || op == OP_BOR || op == OP_BXOR)
+                return op_bitwise(E, P, op, n->binop.a, n->binop.b, out);
             if (op == OP_EQ || op == OP_NE || op == OP_LT || op == OP_LE
                 || op == OP_GT || op == OP_GE)
                 return op_cmp(E, P, op, n->binop.a, n->binop.b, out);
