@@ -669,6 +669,226 @@ int main(int argc, char **argv) {
         eng->release(h);
     }
 
+    /* --- 24: cast string -> DT_DBDATE, stringify back ----------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 32) (DT_DBDATE) \"2026-05-11\"", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            EXPECT_STR(out, 0, "2026-05-11");
+            EXPECT_STR(out, 1, "2026-05-11");
+            EXPECT_STR(out, 2, "2026-05-11");
+        }
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 25: cast string -> DT_DBTIMESTAMP with fractional seconds ---- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 40) (DT_DBTIMESTAMP) \"2026-05-11 10:30:00.123456\"",
+                          "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            EXPECT_STR(out, 0, "2026-05-11 10:30:00.123456");
+        }
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 26: NULL(DT_DBDATE) propagates through YEAR ------------------ */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "YEAR(NULL(DT_DBDATE))", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(out.null_count == 3);
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 27: YEAR / MONTH / DAY on a timestamp literal ---------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "YEAR((DT_DBTIMESTAMP) \"2026-05-11 10:30:00\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) {
+            CHECK(get_i64(&out, 0) == 2026);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "MONTH((DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 5);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DAY((DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 11);
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 28: DATEPART variants ---------------------------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEPART(\"quarter\", (DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 2);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEPART(\"dayofyear\", (DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        /* 2026-05-11 = Jan 31 + Feb 28 + Mar 31 + Apr 30 + 11 = 131 */
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 131);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        /* 2026-05-11 was a Monday → SSIS DW=2 (1=Sunday). */
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEPART(\"weekday\", (DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 2);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEPART(\"hour\", (DT_DBTIMESTAMP) \"2026-05-11 10:30:00\")",
+                          "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 10);
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 29: DATEADD month + DATEADD year ----------------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 32) DATEADD(\"month\", 1, (DT_DBDATE) \"2026-01-31\")",
+                          "u", &out);
+        CHECK(rc == BETL_OK);
+        /* Jan 31 + 1 month should clamp to Feb 28 (2026 isn't a leap year). */
+        if (out.length == 3 && out.n_buffers == 3) EXPECT_STR(out, 0, "2026-02-28");
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 32) DATEADD(\"year\", -1, (DT_DBDATE) \"2026-05-11\")",
+                          "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) EXPECT_STR(out, 0, "2025-05-11");
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 40) DATEADD(\"hour\", 25, "
+                          "(DT_DBTIMESTAMP) \"2026-05-11 10:30:00\")",
+                          "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) EXPECT_STR(out, 0, "2026-05-12 11:30:00");
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 30: DATEDIFF day + DATEDIFF year ----------------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEDIFF(\"day\", (DT_DBDATE) \"2026-05-01\", "
+                                            "(DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 10);
+        if (out.release) out.release(&out);
+    }
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEDIFF(\"year\", (DT_DBDATE) \"2020-01-01\", "
+                                             "(DT_DBDATE) \"2026-05-11\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 6);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* DATEDIFF in hours between two timestamps spanning ~1.5 days. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "DATEDIFF(\"hour\", "
+                          "(DT_DBTIMESTAMP) \"2026-05-11 10:00:00\", "
+                          "(DT_DBTIMESTAMP) \"2026-05-12 22:30:00\")", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 36);  /* 1.5 days = 36h */
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 31: date comparison ------------------------------------------ */
+    {
+        /* (DT_DBDATE) "2026-05-11" < (DT_DBDATE) "2026-05-12" → TRUE */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DBDATE) \"2026-05-11\" < (DT_DBDATE) \"2026-05-12\"",
+                          "b", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 2 && out.buffers[1]) {
+            const uint8_t *bm = out.buffers[1];
+            CHECK(bit_is_set(bm, 0));
+        }
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 32: GETDATE returns a non-null timestamp --------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 40) GETDATE()", "u", &out);
+        CHECK(rc == BETL_OK);
+        /* Don't check the value — just verify the row landed and length>=19
+         * (the iso "YYYY-MM-DD HH:MM:SS" prefix). */
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            size_t n0 = (size_t)(off[1] - off[0]);
+            CHECK(n0 >= 19);
+            CHECK(out.null_count == 0);
+        }
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 33: cast date -> timestamp gives midnight -------------------- */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_WSTR, 40) (DT_DBTIMESTAMP) (DT_DBDATE) \"2026-05-11\"",
+                          "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3)
+            EXPECT_STR(out, 0, "2026-05-11 00:00:00");
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 34: error: YEAR on a string ---------------------------------- */
+    {
+        void *h = NULL;
+        rc = eng->compile(ctx, "YEAR(\"hello\")", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        CHECK(out.release == NULL);
+        eng->release(h);
+    }
+
 #undef EXPECT_STR
 
     /* --- 21: syntax error at compile time ----------------------------- */

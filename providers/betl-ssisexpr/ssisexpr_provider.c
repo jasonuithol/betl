@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>           /* strcasecmp */
+#include <time.h>              /* clock_gettime — GETDATE */
 
 #include "betl/provider.h"
 
@@ -61,6 +62,10 @@ typedef enum {
     DT_BOOL,
     DT_WSTR,
     DT_STR,
+    DT_DBDATE,          /* Arrow tdD — days since 1970-01-01 */
+    DT_DBTIMESTAMP,     /* Arrow tsu: — micros since 1970-01-01 UTC, no tz */
+    DT_DBTIMESTAMP2,    /* alias for DT_DBTIMESTAMP (SSIS distinguishes
+                         * by precision; we treat both as us-precision) */
 } SsisDt;
 
 typedef enum {
@@ -85,6 +90,9 @@ typedef enum {
     /* numeric */
     FN_ABS, FN_POWER, FN_SQUARE, FN_SQRT,
     FN_ROUND, FN_CEILING, FN_FLOOR, FN_SIGN,
+    /* date / timestamp */
+    FN_GETDATE, FN_YEAR, FN_MONTH, FN_DAY,
+    FN_DATEPART, FN_DATEADD, FN_DATEDIFF,
 } FnId;
 
 typedef struct Node Node;
@@ -428,6 +436,14 @@ static const FnSpec g_fns[] = {
     { "CEILING",     FN_CEILING,     1, 1 },
     { "FLOOR",       FN_FLOOR,       1, 1 },
     { "SIGN",        FN_SIGN,        1, 1 },
+    /* date / timestamp */
+    { "GETDATE",     FN_GETDATE,     0, 0 },
+    { "YEAR",        FN_YEAR,        1, 1 },
+    { "MONTH",       FN_MONTH,       1, 1 },
+    { "DAY",         FN_DAY,         1, 1 },
+    { "DATEPART",    FN_DATEPART,    2, 2 },
+    { "DATEADD",     FN_DATEADD,     3, 3 },
+    { "DATEDIFF",    FN_DATEDIFF,    3, 3 },
 };
 static const size_t g_n_fns = sizeof g_fns / sizeof g_fns[0];
 
@@ -480,15 +496,18 @@ static Node *p_call_args(Par *P, const FnSpec *fs);
 
 /* Recognize a SSIS DT_xxx type name. Returns 1 + writes *out on hit. */
 static int parse_dt(const char *name, SsisDt *out) {
-    if      (strcasecmp(name, "DT_I1")   == 0) { *out = DT_I1;   return 1; }
-    else if (strcasecmp(name, "DT_I2")   == 0) { *out = DT_I2;   return 1; }
-    else if (strcasecmp(name, "DT_I4")   == 0) { *out = DT_I4;   return 1; }
-    else if (strcasecmp(name, "DT_I8")   == 0) { *out = DT_I8;   return 1; }
-    else if (strcasecmp(name, "DT_R4")   == 0) { *out = DT_R4;   return 1; }
-    else if (strcasecmp(name, "DT_R8")   == 0) { *out = DT_R8;   return 1; }
-    else if (strcasecmp(name, "DT_BOOL") == 0) { *out = DT_BOOL; return 1; }
-    else if (strcasecmp(name, "DT_WSTR") == 0) { *out = DT_WSTR; return 1; }
-    else if (strcasecmp(name, "DT_STR")  == 0) { *out = DT_STR;  return 1; }
+    if      (strcasecmp(name, "DT_I1")           == 0) { *out = DT_I1;           return 1; }
+    else if (strcasecmp(name, "DT_I2")           == 0) { *out = DT_I2;           return 1; }
+    else if (strcasecmp(name, "DT_I4")           == 0) { *out = DT_I4;           return 1; }
+    else if (strcasecmp(name, "DT_I8")           == 0) { *out = DT_I8;           return 1; }
+    else if (strcasecmp(name, "DT_R4")           == 0) { *out = DT_R4;           return 1; }
+    else if (strcasecmp(name, "DT_R8")           == 0) { *out = DT_R8;           return 1; }
+    else if (strcasecmp(name, "DT_BOOL")         == 0) { *out = DT_BOOL;         return 1; }
+    else if (strcasecmp(name, "DT_WSTR")         == 0) { *out = DT_WSTR;         return 1; }
+    else if (strcasecmp(name, "DT_STR")          == 0) { *out = DT_STR;          return 1; }
+    else if (strcasecmp(name, "DT_DBDATE")       == 0) { *out = DT_DBDATE;       return 1; }
+    else if (strcasecmp(name, "DT_DBTIMESTAMP")  == 0) { *out = DT_DBTIMESTAMP;  return 1; }
+    else if (strcasecmp(name, "DT_DBTIMESTAMP2") == 0) { *out = DT_DBTIMESTAMP2; return 1; }
     return 0;
 }
 
@@ -838,18 +857,23 @@ static Node *p_call_args(Par *P, const FnSpec *fs) {
  *  Output column staging (mirrors lua_provider's LmCol)            *
  * ============================================================== */
 
-typedef enum { LM_T_INT64 = 1, LM_T_UTF8 = 2, LM_T_BOOL = 3, LM_T_FLOAT64 = 4 } LmType;
+typedef enum {
+    LM_T_INT64 = 1, LM_T_UTF8 = 2, LM_T_BOOL = 3, LM_T_FLOAT64 = 4,
+    LM_T_DATE32 = 5,      /* Arrow tdD — int32 days since 1970-01-01 */
+    LM_T_TIMESTAMP_US = 6, /* Arrow tsu: — int64 micros since 1970-01-01 */
+} LmType;
 
 typedef struct {
     LmType   type;
     uint8_t *nulls;
-    int64_t *i64_vals;
+    int64_t *i64_vals;      /* used by INT64 and TIMESTAMP_US */
     double  *f64_vals;
     int32_t *u8_offsets;
     char    *u8_data;
     size_t   u8_len;
     size_t   u8_cap;
     uint8_t *b_vals;
+    int32_t *d32_vals;      /* used by DATE32 */
 } LmCol;
 
 static int lm_col_init(LmCol *c, LmType type, size_t length) {
@@ -857,7 +881,7 @@ static int lm_col_init(LmCol *c, LmType type, size_t length) {
     c->type  = type;
     c->nulls = calloc(length ? length : 1, sizeof *c->nulls);
     if (!c->nulls) return -1;
-    if (type == LM_T_INT64) {
+    if (type == LM_T_INT64 || type == LM_T_TIMESTAMP_US) {
         c->i64_vals = calloc(length ? length : 1, sizeof *c->i64_vals);
         if (!c->i64_vals) { free(c->nulls); c->nulls = NULL; return -1; }
     } else if (type == LM_T_FLOAT64) {
@@ -872,6 +896,9 @@ static int lm_col_init(LmCol *c, LmType type, size_t length) {
             free(c->u8_offsets); free(c->nulls);
             c->u8_offsets = NULL; c->nulls = NULL; return -1;
         }
+    } else if (type == LM_T_DATE32) {
+        c->d32_vals = calloc(length ? length : 1, sizeof *c->d32_vals);
+        if (!c->d32_vals) { free(c->nulls); c->nulls = NULL; return -1; }
     } else { /* LM_T_BOOL */
         c->b_vals = calloc(length ? length : 1, sizeof *c->b_vals);
         if (!c->b_vals) { free(c->nulls); c->nulls = NULL; return -1; }
@@ -886,6 +913,7 @@ static void lm_col_free(LmCol *c) {
     free(c->u8_offsets);
     free(c->u8_data);
     free(c->b_vals);
+    free(c->d32_vals);
     memset(c, 0, sizeof *c);
 }
 
@@ -941,6 +969,15 @@ static void release_bool_leaf(struct ArrowArray *arr) {
     arr->release = NULL;
 }
 
+static void release_date32_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
 static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
     int64_t  null_count = 0;
     uint8_t *vmap = NULL;
@@ -956,12 +993,20 @@ static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
     }
     free(c->nulls); c->nulls = NULL;
 
-    if (c->type == LM_T_INT64) {
+    if (c->type == LM_T_INT64 || c->type == LM_T_TIMESTAMP_US) {
         const void **bufs = malloc(2 * sizeof *bufs);
         if (!bufs) { free(vmap); return -1; }
         bufs[0] = vmap; bufs[1] = c->i64_vals; c->i64_vals = NULL;
         out->length = (int64_t)length; out->null_count = null_count;
         out->n_buffers = 2; out->buffers = bufs; out->release = release_int64_leaf;
+        return 0;
+    }
+    if (c->type == LM_T_DATE32) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap; bufs[1] = c->d32_vals; c->d32_vals = NULL;
+        out->length = (int64_t)length; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = release_date32_leaf;
         return 0;
     }
     if (c->type == LM_T_FLOAT64) {
@@ -1011,7 +1056,11 @@ static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
  *  Value type and evaluator                                        *
  * ============================================================== */
 
-typedef enum { VK_INT64, VK_FLOAT64, VK_UTF8, VK_BOOL } VKind;
+typedef enum {
+    VK_INT64, VK_FLOAT64, VK_UTF8, VK_BOOL,
+    VK_DATE32,         /* int32 days since 1970-01-01; stored in i64 */
+    VK_TIMESTAMP_US,   /* int64 micros since 1970-01-01 UTC; stored in i64 */
+} VKind;
 
 typedef struct {
     VKind kind;
@@ -1095,6 +1144,14 @@ static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, Value *out) {
             out->str_n = (size_t)(off[row + 1] - off[row]);
             return 0;
         }
+        case 'D': {
+            const int32_t *v = col->buffers[1];
+            out->kind = VK_DATE32; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 'T': {
+            const int64_t *v = col->buffers[1];
+            out->kind = VK_TIMESTAMP_US; out->i64 = v[row]; return 0;
+        }
         default:
             return eval_err(E, "unsupported column format '%c'", col_fmt);
     }
@@ -1175,6 +1232,23 @@ static int cmp_values(Eval *E, const Value *a, const Value *b, int *out_cmp) {
         *out_cmp = (a->b > b->b) - (a->b < b->b);
         return 0;
     }
+    /* Temporal: same kind compares i64 directly; date vs timestamp
+     * promotes date → timestamp (midnight). */
+    int a_temp = (a->kind == VK_DATE32 || a->kind == VK_TIMESTAMP_US);
+    int b_temp = (b->kind == VK_DATE32 || b->kind == VK_TIMESTAMP_US);
+    if (a_temp && b_temp) {
+        int64_t av = a->kind == VK_DATE32 ? a->i64 * 86400000000LL : a->i64;
+        int64_t bv = b->kind == VK_DATE32 ? b->i64 * 86400000000LL : b->i64;
+        if (a->kind == VK_DATE32 && b->kind == VK_DATE32) {
+            /* both dates — compare directly to avoid the *86400e6 round-trip */
+            av = a->i64; bv = b->i64;
+        }
+        *out_cmp = (av > bv) - (av < bv);
+        return 0;
+    }
+    if (a_temp != b_temp) {
+        return eval_err(E, "cannot compare temporal with non-temporal");
+    }
     /* numeric */
     Value aa = *a, bb = *b;
     if (aa.kind == VK_UTF8 || bb.kind == VK_UTF8 || aa.kind == VK_BOOL || bb.kind == VK_BOOL) {
@@ -1251,18 +1325,143 @@ static int op_and_or(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Val
     }
 }
 
+/* ============================================================== *
+ *  Date / timestamp helpers                                        *
+ *  Civil ↔ days conversions (Howard Hinnant) work for the full     *
+ *  Arrow date32 range. Timestamps are micros since 1970-01-01 UTC. *
+ * ============================================================== */
+
+static int32_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (unsigned)(153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int32_t)(era * 146097 + (int)doe - 719468);
+}
+
+static void civil_from_days(int32_t z, int *y, unsigned *m, unsigned *d) {
+    z += 719468;
+    int era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int year = (int)yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp < 10 ? mp + 3 : mp - 9;
+    *y = year + (*m <= 2);
+}
+
+/* Euclidean (floor) division used to split a timestamp into (days, micros). */
+static void split_ts(int64_t us, int32_t *out_days, int64_t *out_us_of_day) {
+    int64_t day_us = 86400000000LL;
+    int64_t d = us / day_us;
+    int64_t r = us % day_us;
+    if (r < 0) { r += day_us; --d; }
+    *out_days = (int32_t)d;
+    *out_us_of_day = r;
+}
+
+/* "YYYY-MM-DD" → days. Returns -1 on parse error. */
+static int parse_iso_date(const char *s, size_t n, int32_t *out_days) {
+    if (n != 10) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        char c = s[i];
+        int expect_digit = (i != 4 && i != 7);
+        if (expect_digit && !(c >= '0' && c <= '9')) return -1;
+        if (!expect_digit && c != '-') return -1;
+    }
+    int y = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    unsigned mo = (unsigned)((s[5]-'0')*10 + (s[6]-'0'));
+    unsigned dy = (unsigned)((s[8]-'0')*10 + (s[9]-'0'));
+    if (mo < 1 || mo > 12 || dy < 1 || dy > 31) return -1;
+    *out_days = days_from_civil(y, mo, dy);
+    return 0;
+}
+
+/* "YYYY-MM-DD HH:MM:SS[.uuuuuu]" or with 'T' separator → micros.
+ * Fractional seconds are accepted up to 6 digits, padded with zeros. */
+static int parse_iso_ts(const char *s, size_t n, int64_t *out_us) {
+    if (n < 19) return -1;
+    int32_t days;
+    if (parse_iso_date(s, 10, &days) != 0) return -1;
+    if (s[10] != ' ' && s[10] != 'T') return -1;
+    for (size_t i = 11; i < 19; ++i) {
+        char c = s[i];
+        int expect_digit = (i != 13 && i != 16);
+        if (expect_digit && !(c >= '0' && c <= '9')) return -1;
+        if (!expect_digit && c != ':') return -1;
+    }
+    int hh = (s[11]-'0')*10 + (s[12]-'0');
+    int mm = (s[14]-'0')*10 + (s[15]-'0');
+    int ss = (s[17]-'0')*10 + (s[18]-'0');
+    if (hh > 23 || mm > 59 || ss > 59) return -1;
+    int64_t us_of_day = (int64_t)hh * 3600000000LL
+                      + (int64_t)mm * 60000000LL
+                      + (int64_t)ss * 1000000LL;
+    if (n > 19) {
+        if (s[19] != '.') return -1;
+        if (n > 26) return -1;            /* >6 fractional digits */
+        int frac = 0; int mult = 100000;
+        for (size_t i = 20; i < n; ++i) {
+            char c = s[i];
+            if (c < '0' || c > '9') return -1;
+            frac += (c - '0') * mult;
+            mult /= 10;
+        }
+        us_of_day += frac;
+    }
+    *out_us = (int64_t)days * 86400000000LL + us_of_day;
+    return 0;
+}
+
+/* Format a date32 as YYYY-MM-DD. Returns bytes written (no NUL), or -1. */
+static int fmt_date_iso(int32_t days, char *buf, size_t cap) {
+    int y = 0; unsigned m = 0, d = 0;
+    civil_from_days(days, &y, &m, &d);
+    int n = snprintf(buf, cap, "%04d-%02u-%02u", y, m, d);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return n;
+}
+
+/* Format a ts_us as YYYY-MM-DD HH:MM:SS[.uuuuuu] — fractional part is
+ * omitted when zero, matching SSIS / SQL behaviour. */
+static int fmt_ts_iso(int64_t us, char *buf, size_t cap) {
+    int32_t days; int64_t us_of_day;
+    split_ts(us, &days, &us_of_day);
+    int y = 0; unsigned m = 0, d = 0;
+    civil_from_days(days, &y, &m, &d);
+    int hh = (int)(us_of_day / 3600000000LL);
+    int mm = (int)((us_of_day / 60000000LL) % 60);
+    int ss = (int)((us_of_day / 1000000LL) % 60);
+    int frac = (int)(us_of_day % 1000000LL);
+    int n;
+    if (frac == 0) {
+        n = snprintf(buf, cap, "%04d-%02u-%02u %02d:%02d:%02d", y, m, d, hh, mm, ss);
+    } else {
+        n = snprintf(buf, cap, "%04d-%02u-%02u %02d:%02d:%02d.%06d",
+                     y, m, d, hh, mm, ss, frac);
+    }
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return n;
+}
+
+
 static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in, Value *out) {
     (void)has_len; (void)len;
     memset(out, 0, sizeof *out);
     if (in->is_null) { out->is_null = 1; return 0; }
-    int to_int = (dt == DT_I1 || dt == DT_I2 || dt == DT_I4 || dt == DT_I8);
+    int to_int   = (dt == DT_I1 || dt == DT_I2 || dt == DT_I4 || dt == DT_I8);
     int to_float = (dt == DT_R4 || dt == DT_R8);
-    int to_str = (dt == DT_WSTR || dt == DT_STR);
-    int to_bool = (dt == DT_BOOL);
+    int to_str   = (dt == DT_WSTR || dt == DT_STR);
+    int to_bool  = (dt == DT_BOOL);
+    int to_date  = (dt == DT_DBDATE);
+    int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2);
 
     if (to_int) {
         out->kind = VK_INT64;
-        if (in->kind == VK_INT64)   out->i64 = in->i64;
+        if (in->kind == VK_INT64)        out->i64 = in->i64;
         else if (in->kind == VK_FLOAT64) out->i64 = (int64_t)in->f64;
         else if (in->kind == VK_BOOL)    out->i64 = in->b ? 1 : 0;
         else if (in->kind == VK_UTF8) {
@@ -1274,6 +1473,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> int failed: '%s'", tmp);
             out->i64 = (int64_t)v;
         }
+        else return eval_err(E, "cast date/timestamp -> int not supported");
         return 0;
     }
     if (to_float) {
@@ -1290,6 +1490,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> float failed: '%s'", tmp);
             out->f64 = v;
         }
+        else return eval_err(E, "cast date/timestamp -> float not supported");
         return 0;
     }
     if (to_bool) {
@@ -1297,7 +1498,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
         if (in->kind == VK_BOOL)    out->b = in->b;
         else if (in->kind == VK_INT64) out->b = in->i64 != 0;
         else if (in->kind == VK_FLOAT64) out->b = in->f64 != 0.0;
-        else return eval_err(E, "cast string -> bool not supported");
+        else return eval_err(E, "cast non-numeric -> bool not supported");
         return 0;
     }
     if (to_str) {
@@ -1306,9 +1507,11 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
             out->str = in->str; out->str_n = in->str_n; return 0;
         }
         char buf[64]; int n = 0;
-        if (in->kind == VK_INT64)        n = snprintf(buf, sizeof buf, "%" PRId64, in->i64);
-        else if (in->kind == VK_FLOAT64) n = snprintf(buf, sizeof buf, "%g", in->f64);
-        else if (in->kind == VK_BOOL)    n = snprintf(buf, sizeof buf, "%s", in->b ? "True" : "False");
+        if (in->kind == VK_INT64)             n = snprintf(buf, sizeof buf, "%" PRId64, in->i64);
+        else if (in->kind == VK_FLOAT64)      n = snprintf(buf, sizeof buf, "%g", in->f64);
+        else if (in->kind == VK_BOOL)        n = snprintf(buf, sizeof buf, "%s", in->b ? "True" : "False");
+        else if (in->kind == VK_DATE32)       n = fmt_date_iso((int32_t)in->i64, buf, sizeof buf);
+        else if (in->kind == VK_TIMESTAMP_US) n = fmt_ts_iso  (in->i64,           buf, sizeof buf);
         if (n < 0 || (size_t)n >= sizeof buf) return eval_err(E, "cast -> string overflow");
         char *cp = malloc((size_t)n + 1);
         if (!cp) return eval_err(E, "out of memory");
@@ -1316,6 +1519,41 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
         if (scratch_add(E->scratch, cp) != 0) return eval_err(E, "out of memory");
         out->str = cp; out->str_n = (size_t)n;
         return 0;
+    }
+    if (to_date) {
+        out->kind = VK_DATE32;
+        if (in->kind == VK_DATE32)       { out->i64 = in->i64; return 0; }
+        if (in->kind == VK_TIMESTAMP_US) {
+            int32_t days; int64_t us_of_day;
+            split_ts(in->i64, &days, &us_of_day);
+            out->i64 = days;
+            return 0;
+        }
+        if (in->kind == VK_UTF8) {
+            int32_t days;
+            if (parse_iso_date(in->str, in->str_n, &days) != 0)
+                return eval_err(E, "cast string -> DT_DBDATE: expected YYYY-MM-DD");
+            out->i64 = days;
+            return 0;
+        }
+        return eval_err(E, "cast non-string/non-temporal -> DT_DBDATE not supported");
+    }
+    if (to_ts) {
+        out->kind = VK_TIMESTAMP_US;
+        if (in->kind == VK_TIMESTAMP_US) { out->i64 = in->i64; return 0; }
+        if (in->kind == VK_DATE32) {
+            /* midnight on that date */
+            out->i64 = in->i64 * 86400000000LL;
+            return 0;
+        }
+        if (in->kind == VK_UTF8) {
+            int64_t us;
+            if (parse_iso_ts(in->str, in->str_n, &us) != 0)
+                return eval_err(E, "cast string -> DT_DBTIMESTAMP: expected YYYY-MM-DD HH:MM:SS[.uuuuuu]");
+            out->i64 = us;
+            return 0;
+        }
+        return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
     }
     return eval_err(E, "unsupported cast target");
 }
@@ -1585,6 +1823,236 @@ static int fn_sign(Eval *E, Value *vs, Value *out) {
     return 0;
 }
 
+/* Map a SSIS DATEPART/DATEADD part name to an internal unit code.
+ * Returns -1 on unknown part. */
+typedef enum {
+    PU_YEAR, PU_QUARTER, PU_MONTH,
+    PU_DAYOFYEAR, PU_DAY,
+    PU_WEEK, PU_WEEKDAY,
+    PU_HOUR, PU_MINUTE, PU_SECOND,
+} PartUnit;
+
+static int parse_part(const char *s, size_t n, PartUnit *out) {
+    /* SSIS / SQL Server tolerate full names and short aliases. */
+    struct { const char *name; PartUnit u; } tbl[] = {
+        { "year",      PU_YEAR },      { "yyyy", PU_YEAR },   { "yy", PU_YEAR },
+        { "quarter",   PU_QUARTER },   { "qq",   PU_QUARTER }, { "q",  PU_QUARTER },
+        { "month",     PU_MONTH },     { "mm",   PU_MONTH },   { "m",  PU_MONTH },
+        { "dayofyear", PU_DAYOFYEAR }, { "dy",   PU_DAYOFYEAR }, { "y", PU_DAYOFYEAR },
+        { "day",       PU_DAY },       { "dd",   PU_DAY },     { "d",  PU_DAY },
+        { "week",      PU_WEEK },      { "wk",   PU_WEEK },    { "ww", PU_WEEK },
+        { "weekday",   PU_WEEKDAY },   { "dw",   PU_WEEKDAY },
+        { "hour",      PU_HOUR },      { "hh",   PU_HOUR },
+        { "minute",    PU_MINUTE },    { "mi",   PU_MINUTE },  { "n",  PU_MINUTE },
+        { "second",    PU_SECOND },    { "ss",   PU_SECOND },  { "s",  PU_SECOND },
+    };
+    for (size_t i = 0; i < sizeof tbl / sizeof tbl[0]; ++i) {
+        size_t L = strlen(tbl[i].name);
+        if (L == n && strncasecmp(s, tbl[i].name, L) == 0) {
+            *out = tbl[i].u; return 0;
+        }
+    }
+    return -1;
+}
+
+/* Get (y, m, d) for a temporal Value, treating timestamps as their date part. */
+static int temporal_to_ymd(Eval *E, const Value *v, int *y, unsigned *m, unsigned *d,
+                           const char *fn) {
+    if (v->kind == VK_DATE32) {
+        civil_from_days((int32_t)v->i64, y, m, d);
+        return 0;
+    }
+    if (v->kind == VK_TIMESTAMP_US) {
+        int32_t days; int64_t us_of_day;
+        split_ts(v->i64, &days, &us_of_day);
+        civil_from_days(days, y, m, d);
+        return 0;
+    }
+    return eval_err(E, "%s: argument must be a date or timestamp", fn);
+}
+
+static int fn_getdate(Eval *E, Value *vs, Value *out) {
+    (void)vs;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return eval_err(E, "GETDATE: clock_gettime failed");
+    }
+    int64_t us = (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+    out->kind = VK_TIMESTAMP_US; out->i64 = us;
+    return 0;
+}
+
+static int fn_year (Eval *E, Value *vs, Value *out) {
+    int y = 0; unsigned m = 0, d = 0;
+    if (temporal_to_ymd(E, &vs[0], &y, &m, &d, "YEAR") != 0) return -1;
+    out->kind = VK_INT64; out->i64 = y;
+    return 0;
+}
+static int fn_month(Eval *E, Value *vs, Value *out) {
+    int y = 0; unsigned m = 0, d = 0;
+    if (temporal_to_ymd(E, &vs[0], &y, &m, &d, "MONTH") != 0) return -1;
+    out->kind = VK_INT64; out->i64 = (int64_t)m;
+    return 0;
+}
+static int fn_day  (Eval *E, Value *vs, Value *out) {
+    int y = 0; unsigned m = 0, d = 0;
+    if (temporal_to_ymd(E, &vs[0], &y, &m, &d, "DAY") != 0) return -1;
+    out->kind = VK_INT64; out->i64 = (int64_t)d;
+    return 0;
+}
+
+static int fn_datepart(Eval *E, Value *vs, Value *out) {
+    if (vs[0].kind != VK_UTF8) return eval_err(E, "DATEPART: first arg must be a part name string");
+    PartUnit pu;
+    if (parse_part(vs[0].str, vs[0].str_n, &pu) != 0)
+        return eval_err(E, "DATEPART: unknown part");
+    int y = 0; unsigned m = 0, d = 0;
+    if (temporal_to_ymd(E, &vs[1], &y, &m, &d, "DATEPART") != 0) return -1;
+    out->kind = VK_INT64;
+    if (pu == PU_YEAR)        { out->i64 = y; return 0; }
+    if (pu == PU_QUARTER)     { out->i64 = (int64_t)((m - 1) / 3 + 1); return 0; }
+    if (pu == PU_MONTH)       { out->i64 = (int64_t)m; return 0; }
+    if (pu == PU_DAY)         { out->i64 = (int64_t)d; return 0; }
+    if (pu == PU_DAYOFYEAR)   {
+        int32_t doy = days_from_civil(y, m, d) - days_from_civil(y, 1, 1) + 1;
+        out->i64 = doy; return 0;
+    }
+    if (pu == PU_WEEKDAY)     {
+        /* SSIS DW: 1=Sunday..7=Saturday. days_from_civil's epoch
+         * 1970-01-01 was a Thursday (DW=5). */
+        int32_t days = days_from_civil(y, m, d);
+        int32_t dw = (days % 7 + 7) % 7;            /* 0=Thu */
+        int32_t ssis = ((dw + 4) % 7) + 1;          /* shift so Sunday=1 */
+        out->i64 = ssis; return 0;
+    }
+    if (pu == PU_WEEK)        {
+        /* ISO-ish week-of-year via dayofyear (simple version: 1..53). */
+        int32_t doy = days_from_civil(y, m, d) - days_from_civil(y, 1, 1) + 1;
+        out->i64 = (doy + 6) / 7; return 0;
+    }
+    /* Time-of-day units require a timestamp. */
+    if (vs[1].kind != VK_TIMESTAMP_US)
+        return eval_err(E, "DATEPART: hour/minute/second require a timestamp");
+    int32_t days; int64_t us_of_day;
+    split_ts(vs[1].i64, &days, &us_of_day);
+    if (pu == PU_HOUR)   { out->i64 = us_of_day / 3600000000LL; return 0; }
+    if (pu == PU_MINUTE) { out->i64 = (us_of_day / 60000000LL) % 60; return 0; }
+    if (pu == PU_SECOND) { out->i64 = (us_of_day / 1000000LL) % 60; return 0; }
+    return eval_err(E, "DATEPART: internal: unhandled part unit");
+}
+
+/* DATEADD on a date with sub-day units rejects (matches "predictable typed"
+ * behaviour: result type follows input). Use DATEADD on a timestamp for
+ * hours/minutes/seconds. */
+static int fn_dateadd(Eval *E, Value *vs, Value *out) {
+    if (vs[0].kind != VK_UTF8) return eval_err(E, "DATEADD: first arg must be a part name string");
+    if (vs[1].kind != VK_INT64) return eval_err(E, "DATEADD: second arg must be an integer");
+    PartUnit pu;
+    if (parse_part(vs[0].str, vs[0].str_n, &pu) != 0)
+        return eval_err(E, "DATEADD: unknown part");
+    int64_t n = vs[1].i64;
+    int input_is_date = (vs[2].kind == VK_DATE32);
+    int input_is_ts   = (vs[2].kind == VK_TIMESTAMP_US);
+    if (!input_is_date && !input_is_ts)
+        return eval_err(E, "DATEADD: third arg must be a date or timestamp");
+
+    /* Convert to (days, us_of_day) so all math is uniform. */
+    int32_t days; int64_t us_of_day = 0;
+    if (input_is_date) { days = (int32_t)vs[2].i64; }
+    else               { split_ts(vs[2].i64, &days, &us_of_day); }
+
+    if (pu == PU_HOUR || pu == PU_MINUTE || pu == PU_SECOND) {
+        if (input_is_date) return eval_err(E, "DATEADD: sub-day units require a timestamp input");
+        int64_t delta_us =
+            pu == PU_HOUR   ? n * 3600000000LL :
+            pu == PU_MINUTE ? n *   60000000LL :
+                              n *    1000000LL;
+        int64_t new_us = (int64_t)days * 86400000000LL + us_of_day + delta_us;
+        out->kind = VK_TIMESTAMP_US; out->i64 = new_us;
+        return 0;
+    }
+
+    if (pu == PU_DAY || pu == PU_DAYOFYEAR) {
+        days = (int32_t)((int64_t)days + n);
+    } else if (pu == PU_WEEK) {
+        days = (int32_t)((int64_t)days + n * 7);
+    } else {
+        /* year / quarter / month: do calendar math, then clamp day. */
+        int y = 0; unsigned m = 0, d = 0;
+        civil_from_days(days, &y, &m, &d);
+        int64_t months;
+        if (pu == PU_YEAR)         months = n * 12;
+        else if (pu == PU_QUARTER) months = n * 3;
+        else /* PU_MONTH */        months = n;
+        /* y/m → 0-based total months from epoch year, then add. */
+        int64_t total = (int64_t)y * 12 + (int64_t)(m - 1) + months;
+        int ny = (int)(total / 12);
+        unsigned nm = (unsigned)(((total % 12) + 12) % 12) + 1;
+        if (total < 0 && (total % 12) != 0) --ny;
+        /* clamp d to last day of (ny, nm) */
+        static const unsigned mdays[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+        unsigned last = mdays[nm - 1];
+        if (nm == 2) {
+            int leap = (ny % 4 == 0 && (ny % 100 != 0 || ny % 400 == 0));
+            if (leap) last = 29;
+        }
+        unsigned nd = d > last ? last : d;
+        days = days_from_civil(ny, nm, nd);
+    }
+
+    if (input_is_date) {
+        out->kind = VK_DATE32; out->i64 = days;
+    } else {
+        out->kind = VK_TIMESTAMP_US;
+        out->i64 = (int64_t)days * 86400000000LL + us_of_day;
+    }
+    return 0;
+}
+
+static int fn_datediff(Eval *E, Value *vs, Value *out) {
+    if (vs[0].kind != VK_UTF8) return eval_err(E, "DATEDIFF: first arg must be a part name string");
+    PartUnit pu;
+    if (parse_part(vs[0].str, vs[0].str_n, &pu) != 0)
+        return eval_err(E, "DATEDIFF: unknown part");
+
+    /* Coerce both temporal args to (days, us_of_day). */
+    int32_t d1, d2; int64_t u1 = 0, u2 = 0;
+    if (vs[1].kind == VK_DATE32)            d1 = (int32_t)vs[1].i64;
+    else if (vs[1].kind == VK_TIMESTAMP_US) split_ts(vs[1].i64, &d1, &u1);
+    else return eval_err(E, "DATEDIFF: second arg must be date or timestamp");
+    if (vs[2].kind == VK_DATE32)            d2 = (int32_t)vs[2].i64;
+    else if (vs[2].kind == VK_TIMESTAMP_US) split_ts(vs[2].i64, &d2, &u2);
+    else return eval_err(E, "DATEDIFF: third arg must be date or timestamp");
+
+    out->kind = VK_INT64;
+    if (pu == PU_DAY || pu == PU_DAYOFYEAR) {
+        out->i64 = (int64_t)d2 - (int64_t)d1;
+        return 0;
+    }
+    if (pu == PU_WEEK) {
+        out->i64 = ((int64_t)d2 - (int64_t)d1) / 7;
+        return 0;
+    }
+    if (pu == PU_YEAR || pu == PU_QUARTER || pu == PU_MONTH) {
+        int y1, y2; unsigned m1, m2, dd1, dd2;
+        civil_from_days(d1, &y1, &m1, &dd1);
+        civil_from_days(d2, &y2, &m2, &dd2);
+        int64_t months = ((int64_t)y2 - y1) * 12 + ((int64_t)m2 - m1);
+        if (pu == PU_YEAR)    out->i64 = months / 12;
+        if (pu == PU_QUARTER) out->i64 = months / 3;
+        if (pu == PU_MONTH)   out->i64 = months;
+        return 0;
+    }
+    /* hour/minute/second: full elapsed time including us_of_day. */
+    int64_t us1 = (int64_t)d1 * 86400000000LL + u1;
+    int64_t us2 = (int64_t)d2 * 86400000000LL + u2;
+    int64_t delta = us2 - us1;
+    if (pu == PU_HOUR)   { out->i64 = delta / 3600000000LL; return 0; }
+    if (pu == PU_MINUTE) { out->i64 = delta /   60000000LL; return 0; }
+    if (pu == PU_SECOND) { out->i64 = delta /    1000000LL; return 0; }
+    return eval_err(E, "DATEDIFF: unsupported part");
+}
+
 /* Dispatch. ISNULL/REPLACENULL must observe NULL on their first arg
  * rather than propagating; every other function propagates NULL when
  * any arg is NULL. */
@@ -1639,6 +2107,13 @@ static int eval_call(Eval *E, Par *P, const Node *n, Value *out) {
         case FN_CEILING:    return fn_ceiling   (E, vs, out);
         case FN_FLOOR:      return fn_floor     (E, vs, out);
         case FN_SIGN:       return fn_sign      (E, vs, out);
+        case FN_GETDATE:    return fn_getdate   (E, vs, out);
+        case FN_YEAR:       return fn_year      (E, vs, out);
+        case FN_MONTH:      return fn_month     (E, vs, out);
+        case FN_DAY:        return fn_day       (E, vs, out);
+        case FN_DATEPART:   return fn_datepart  (E, vs, out);
+        case FN_DATEADD:    return fn_dateadd   (E, vs, out);
+        case FN_DATEDIFF:   return fn_datediff  (E, vs, out);
         case FN_ISNULL:
         case FN_REPLACENULL: /* handled above */ break;
     }
@@ -1742,10 +2217,12 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
                      "ssisexpr: column %zu has no format", i);
             return -1;
         }
-        if (strcmp(fmt, "l") == 0)      e->col_fmts[i] = 'l';
-        else if (strcmp(fmt, "g") == 0) e->col_fmts[i] = 'g';
-        else if (strcmp(fmt, "b") == 0) e->col_fmts[i] = 'b';
-        else if (strcmp(fmt, "u") == 0) e->col_fmts[i] = 'u';
+        if (strcmp(fmt, "l") == 0)        e->col_fmts[i] = 'l';
+        else if (strcmp(fmt, "g") == 0)   e->col_fmts[i] = 'g';
+        else if (strcmp(fmt, "b") == 0)   e->col_fmts[i] = 'b';
+        else if (strcmp(fmt, "u") == 0)   e->col_fmts[i] = 'u';
+        else if (strcmp(fmt, "tdD") == 0) e->col_fmts[i] = 'D';
+        else if (strcmp(fmt, "tsu:") == 0) e->col_fmts[i] = 'T';
         else {
             snprintf(e->last_err, sizeof e->last_err,
                      "ssisexpr: column '%s' has unsupported format '%s'",
@@ -1831,12 +2308,18 @@ static void ssisexpr_release(void *handle) {
 
 static int format_to_lmtype(const char *fmt, LmType *out) {
     if (!fmt) return -1;
-    if      (strcmp(fmt, "l") == 0) { *out = LM_T_INT64;   return 0; }
-    else if (strcmp(fmt, "g") == 0) { *out = LM_T_FLOAT64; return 0; }
-    else if (strcmp(fmt, "u") == 0) { *out = LM_T_UTF8;    return 0; }
-    else if (strcmp(fmt, "b") == 0) { *out = LM_T_BOOL;    return 0; }
+    if      (strcmp(fmt, "l")    == 0) { *out = LM_T_INT64;        return 0; }
+    else if (strcmp(fmt, "g")    == 0) { *out = LM_T_FLOAT64;      return 0; }
+    else if (strcmp(fmt, "u")    == 0) { *out = LM_T_UTF8;         return 0; }
+    else if (strcmp(fmt, "b")    == 0) { *out = LM_T_BOOL;         return 0; }
+    else if (strcmp(fmt, "tdD")  == 0) { *out = LM_T_DATE32;       return 0; }
+    else if (strcmp(fmt, "tsu:") == 0) { *out = LM_T_TIMESTAMP_US; return 0; }
     return -1;
 }
+
+/* Forward decls for stringify helpers used by store_value's UTF8 path. */
+static int fmt_date_iso(int32_t days, char *buf, size_t cap);
+static int fmt_ts_iso  (int64_t us,   char *buf, size_t cap);
 
 /* Coerce one Value into the LmCol's slot for row_idx. is_null already handled. */
 static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value *v) {
@@ -1845,19 +2328,38 @@ static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value
             if (v->kind == VK_INT64)        col->i64_vals[row_idx] = v->i64;
             else if (v->kind == VK_FLOAT64) col->i64_vals[row_idx] = (int64_t)v->f64;
             else if (v->kind == VK_BOOL)    col->i64_vals[row_idx] = v->b ? 1 : 0;
-            else { betl_set_error(ctx, "ssisexpr: cannot coerce string to int64"); return -1; }
+            else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to int64"); return -1; }
             return 0;
         case LM_T_FLOAT64:
             if (v->kind == VK_INT64)        col->f64_vals[row_idx] = (double)v->i64;
             else if (v->kind == VK_FLOAT64) col->f64_vals[row_idx] = v->f64;
             else if (v->kind == VK_BOOL)    col->f64_vals[row_idx] = v->b ? 1.0 : 0.0;
-            else { betl_set_error(ctx, "ssisexpr: cannot coerce string to float64"); return -1; }
+            else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to float64"); return -1; }
             return 0;
         case LM_T_BOOL:
             if (v->kind == VK_BOOL)         col->b_vals[row_idx] = v->b ? 1 : 0;
             else if (v->kind == VK_INT64)   col->b_vals[row_idx] = v->i64 != 0;
             else if (v->kind == VK_FLOAT64) col->b_vals[row_idx] = v->f64 != 0.0;
-            else { betl_set_error(ctx, "ssisexpr: cannot coerce string to bool"); return -1; }
+            else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to bool"); return -1; }
+            return 0;
+        case LM_T_DATE32:
+            if (v->kind != VK_DATE32) {
+                betl_set_error(ctx, "ssisexpr: cannot coerce non-date to DT_DBDATE column "
+                                    "(use (DT_DBDATE) cast first)");
+                return -1;
+            }
+            col->d32_vals[row_idx] = (int32_t)v->i64;
+            return 0;
+        case LM_T_TIMESTAMP_US:
+            if (v->kind == VK_TIMESTAMP_US) {
+                col->i64_vals[row_idx] = v->i64;
+            } else if (v->kind == VK_DATE32) {
+                /* Promote date32 to midnight-on-that-date in micros. */
+                col->i64_vals[row_idx] = v->i64 * (int64_t)86400000000LL;
+            } else {
+                betl_set_error(ctx, "ssisexpr: cannot coerce non-temporal to DT_DBTIMESTAMP column");
+                return -1;
+            }
             return 0;
         case LM_T_UTF8:
             if (v->kind == VK_UTF8) {
@@ -1867,9 +2369,11 @@ static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value
             } else {
                 /* Stringify a non-string. Reuse the cast path semantics. */
                 char buf[64]; int n = 0;
-                if (v->kind == VK_INT64)        n = snprintf(buf, sizeof buf, "%" PRId64, v->i64);
-                else if (v->kind == VK_FLOAT64) n = snprintf(buf, sizeof buf, "%g", v->f64);
-                else /* BOOL */                 n = snprintf(buf, sizeof buf, "%s", v->b ? "True" : "False");
+                if (v->kind == VK_INT64)             n = snprintf(buf, sizeof buf, "%" PRId64, v->i64);
+                else if (v->kind == VK_FLOAT64)      n = snprintf(buf, sizeof buf, "%g", v->f64);
+                else if (v->kind == VK_BOOL)        n = snprintf(buf, sizeof buf, "%s", v->b ? "True" : "False");
+                else if (v->kind == VK_DATE32)       n = fmt_date_iso((int32_t)v->i64, buf, sizeof buf);
+                else if (v->kind == VK_TIMESTAMP_US) n = fmt_ts_iso  (v->i64,           buf, sizeof buf);
                 if (n < 0) { betl_set_error(ctx, "ssisexpr: stringify error"); return -1; }
                 if (lm_col_append_string(col, buf, (size_t)n, row_idx) != 0) {
                     betl_set_error(ctx, "ssisexpr: out of memory"); return -1;
