@@ -38,6 +38,9 @@ endif()
 # --- Dependencies ----------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAML REQUIRED IMPORTED_TARGET yaml-0.1)
+# pthread for the async-stream wrapper used by the executor's parallel mode.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 # libpq is optional at top-level configure: when present we build the
 # Postgres integration tests; when absent the rest of the project still
 # builds cleanly. Tests gate themselves on LIBPQ_FOUND.
@@ -102,6 +105,7 @@ configure_file(
 add_library(betl_core STATIC
     src/loader/registry.c
     src/pipeline/pipeline.c
+    src/runtime/async_stream.c
     src/runtime/builtins.c
     src/runtime/connections.c
     src/runtime/context.c
@@ -129,7 +133,7 @@ target_include_directories(betl_core PUBLIC
     ${CMAKE_BINARY_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
 )
-target_link_libraries(betl_core PUBLIC PkgConfig::YAML ${CMAKE_DL_LIBS})
+target_link_libraries(betl_core PUBLIC PkgConfig::YAML ${CMAKE_DL_LIBS} Threads::Threads)
 
 # Pull in postgres.upsert when libpq is available. The component is part
 # of the core (not a separate plugin) for v0.1 — same model as csv.read.

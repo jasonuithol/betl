@@ -35,7 +35,21 @@
 #define ROW_COUNT        4000
 #define PAYLOAD_BYTES     500
 #define BATCH_SIZE        100
-#define MAX_HWM_DELTA_KB (5 * 1024)   /* 5 MB headroom */
+
+/* TSan/ASan shadow memory inflates VmHWM by several MB independent of
+ * data volume — bump the headroom under sanitizers so the streaming-vs-
+ * buffered distinction (a >10x ratio) still holds without false-failing. */
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#  define MAX_HWM_DELTA_KB (32 * 1024)
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#    define MAX_HWM_DELTA_KB (32 * 1024)
+#  else
+#    define MAX_HWM_DELTA_KB (5 * 1024)
+#  endif
+#else
+#  define MAX_HWM_DELTA_KB (5 * 1024)
+#endif
 
 static int failures = 0;
 

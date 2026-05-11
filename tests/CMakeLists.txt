@@ -228,6 +228,28 @@ if(BETL_LUA_FOUND)
     )
 endif()
 
+# --- pipeline parallelism (async_stream wrapper) ----------------------------
+# Same canonical pipeline run with three queue depths to stress the
+# producer/consumer sync. Registered three times with distinct env vars
+# so the depth-1 case (most synchronization, smallest queue) runs even
+# in the default sweep.
+add_executable(test_pipeline_parallel test_pipeline_parallel.c)
+target_link_libraries(test_pipeline_parallel PRIVATE betl_core)
+add_test(NAME pipeline_parallel_default
+    COMMAND test_pipeline_parallel)
+set_tests_properties(pipeline_parallel_default PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: pipeline_parallel test passed")
+add_test(NAME pipeline_parallel_depth1
+    COMMAND test_pipeline_parallel)
+set_tests_properties(pipeline_parallel_depth1 PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: pipeline_parallel test passed"
+    ENVIRONMENT "BETL_PARALLEL=on;BETL_PARALLEL_DEPTH=1")
+add_test(NAME pipeline_parallel_off
+    COMMAND test_pipeline_parallel)
+set_tests_properties(pipeline_parallel_off PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: pipeline_parallel test passed"
+    ENVIRONMENT "BETL_PARALLEL=off")
+
 # --- csv.read v2 end-to-end (streaming + RFC 4180 quoting) ------------------
 add_executable(test_csv_read test_csv_read.c)
 target_link_libraries(test_csv_read PRIVATE betl_core)

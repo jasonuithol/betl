@@ -118,6 +118,24 @@ upserts).
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
 
+## Pipeline parallelism
+
+The executor wraps every dataflow edge in a producer-thread + bounded
+queue, so adjacent steps overlap their I/O. A typical
+`postgres.read → mssql.upsert` chain has the source and sink running
+concurrently.
+
+This is **on by default**. Tunable via env vars:
+
+- `BETL_PARALLEL=off` — fall back to the single-threaded path
+  (useful for debugging or memory-constrained runs).
+- `BETL_PARALLEL_DEPTH=N` — per-edge ring-buffer capacity in batches.
+  Default 4. Memory bound is `depth × n_edges × max_batch_size`.
+
+Components don't need to be thread-safe themselves: each component's
+state is still touched by exactly one thread — the parallelism happens
+*between* components, on the edges.
+
 ## Building from source
 
 Prerequisites:

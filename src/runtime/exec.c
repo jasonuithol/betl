@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "betl/provider.h"
+#include "runtime/async_stream.h"
 #include "runtime/context.h"
 #include "runtime/substitute.h"
 
@@ -375,14 +376,52 @@ static int run_dataflow_stage(BetlContext *ctx, BetlRegistry *reg,
                 rc = BETL_ERR_INVALID;
                 goto cleanup;
             }
-            rc = r->def->attach_input(r->state, (int)pi,
-                                      &upr->outputs[port_idx]);
-            if (rc != BETL_OK) goto cleanup;
-            /* attach_input transferred the buffers + release into the
-             * downstream's own state; mark the slot empty so cleanup
-             * doesn't double-release. */
-            upr->output_attached[port_idx] = 0;
-            memset(&upr->outputs[port_idx], 0, sizeof upr->outputs[port_idx]);
+
+            /* Pipeline parallelism: wrap each upstream-to-downstream
+             * edge with an async_stream so the producer (upstream) runs
+             * on its own thread. Wrapper takes ownership of the
+             * upstream's slot; if attach_input fails, the wrapper's
+             * release tears down the producer thread cleanly. */
+            struct ArrowArrayStream wrapped = {0};
+            struct ArrowArrayStream *to_pass = &upr->outputs[port_idx];
+            int wrapped_in_use = 0;
+            if (betl_pipeline_parallel_enabled()) {
+                int wrap_rc = betl_async_wrap(
+                    &upr->outputs[port_idx],
+                    betl_pipeline_parallel_depth(), ctx, &wrapped);
+                if (wrap_rc != BETL_OK) {
+                    betl_set_error(ctx,
+                        "stage '%s' step '%s': failed to wrap upstream "
+                        "'%s' for pipeline parallelism",
+                        s->id, st->id, s->steps[up].id);
+                    rc = wrap_rc;
+                    goto cleanup;
+                }
+                /* upstream slot was zeroed by betl_async_wrap; the
+                 * wrapper now owns it. */
+                upr->output_attached[port_idx] = 0;
+                to_pass = &wrapped;
+                wrapped_in_use = 1;
+            }
+            rc = r->def->attach_input(r->state, (int)pi, to_pass);
+            if (rc != BETL_OK) {
+                /* attach_input may or may not have taken ownership; if
+                 * the component is well-behaved it zeroed the stream on
+                 * error too, but we can't rely on that. Release the
+                 * wrapper here only if the component clearly didn't take
+                 * it (release callback still set). */
+                if (wrapped_in_use && wrapped.release) {
+                    wrapped.release(&wrapped);
+                }
+                goto cleanup;
+            }
+            /* attach_input transferred ownership; mark the slot empty
+             * so cleanup doesn't double-release. */
+            if (!wrapped_in_use) {
+                upr->output_attached[port_idx] = 0;
+                memset(&upr->outputs[port_idx], 0,
+                       sizeof upr->outputs[port_idx]);
+            }
         }
     }
 
