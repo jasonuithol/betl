@@ -27,6 +27,7 @@
 #include <sqltypes.h>
 
 #include "runtime/date_util.h"
+#include "runtime/decimal_util.h"
 
 #include "betl/provider.h"
 
@@ -126,6 +127,9 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
     case SQL_TYPE_TIMESTAMP:     /* MSSQL DATETIME / DATETIME2 */
     case SQL_TIMESTAMP:          /* older ODBC alias */
         *out = 'T'; return 0;
+    case SQL_DECIMAL:
+    case SQL_NUMERIC:
+        *out = 'N'; return 0;
     default:
         return -1;
     }
@@ -162,6 +166,12 @@ static void msr_release_struct(struct ArrowArray *arr) {
     arr->release = NULL;
 }
 
+static void msr_release_schema_named_owned_format(struct ArrowSchema *sch) {
+    free((void *)sch->name);
+    free((void *)sch->format);
+    sch->release = NULL;
+}
+
 static void msr_release_schema_named(struct ArrowSchema *sch) {
     free((void *)sch->name);
     sch->release = NULL;
@@ -185,12 +195,13 @@ static void msr_release_schema_struct(struct ArrowSchema *sch) {
 typedef struct {
     /* Per-batch staging — capacity = batch_size; current row count
      * tracked at the state level. i64_vals is used for both 'l' and
-     * 'T' (timestamp_us); d32_vals for 'D'. */
-    int64_t  *i64_vals;
-    int32_t  *d32_vals;
-    char    **u8_strs;
-    size_t   *u8_lens;
-    uint8_t  *nulls;       /* 1 = null, 0 = valid */
+     * 'T' (timestamp_us); d32_vals for 'D'; d128_vals for 'N'. */
+    int64_t      *i64_vals;
+    int32_t      *d32_vals;
+    betl_dec128  *d128_vals;
+    char        **u8_strs;
+    size_t       *u8_lens;
+    uint8_t      *nulls;       /* 1 = null, 0 = valid */
 } MsReadCol;
 
 typedef struct {
@@ -209,7 +220,10 @@ typedef struct {
     int          schema_resolved;
     SQLSMALLINT  n_cols;
     char       **col_names;
-    char        *col_fmts;        /* per-col 'l' or 'u' */
+    char        *col_fmts;        /* per-col 'l'/'u'/'D'/'T'/'N' */
+    int         *col_precisions;  /* decimal columns only */
+    int         *col_scales;      /* decimal columns only */
+    char       **col_fmt_strings; /* heap-owned "d:p,s" for decimal cols */
 
     /* Per-batch staging. */
     MsReadCol *cols;
@@ -345,6 +359,7 @@ static void msr_destroy(void *state) {
         for (SQLSMALLINT c = 0; c < s->n_cols; ++c) {
             free(s->cols[c].i64_vals);
             free(s->cols[c].d32_vals);
+            free(s->cols[c].d128_vals);
             free(s->cols[c].u8_strs);
             free(s->cols[c].u8_lens);
             free(s->cols[c].nulls);
@@ -355,7 +370,13 @@ static void msr_destroy(void *state) {
         for (SQLSMALLINT c = 0; c < s->n_cols; ++c) free(s->col_names[c]);
         free(s->col_names);
     }
+    if (s->col_fmt_strings) {
+        for (SQLSMALLINT c = 0; c < s->n_cols; ++c) free(s->col_fmt_strings[c]);
+        free(s->col_fmt_strings);
+    }
     free(s->col_fmts);
+    free(s->col_precisions);
+    free(s->col_scales);
     if (s->hstmt != SQL_NULL_HSTMT) SQLFreeHandle(SQL_HANDLE_STMT, s->hstmt);
     if (s->hdbc != SQL_NULL_HDBC) {
         SQLDisconnect(s->hdbc);
@@ -379,10 +400,14 @@ static int msr_resolve_schema(MsReadState *s) {
         return -1;
     }
     s->n_cols = n;
-    s->col_names = calloc((size_t)n, sizeof *s->col_names);
-    s->col_fmts  = malloc((size_t)n);
-    s->cols      = calloc((size_t)n, sizeof *s->cols);
-    if (!s->col_names || !s->col_fmts || !s->cols) {
+    s->col_names       = calloc((size_t)n, sizeof *s->col_names);
+    s->col_fmts        = malloc((size_t)n);
+    s->col_precisions  = calloc((size_t)n, sizeof *s->col_precisions);
+    s->col_scales      = calloc((size_t)n, sizeof *s->col_scales);
+    s->col_fmt_strings = calloc((size_t)n, sizeof *s->col_fmt_strings);
+    s->cols            = calloc((size_t)n, sizeof *s->cols);
+    if (!s->col_names || !s->col_fmts || !s->col_precisions
+        || !s->col_scales || !s->col_fmt_strings || !s->cols) {
         betl_set_error(s->ctx, "mssql.read: out of memory");
         return -1;
     }
@@ -402,7 +427,8 @@ static int msr_resolve_schema(MsReadState *s) {
         if (sql_type_to_fmt(sql_type, &fmt) != 0) {
             betl_set_error(s->ctx,
                 "mssql.read: column '%s' has unsupported SQL type %d "
-                "(supported: int family, char/varchar family, date, datetime/datetime2)",
+                "(supported: int family, char/varchar family, date, "
+                "datetime/datetime2, numeric/decimal)",
                 colname, (int)sql_type);
             return -1;
         }
@@ -411,6 +437,25 @@ static int msr_resolve_schema(MsReadState *s) {
         if (!s->col_names[c]) {
             betl_set_error(s->ctx, "mssql.read: out of memory");
             return -1;
+        }
+        if (fmt == 'N') {
+            int p  = (int)col_size;
+            int sc = (int)decimal;
+            if (p < 1 || p > 38 || sc < 0 || sc > p) {
+                betl_set_error(s->ctx,
+                    "mssql.read: column '%s' DECIMAL(%d,%d) outside supported "
+                    "[1,38] precision", s->col_names[c], p, sc);
+                return -1;
+            }
+            s->col_precisions[c] = p;
+            s->col_scales[c]     = sc;
+            char buf[24];
+            snprintf(buf, sizeof buf, "d:%d,%d", p, sc);
+            s->col_fmt_strings[c] = strdup(buf);
+            if (!s->col_fmt_strings[c]) {
+                betl_set_error(s->ctx, "mssql.read: out of memory");
+                return -1;
+            }
         }
         /* Pre-allocate staging at batch_size capacity. */
         s->cols[c].nulls = calloc(s->batch_size, 1);
@@ -427,6 +472,12 @@ static int msr_resolve_schema(MsReadState *s) {
         } else if (fmt == 'D') {
             s->cols[c].d32_vals = malloc(s->batch_size * sizeof(int32_t));
             if (!s->cols[c].d32_vals) {
+                betl_set_error(s->ctx, "mssql.read: out of memory");
+                return -1;
+            }
+        } else if (fmt == 'N') {
+            s->cols[c].d128_vals = malloc(s->batch_size * sizeof(betl_dec128));
+            if (!s->cols[c].d128_vals) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
                 return -1;
             }
@@ -494,6 +545,36 @@ static void msr_release_date32_leaf(struct ArrowArray *arr) {
     }
     free(arr->buffers);
     arr->release = NULL;
+}
+
+static void msr_release_decimal128_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static int msr_build_decimal128_leaf(struct ArrowArray *out,
+                                     const betl_dec128 *vals,
+                                     const uint8_t *nulls,
+                                     size_t n) {
+    betl_dec128 *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0 : vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = msr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = msr_release_decimal128_leaf;
+    return 0;
 }
 
 static int msr_build_date32_leaf(struct ArrowArray *out,
@@ -578,13 +659,40 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
     if (!kids) return ENOMEM;
     for (SQLSMALLINT i = 0; i < s->n_cols; ++i) {
         const char *fmt = "u";
+        int owned = 0;
         switch (s->col_fmts[i]) {
             case 'l': fmt = "l";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
+            case 'N':
+                fmt = strdup(s->col_fmt_strings[i]);
+                owned = 1;
+                if (!fmt) {
+                    for (SQLSMALLINT k = 0; k < i; ++k) {
+                        if (kids[k]->release) kids[k]->release(kids[k]);
+                        free(kids[k]);
+                    }
+                    free(kids);
+                    return ENOMEM;
+                }
+                break;
             default:  fmt = "u";    break;
         }
         kids[i] = msr_new_leaf(s->col_names[i], fmt);
+        if (!kids[i]) {
+            if (owned) free((void *)fmt);
+            for (SQLSMALLINT k = 0; k < i; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids);
+            return ENOMEM;
+        }
+        if (owned) {
+            /* msr_new_leaf used the default release that frees only the
+             * name; switch to the variant that also frees format. */
+            kids[i]->release = msr_release_schema_named_owned_format;
+        }
         if (!kids[i]) {
             for (SQLSMALLINT k = 0; k < i; ++k) {
                 if (kids[k]->release) kids[k]->release(kids[k]);
@@ -604,6 +712,36 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
 /* Read one cell from the current row into the column's staging slot. */
 static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
     MsReadCol *col = &s->cols[c];
+    if (s->col_fmts[c] == 'N') {
+        /* Fetch as text — driver formats as "[-]ddd[.ddd...]" with the
+         * column's scale. Parse with our shared decimal helper. */
+        SQLCHAR buf[64];
+        SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                      SQL_C_CHAR, buf, sizeof buf, &ind))) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(decimal) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row]     = 1;
+            col->d128_vals[row] = 0;
+        } else {
+            betl_dec128 v;
+            if (betl_dec128_parse((const char *)buf, (size_t)ind,
+                                  s->col_scales[c], &v) != 0) {
+                betl_set_error(s->ctx,
+                    "mssql.read: row %zu col '%s': '%s' is not a valid "
+                    "DECIMAL(%d,%d)", row, s->col_names[c], (const char *)buf,
+                    s->col_precisions[c], s->col_scales[c]);
+                return -1;
+            }
+            col->nulls[row]     = 0;
+            col->d128_vals[row] = v;
+        }
+        return 0;
+    }
     if (s->col_fmts[c] == 'l') {
         SQLBIGINT v = 0;
         SQLLEN ind = 0;
@@ -772,6 +910,9 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'D') {
             rc = msr_build_date32_leaf(kids[c], s->cols[c].d32_vals,
                                        s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 'N') {
+            rc = msr_build_decimal128_leaf(kids[c], s->cols[c].d128_vals,
+                                           s->cols[c].nulls, (size_t)n);
         } else {
             rc = msr_build_utf8_leaf(kids[c], s->cols[c].u8_strs,
                                      s->cols[c].u8_lens,

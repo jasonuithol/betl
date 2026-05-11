@@ -490,6 +490,15 @@ if(LIBPQ_FOUND)
         PASS_REGULAR_EXPRESSION "ok: pg_upsert date/timestamp roundtrip test passed"
     )
 
+    # --- postgres.upsert NUMERIC roundtrip test -----------------------------
+    add_executable(test_pg_upsert_decimal test_pg_upsert_decimal.c)
+    target_link_libraries(test_pg_upsert_decimal PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_upsert_decimal COMMAND test_pg_upsert_decimal)
+    set_tests_properties(pg_upsert_decimal PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_upsert decimal roundtrip test passed"
+    )
+
     # --- postgres.read streaming stress test (no Lua) -----------------------
     # Verifies VmHWM stays bounded across a 2MB result set with a small
     # batch_size — proves the libpq cursor path actually streams rather

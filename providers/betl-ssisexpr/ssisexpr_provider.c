@@ -31,6 +31,11 @@
 
 #include "betl/provider.h"
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+typedef __int128 i128;
+#pragma GCC diagnostic pop
+
 
 /* ============================================================== *
  *  AST                                                             *
@@ -66,6 +71,7 @@ typedef enum {
     DT_DBTIMESTAMP,     /* Arrow tsu: — micros since 1970-01-01 UTC, no tz */
     DT_DBTIMESTAMP2,    /* alias for DT_DBTIMESTAMP (SSIS distinguishes
                          * by precision; we treat both as us-precision) */
+    DT_NUMERIC,         /* Arrow d:p,s — int128 + (precision, scale) */
 } SsisDt;
 
 typedef enum {
@@ -108,7 +114,8 @@ struct Node {
         struct { Op op; Node *a; } unary;
         struct { Op op; Node *a; Node *b; } binop;
         struct { Node *cond; Node *t; Node *f; } ternary;
-        struct { SsisDt dt; int has_len; int64_t len; Node *a; } cast;
+        struct { SsisDt dt; int has_len; int64_t len;
+                 int has_scale; int64_t scale; Node *a; } cast;
         struct { FnId fn; Node **args; size_t n_args; } call;
     };
 };
@@ -465,7 +472,8 @@ typedef struct {
     Arena      *arena;
     /* Column-name → index resolution table. */
     char      **col_names;
-    char       *col_fmts;        /* parallel: 'l'/'g'/'u'/'b' */
+    char       *col_fmts;        /* parallel: 'l'/'g'/'u'/'b'/'D'/'T'/'N' */
+    int        *col_scales;      /* decimal scale per column; 0 elsewhere */
     size_t      n_cols;
     char        err[256];
 } Par;
@@ -508,6 +516,8 @@ static int parse_dt(const char *name, SsisDt *out) {
     else if (strcasecmp(name, "DT_DBDATE")       == 0) { *out = DT_DBDATE;       return 1; }
     else if (strcasecmp(name, "DT_DBTIMESTAMP")  == 0) { *out = DT_DBTIMESTAMP;  return 1; }
     else if (strcasecmp(name, "DT_DBTIMESTAMP2") == 0) { *out = DT_DBTIMESTAMP2; return 1; }
+    else if (strcasecmp(name, "DT_NUMERIC")      == 0) { *out = DT_NUMERIC;      return 1; }
+    else if (strcasecmp(name, "DT_DECIMAL")      == 0) { *out = DT_NUMERIC;      return 1; }
     return 0;
 }
 
@@ -669,7 +679,8 @@ static Node *p_paren_or_cast(Par *P) {
             TokKind next = P->toks[P->pos + 1].kind;
             if (next == T_RPAREN || next == T_COMMA) {
                 advance(P);                    /* consume DT_xxx */
-                int has_len = 0; int64_t length = 0;
+                int has_len = 0;    int64_t length = 0;
+                int has_scale = 0;  int64_t scale  = 0;
                 if (match(P, T_COMMA)) {
                     if (!check(P, T_INT)) {
                         par_err(P, "cast length must be an integer literal");
@@ -678,6 +689,18 @@ static Node *p_paren_or_cast(Par *P) {
                     length = peek(P)->i64;
                     advance(P);
                     has_len = 1;
+                    /* Optional third arg: scale for DT_NUMERIC, or
+                     * code-page for DT_STR (we accept and ignore the
+                     * latter). */
+                    if (match(P, T_COMMA)) {
+                        if (!check(P, T_INT)) {
+                            par_err(P, "cast: expected integer after second comma");
+                            return NULL;
+                        }
+                        scale = peek(P)->i64;
+                        advance(P);
+                        has_scale = 1;
+                    }
                 }
                 if (!match(P, T_RPAREN)) {
                     par_err(P, "expected ')' after cast type");
@@ -690,6 +713,8 @@ static Node *p_paren_or_cast(Par *P) {
                 n->cast.dt = dt;
                 n->cast.has_len = has_len;
                 n->cast.len = length;
+                n->cast.has_scale = has_scale;
+                n->cast.scale = scale;
                 n->cast.a = inner;
                 return n;
             }
@@ -1060,19 +1085,25 @@ typedef enum {
     VK_INT64, VK_FLOAT64, VK_UTF8, VK_BOOL,
     VK_DATE32,         /* int32 days since 1970-01-01; stored in i64 */
     VK_TIMESTAMP_US,   /* int64 micros since 1970-01-01 UTC; stored in i64 */
+    VK_DECIMAL128,     /* int128 fixed-scale; stored in d128 + dec_scale */
 } VKind;
 
 typedef struct {
-    VKind kind;
-    int   is_null;
-    int64_t i64;
-    double  f64;
-    int     b;
+    /* Ordered widest-first to minimize struct padding (clang-analyzer
+     * picked the layout). decimal128 must come first since __int128 has
+     * 16-byte alignment. */
+    i128        d128;          /* decimal128 magnitude */
+    int64_t     i64;           /* int64 + date32 + timestamp_us */
+    double      f64;
     /* utf8: pointer + length. Either zero-copy into the input batch /
      * a literal node's bytes, or into the per-batch scratch arena which
      * owns the buffer until evaluate() exits. */
     const char *str;
     size_t      str_n;
+    VKind       kind;
+    int         is_null;
+    int         b;
+    int         dec_scale;     /* digits after the point, for d128 */
 } Value;
 
 typedef struct {
@@ -1113,7 +1144,8 @@ static int eval_err(Eval *E, const char *fmt, ...) {
 }
 
 /* Read row.col_idx as a Value. */
-static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, Value *out) {
+static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, int dec_scale,
+                         Value *out) {
     memset(out, 0, sizeof *out);
     const struct ArrowArray *col = E->batch->children[col_idx];
     size_t row = E->row + (size_t)col->offset;
@@ -1152,6 +1184,13 @@ static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, Value *out) {
             const int64_t *v = col->buffers[1];
             out->kind = VK_TIMESTAMP_US; out->i64 = v[row]; return 0;
         }
+        case 'N': {
+            const i128 *v = col->buffers[1];
+            out->kind      = VK_DECIMAL128;
+            out->d128      = v[row];
+            out->dec_scale = dec_scale;
+            return 0;
+        }
         default:
             return eval_err(E, "unsupported column format '%c'", col_fmt);
     }
@@ -1167,6 +1206,14 @@ static void promote_numeric(Value *a, Value *b) {
 }
 
 static int eval_node(Eval *E, Par *P, const Node *n, Value *out);
+
+/* Forward decls for decimal128 helpers (defined further down in the
+ * "Date / timestamp / decimal helpers" section). cmp_values needs them
+ * before that section. */
+static int parse_decimal(const char *s, size_t n, int scale, i128 *out);
+static int format_decimal(i128 v, int scale, char *buf, size_t cap);
+static double decimal_to_double(i128 v, int scale);
+static int compare_decimals(i128 a, int sa, i128 b, int sb);
 
 static int op_arith(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Value *out) {
     Value a, b;
@@ -1230,6 +1277,26 @@ static int cmp_values(Eval *E, const Value *a, const Value *b, int *out_cmp) {
     }
     if (a->kind == VK_BOOL && b->kind == VK_BOOL) {
         *out_cmp = (a->b > b->b) - (a->b < b->b);
+        return 0;
+    }
+    /* Decimal vs decimal — direct compare with scale promotion. */
+    if (a->kind == VK_DECIMAL128 && b->kind == VK_DECIMAL128) {
+        *out_cmp = compare_decimals(a->d128, a->dec_scale, b->d128, b->dec_scale);
+        return 0;
+    }
+    /* Decimal vs other numeric: compare via double (lossy but pragmatic;
+     * SSIS users mixing decimal with int/float in a comparison is rare
+     * and the double has 53-bit mantissa = ~16 decimal digits headroom). */
+    if (a->kind == VK_DECIMAL128 && (b->kind == VK_INT64 || b->kind == VK_FLOAT64)) {
+        double ad = decimal_to_double(a->d128, a->dec_scale);
+        double bd = (b->kind == VK_INT64) ? (double)b->i64 : b->f64;
+        *out_cmp = (ad > bd) - (ad < bd);
+        return 0;
+    }
+    if (b->kind == VK_DECIMAL128 && (a->kind == VK_INT64 || a->kind == VK_FLOAT64)) {
+        double ad = (a->kind == VK_INT64) ? (double)a->i64 : a->f64;
+        double bd = decimal_to_double(b->d128, b->dec_scale);
+        *out_cmp = (ad > bd) - (ad < bd);
         return 0;
     }
     /* Temporal: same kind compares i64 directly; date vs timestamp
@@ -1448,7 +1515,126 @@ static int fmt_ts_iso(int64_t us, char *buf, size_t cap) {
 }
 
 
-static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in, Value *out) {
+/* ============================================================== *
+ *  Decimal128 helpers (parse, format, compare)                     *
+ *  Same shape as src/runtime/decimal_util — duplicated here so the *
+ *  ssisexpr plugin stays self-contained.                           *
+ * ============================================================== */
+
+static int dec_safe_mul10(i128 *v, int add_digit) {
+    i128 ten = 10;
+    if (*v > 0 && *v > ((i128)1 << 126) / ten) return -1;
+    *v *= ten;
+    if (add_digit) *v += add_digit;
+    return 0;
+}
+
+static int parse_decimal(const char *s, size_t n, int scale, i128 *out) {
+    if (n == 0 || scale < 0 || scale > 38) return -1;
+    size_t i = 0;
+    int sign = 1;
+    if (s[0] == '-') { sign = -1; ++i; }
+    else if (s[0] == '+') ++i;
+    if (i == n) return -1;
+    i128 mag = 0;
+    int seen = 0, frac = 0, in_frac = 0;
+    for (; i < n; ++i) {
+        char c = s[i];
+        if (c == '.') {
+            if (in_frac) return -1;
+            in_frac = 1; continue;
+        }
+        if (c < '0' || c > '9') return -1;
+        seen = 1;
+        if (in_frac && frac >= scale) {
+            if (c != '0') return -1;
+            continue;
+        }
+        if (dec_safe_mul10(&mag, c - '0') != 0) return -1;
+        if (in_frac) ++frac;
+    }
+    if (!seen) return -1;
+    while (frac < scale) {
+        if (dec_safe_mul10(&mag, 0) != 0) return -1;
+        ++frac;
+    }
+    *out = (sign < 0) ? -mag : mag;
+    return 0;
+}
+
+static int format_decimal(i128 v, int scale, char *buf, size_t cap) {
+    if (scale < 0 || scale > 38) return -1;
+    int negative = (v < 0);
+    i128 mag = negative ? -v : v;
+    char digits[40];
+    int n = 0;
+    if (mag == 0) digits[n++] = '0';
+    else {
+        while (mag > 0 && n < (int)sizeof digits) {
+            digits[n++] = (char)('0' + (int)(mag % 10));
+            mag /= 10;
+        }
+        if (mag > 0) return -1;
+    }
+    while (n < scale + 1) digits[n++] = '0';
+    size_t need = (size_t)n + (scale > 0 ? 1 : 0) + (negative ? 1 : 0);
+    if (need + 1 > cap) return -1;
+    char *p = buf;
+    if (negative) *p++ = '-';
+    for (int k = n - 1; k >= scale; --k) *p++ = digits[k];
+    if (scale > 0) {
+        *p++ = '.';
+        for (int k = scale - 1; k >= 0; --k) *p++ = digits[k];
+    }
+    *p = '\0';
+    return (int)(p - buf);
+}
+
+static double decimal_to_double(i128 v, int scale) {
+    int neg = (v < 0);
+    i128 mag = neg ? -v : v;
+    uint64_t lo = (uint64_t)mag;
+    uint64_t hi = (uint64_t)(mag >> 64);
+    double d = (double)hi * 18446744073709551616.0 + (double)lo;
+    d /= pow(10.0, scale);
+    return neg ? -d : d;
+}
+
+/* Compare two decimals, possibly with different scales. Returns -1/0/1.
+ * Promote the lower-scale side by multiplying by 10^(diff) — overflow
+ * caps the comparison toward the larger magnitude. */
+static int compare_decimals(i128 a, int sa, i128 b, int sb) {
+    if (sa == sb) {
+        if (a < b) return -1;
+        if (a > b) return 1;
+        return 0;
+    }
+    int diff = (sa < sb) ? sb - sa : sa - sb;
+    i128 mul = 1;
+    int overflow = 0;
+    for (int i = 0; i < diff; ++i) {
+        if (mul > ((i128)1 << 126) / 10) { overflow = 1; break; }
+        mul *= 10;
+    }
+    if (overflow) {
+        /* fall back to double for the rare deep-mismatch case */
+        double da = decimal_to_double(a, sa);
+        double db = decimal_to_double(b, sb);
+        if (da < db) return -1;
+        if (da > db) return 1;
+        return 0;
+    }
+    i128 ax = a, bx = b;
+    if (sa < sb) ax *= mul; else bx *= mul;
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    return 0;
+}
+
+
+static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
+                   int has_scale, int64_t scale,
+                   const Value *in, Value *out) {
     (void)has_len; (void)len;
     memset(out, 0, sizeof *out);
     if (in->is_null) { out->is_null = 1; return 0; }
@@ -1458,6 +1644,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
     int to_bool  = (dt == DT_BOOL);
     int to_date  = (dt == DT_DBDATE);
     int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2);
+    int to_dec   = (dt == DT_NUMERIC);
 
     if (to_int) {
         out->kind = VK_INT64;
@@ -1472,6 +1659,15 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
             long long v = strtoll(tmp, &end, 10);
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> int failed: '%s'", tmp);
             out->i64 = (int64_t)v;
+        }
+        else if (in->kind == VK_DECIMAL128) {
+            /* Truncate fractional part. */
+            i128 v = in->d128;
+            int s = in->dec_scale;
+            int neg = (v < 0);
+            i128 mag = neg ? -v : v;
+            for (int k = 0; k < s; ++k) mag /= 10;
+            out->i64 = neg ? -(int64_t)mag : (int64_t)mag;
         }
         else return eval_err(E, "cast date/timestamp -> int not supported");
         return 0;
@@ -1490,6 +1686,9 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> float failed: '%s'", tmp);
             out->f64 = v;
         }
+        else if (in->kind == VK_DECIMAL128) {
+            out->f64 = decimal_to_double(in->d128, in->dec_scale);
+        }
         else return eval_err(E, "cast date/timestamp -> float not supported");
         return 0;
     }
@@ -1498,6 +1697,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
         if (in->kind == VK_BOOL)    out->b = in->b;
         else if (in->kind == VK_INT64) out->b = in->i64 != 0;
         else if (in->kind == VK_FLOAT64) out->b = in->f64 != 0.0;
+        else if (in->kind == VK_DECIMAL128) out->b = in->d128 != 0;
         else return eval_err(E, "cast non-numeric -> bool not supported");
         return 0;
     }
@@ -1512,6 +1712,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
         else if (in->kind == VK_BOOL)        n = snprintf(buf, sizeof buf, "%s", in->b ? "True" : "False");
         else if (in->kind == VK_DATE32)       n = fmt_date_iso((int32_t)in->i64, buf, sizeof buf);
         else if (in->kind == VK_TIMESTAMP_US) n = fmt_ts_iso  (in->i64,           buf, sizeof buf);
+        else if (in->kind == VK_DECIMAL128)   n = format_decimal(in->d128, in->dec_scale, buf, sizeof buf);
         if (n < 0 || (size_t)n >= sizeof buf) return eval_err(E, "cast -> string overflow");
         char *cp = malloc((size_t)n + 1);
         if (!cp) return eval_err(E, "out of memory");
@@ -1554,6 +1755,66 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
             return 0;
         }
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
+    }
+    if (to_dec) {
+        /* `(DT_NUMERIC, p, s)`: precision is metadata only; scale is the
+         * fixed-point exponent we promote the value to. v1 accepts
+         * string and numeric inputs (integer / float / existing decimal
+         * with rescale). */
+        if (!has_scale) {
+            return eval_err(E, "(DT_NUMERIC) requires (precision, scale) "
+                                "e.g. (DT_NUMERIC, 12, 2)");
+        }
+        int target_scale = (int)scale;
+        if (target_scale < 0 || target_scale > 38) {
+            return eval_err(E, "(DT_NUMERIC) scale out of range [0,38]");
+        }
+        out->kind = VK_DECIMAL128;
+        out->dec_scale = target_scale;
+        if (in->kind == VK_UTF8) {
+            char tmp[64];
+            size_t n = in->str_n < sizeof tmp - 1 ? in->str_n : sizeof tmp - 1;
+            memcpy(tmp, in->str, n); tmp[n] = '\0';
+            i128 v;
+            if (parse_decimal(tmp, n, target_scale, &v) != 0)
+                return eval_err(E, "cast string -> DT_NUMERIC failed: '%s'", tmp);
+            out->d128 = v;
+            return 0;
+        }
+        if (in->kind == VK_INT64) {
+            i128 v = (i128)in->i64;
+            for (int k = 0; k < target_scale; ++k) v *= 10;
+            out->d128 = v;
+            return 0;
+        }
+        if (in->kind == VK_FLOAT64) {
+            /* Lossy via text — keeps banker's-rounding etc. at libc.
+             * Use 17 fractional digits which is enough for any double. */
+            char tmp[64];
+            int n = snprintf(tmp, sizeof tmp, "%.*f", target_scale, in->f64);
+            if (n < 0 || (size_t)n >= sizeof tmp) return eval_err(E, "cast float -> DT_NUMERIC overflow");
+            i128 v;
+            if (parse_decimal(tmp, (size_t)n, target_scale, &v) != 0)
+                return eval_err(E, "cast float -> DT_NUMERIC failed");
+            out->d128 = v;
+            return 0;
+        }
+        if (in->kind == VK_DECIMAL128) {
+            /* Rescale. */
+            i128 v = in->d128;
+            int diff = target_scale - in->dec_scale;
+            if (diff > 0) {
+                for (int k = 0; k < diff; ++k) v *= 10;
+            } else if (diff < 0) {
+                int neg = (v < 0);
+                i128 mag = neg ? -v : v;
+                for (int k = 0; k < -diff; ++k) mag /= 10;
+                v = neg ? -mag : mag;
+            }
+            out->d128 = v;
+            return 0;
+        }
+        return eval_err(E, "cast non-numeric/non-string -> DT_NUMERIC not supported");
     }
     return eval_err(E, "unsupported cast target");
 }
@@ -2135,7 +2396,8 @@ static int eval_node(Eval *E, Par *P, const Node *n, Value *out) {
         case N_LIT_NULL: out->is_null = 1; return 0;
         case N_COLREF:
             return read_col_cell(E, n->colref.col_idx,
-                                 P->col_fmts[n->colref.col_idx], out);
+                                 P->col_fmts[n->colref.col_idx],
+                                 P->col_scales[n->colref.col_idx], out);
         case N_UNARY: {
             Value a;
             if (eval_node(E, P, n->unary.a, &a) != 0) return -1;
@@ -2172,7 +2434,8 @@ static int eval_node(Eval *E, Par *P, const Node *n, Value *out) {
         case N_CAST: {
             Value a;
             if (eval_node(E, P, n->cast.a, &a) != 0) return -1;
-            return do_cast(E, n->cast.dt, n->cast.has_len, n->cast.len, &a, out);
+            return do_cast(E, n->cast.dt, n->cast.has_len, n->cast.len,
+                           n->cast.has_scale, n->cast.scale, &a, out);
         }
         case N_CALL:
             return eval_call(E, P, n, out);
@@ -2192,6 +2455,7 @@ typedef struct {
     /* Schema cache. */
     char       **col_names;
     char        *col_fmts;
+    int         *col_scales;     /* set for 'N' (decimal) columns; 0 elsewhere */
     size_t       n_cols;
     char         last_err[512];
 } SsisExpr;
@@ -2203,9 +2467,10 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
         return -1;
     }
     size_t n = (size_t)sch->n_children;
-    e->col_names = calloc(n, sizeof *e->col_names);
-    e->col_fmts  = calloc(n, sizeof *e->col_fmts);
-    if (!e->col_names || !e->col_fmts) {
+    e->col_names  = calloc(n, sizeof *e->col_names);
+    e->col_fmts   = calloc(n, sizeof *e->col_fmts);
+    e->col_scales = calloc(n, sizeof *e->col_scales);
+    if (!e->col_names || !e->col_fmts || !e->col_scales) {
         snprintf(e->last_err, sizeof e->last_err, "ssisexpr: out of memory");
         return -1;
     }
@@ -2223,6 +2488,18 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
         else if (strcmp(fmt, "u") == 0)   e->col_fmts[i] = 'u';
         else if (strcmp(fmt, "tdD") == 0) e->col_fmts[i] = 'D';
         else if (strcmp(fmt, "tsu:") == 0) e->col_fmts[i] = 'T';
+        else if (strncmp(fmt, "d:", 2) == 0) {
+            /* "d:precision,scale" — extract scale (precision is metadata). */
+            int p = 0, s = 0;
+            if (sscanf(fmt + 2, "%d,%d", &p, &s) != 2 || s < 0 || s > 38) {
+                snprintf(e->last_err, sizeof e->last_err,
+                         "ssisexpr: column '%s' has malformed decimal format '%s'",
+                         (c && c->name) ? c->name : "?", fmt);
+                return -1;
+            }
+            e->col_fmts[i]   = 'N';
+            e->col_scales[i] = s;
+        }
         else {
             snprintf(e->last_err, sizeof e->last_err,
                      "ssisexpr: column '%s' has unsupported format '%s'",
@@ -2254,7 +2531,7 @@ static int ssisexpr_compile(BetlContext *ctx,
     if (cache_schema(e, input_schema) != 0) {
         betl_set_error(ctx, "%s", e->last_err);
         for (size_t i = 0; i < e->n_cols; ++i) free(e->col_names[i]);
-        free(e->col_names); free(e->col_fmts);
+        free(e->col_names); free(e->col_fmts); free(e->col_scales);
         free(e);
         return BETL_ERR_TYPE;
     }
@@ -2264,13 +2541,14 @@ static int ssisexpr_compile(BetlContext *ctx,
         betl_set_error(ctx, "ssisexpr: lex error: %s", L.err);
         lex_free(&L);
         for (size_t i = 0; i < e->n_cols; ++i) free(e->col_names[i]);
-        free(e->col_names); free(e->col_fmts); free(e);
+        free(e->col_names); free(e->col_fmts); free(e->col_scales); free(e);
         return BETL_ERR_INVALID;
     }
 
     Par P = {
         .toks = L.toks, .pos = 0, .arena = &e->arena,
-        .col_names = e->col_names, .col_fmts = e->col_fmts, .n_cols = e->n_cols,
+        .col_names = e->col_names, .col_fmts = e->col_fmts,
+        .col_scales = e->col_scales, .n_cols = e->n_cols,
     };
     Node *root = p_ternary(&P);
     if (!root) {
@@ -2279,7 +2557,7 @@ static int ssisexpr_compile(BetlContext *ctx,
         arena_free(&e->arena);
         lex_free(&L);
         for (size_t i = 0; i < e->n_cols; ++i) free(e->col_names[i]);
-        free(e->col_names); free(e->col_fmts); free(e);
+        free(e->col_names); free(e->col_fmts); free(e->col_scales); free(e);
         return BETL_ERR_INVALID;
     }
     if (P.toks[P.pos].kind != T_EOF) {
@@ -2287,7 +2565,7 @@ static int ssisexpr_compile(BetlContext *ctx,
         arena_free(&e->arena);
         lex_free(&L);
         for (size_t i = 0; i < e->n_cols; ++i) free(e->col_names[i]);
-        free(e->col_names); free(e->col_fmts); free(e);
+        free(e->col_names); free(e->col_fmts); free(e->col_scales); free(e);
         return BETL_ERR_INVALID;
     }
     e->root = root;
@@ -2303,6 +2581,7 @@ static void ssisexpr_release(void *handle) {
     for (size_t i = 0; i < e->n_cols; ++i) free(e->col_names[i]);
     free(e->col_names);
     free(e->col_fmts);
+    free(e->col_scales);
     free(e);
 }
 
@@ -2416,7 +2695,8 @@ static int ssisexpr_evaluate(void *handle,
     }
 
     Par P = {
-        .col_names = e->col_names, .col_fmts = e->col_fmts, .n_cols = e->n_cols,
+        .col_names = e->col_names, .col_fmts = e->col_fmts,
+        .col_scales = e->col_scales, .n_cols = e->n_cols,
     };
     ScratchStrs S = {0};
     Eval EV = { .batch = input_struct, .scratch = &S };

@@ -110,6 +110,7 @@ add_library(betl_core STATIC
     src/runtime/connections.c
     src/runtime/context.c
     src/runtime/date_util.c
+    src/runtime/decimal_util.c
     src/runtime/exec.c
     src/runtime/literal_expr.c
     src/runtime/mssql_sql.c
@@ -134,7 +135,7 @@ target_include_directories(betl_core PUBLIC
     ${CMAKE_BINARY_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
 )
-target_link_libraries(betl_core PUBLIC PkgConfig::YAML ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_libraries(betl_core PUBLIC PkgConfig::YAML ${CMAKE_DL_LIBS} Threads::Threads m)
 
 # Pull in postgres.upsert when libpq is available. The component is part
 # of the core (not a separate plugin) for v0.1 — same model as csv.read.

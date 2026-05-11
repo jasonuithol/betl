@@ -33,6 +33,7 @@
 
 #include "betl/provider.h"
 #include "runtime/date_util.h"
+#include "runtime/decimal_util.h"
 #include "runtime/pg_sql.h"
 
 /* ============================================================== *
@@ -269,6 +270,7 @@ typedef enum {
     PG_BOOL,
     PG_DATE32,
     PG_TIMESTAMP_US,
+    PG_DECIMAL128,
     PG_UNSUPPORTED
 } PgColType;
 
@@ -280,7 +282,15 @@ static PgColType arrow_to_pg(const char *fmt) {
     if (strcmp(fmt, "b")    == 0) return PG_BOOL;
     if (strcmp(fmt, "tdD")  == 0) return PG_DATE32;
     if (strcmp(fmt, "tsu:") == 0) return PG_TIMESTAMP_US;
+    if (strncmp(fmt, "d:", 2) == 0) return PG_DECIMAL128;
     return PG_UNSUPPORTED;
+}
+
+/* Extract scale from a "d:precision,scale" format string. -1 on malform. */
+static int pg_decimal_scale(const char *fmt) {
+    int p = 0, s = 0;
+    if (sscanf(fmt + 2, "%d,%d", &p, &s) != 2) return -1;
+    return s;
 }
 
 static int validity_is_null(const struct ArrowArray *a, int64_t row) {
@@ -293,8 +303,10 @@ static int validity_is_null(const struct ArrowArray *a, int64_t row) {
 
 /* Render row `row` of leaf `col` into `out`, as text. Returns 0 on
  * success, -1 on type-unsupported, -2 on OOM. Sets *out_is_null = 1
- * if the value is NULL, in which case `out` is not touched. */
+ * if the value is NULL, in which case `out` is not touched.
+ * `dec_scale` is consulted only for PG_DECIMAL128 cells. */
 static int render_cell(const struct ArrowArray *col, PgColType type,
+                       int dec_scale,
                        int64_t row, char **out, int *out_is_null) {
     *out_is_null = 0;
     *out         = NULL;
@@ -360,6 +372,17 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
         if (!s) return -2;
         memcpy(s, buf, (size_t)n + 1);
         *out = s;
+        return 0;
+    }
+    case PG_DECIMAL128: {
+        const betl_dec128 *vals = col->buffers[1];
+        char buf[48];
+        int n = betl_dec128_format(vals[off], dec_scale, buf, sizeof buf);
+        if (n < 0) return -2;
+        char *str = malloc((size_t)n + 1);
+        if (!str) return -2;
+        memcpy(str, buf, (size_t)n + 1);
+        *out = str;
         return 0;
     }
     case PG_TIMESTAMP_US: {
@@ -462,8 +485,11 @@ static int pg_sink_run(void *state) {
      * resolve its Arrow type. */
     int64_t   *col_to_child = malloc(n_out_cols * sizeof *col_to_child);
     PgColType *col_types    = malloc(n_out_cols * sizeof *col_types);
+    int       *col_dec_scales = calloc(n_out_cols, sizeof *col_dec_scales);
     int rc = BETL_OK;
-    if (!col_to_child || !col_types) { rc = BETL_ERR_INTERNAL; goto cleanup_pre; }
+    if (!col_to_child || !col_types || !col_dec_scales) {
+        rc = BETL_ERR_INTERNAL; goto cleanup_pre;
+    }
 
     for (size_t i = 0; i < n_out_cols; ++i) {
         col_to_child[i] = -1;
@@ -471,6 +497,17 @@ static int pg_sink_run(void *state) {
             if (strcmp(out_cols[i], schema.children[j]->name) == 0) {
                 col_to_child[i] = j;
                 col_types[i]    = arrow_to_pg(schema.children[j]->format);
+                if (col_types[i] == PG_DECIMAL128) {
+                    int sc = pg_decimal_scale(schema.children[j]->format);
+                    if (sc < 0) {
+                        betl_set_error(s->ctx,
+                            "postgres.upsert: column '%s' has malformed decimal format '%s'",
+                            out_cols[i], schema.children[j]->format);
+                        rc = BETL_ERR_TYPE;
+                        goto cleanup_pre;
+                    }
+                    col_dec_scales[i] = sc;
+                }
                 break;
             }
         }
@@ -552,7 +589,7 @@ static int pg_sink_run(void *state) {
             for (size_t c = 0; c < n_out_cols; ++c) {
                 int is_null = 0;
                 row_rc = render_cell(batch.children[col_to_child[c]],
-                                     col_types[c], r,
+                                     col_types[c], col_dec_scales[c], r,
                                      &param_values[c], &is_null);
                 if (row_rc != 0) {
                     betl_set_error(s->ctx,
@@ -612,6 +649,7 @@ cleanup_post:
 cleanup_pre:
     free(col_to_child);
     free(col_types);
+    free(col_dec_scales);
     if (s->n_explicit_cols == 0) free(out_cols);
     if (schema.release) schema.release(&schema);
     return rc;

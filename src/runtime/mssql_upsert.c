@@ -31,6 +31,7 @@
 
 #include "betl/provider.h"
 #include "runtime/date_util.h"
+#include "runtime/decimal_util.h"
 #include "runtime/mssql_sql.h"
 
 /* ============================================================== *
@@ -123,6 +124,7 @@ typedef enum {
     MS_BOOL,
     MS_DATE32,
     MS_TIMESTAMP_US,
+    MS_DECIMAL128,
     MS_UNSUPPORTED
 } MsColType;
 
@@ -134,7 +136,12 @@ static MsColType arrow_to_ms(const char *fmt) {
     if (strcmp(fmt, "b")    == 0) return MS_BOOL;
     if (strcmp(fmt, "tdD")  == 0) return MS_DATE32;
     if (strcmp(fmt, "tsu:") == 0) return MS_TIMESTAMP_US;
+    if (strncmp(fmt, "d:", 2) == 0) return MS_DECIMAL128;
     return MS_UNSUPPORTED;
+}
+
+static int ms_decimal_pscale(const char *fmt, int *p, int *s) {
+    return sscanf(fmt + 2, "%d,%d", p, s) == 2 ? 0 : -1;
 }
 
 /* Per-column scratch the bound parameter points at. Bound once — the
@@ -142,10 +149,12 @@ static MsColType arrow_to_ms(const char *fmt) {
  * statement, only the contents (and `ind`) change per row. */
 typedef struct {
     MsColType type;
+    int       dec_precision;   /* decimal columns */
+    int       dec_scale;       /* decimal columns */
     SQLBIGINT i64_val;
     SQLDOUBLE f64_val;
     SQLCHAR   bool_val;        /* SQL_BIT — 0/1 */
-    char     *str_buf;         /* utf8 scratch */
+    char     *str_buf;         /* utf8 scratch (also reused for decimal text) */
     size_t    str_cap;
     SQL_DATE_STRUCT      date_val;
     SQL_TIMESTAMP_STRUCT ts_val;
@@ -425,6 +434,25 @@ static int ms_fill_cell(BetlContext *ctx,
         b->ind = (SQLLEN)sizeof b->date_val;
         return BETL_OK;
     }
+    case MS_DECIMAL128: {
+        const betl_dec128 *vals = col->buffers[1];
+        char tmp[48];
+        int n = betl_dec128_format(vals[off], b->dec_scale, tmp, sizeof tmp);
+        if (n < 0) {
+            betl_set_error(ctx, "mssql.upsert: decimal format failed for col '%s'",
+                           col_name);
+            return BETL_ERR_INTERNAL;
+        }
+        if (ensure_str_cap(b, (size_t)n + 1) != 0) {
+            betl_set_error(ctx, "mssql.upsert: OOM staging decimal column '%s'",
+                           col_name);
+            return BETL_ERR_INTERNAL;
+        }
+        memcpy(b->str_buf, tmp, (size_t)n);
+        b->str_buf[n] = '\0';
+        b->ind = (SQLLEN)n;
+        return BETL_OK;
+    }
     case MS_TIMESTAMP_US: {
         const int64_t *vals = col->buffers[1];
         int32_t days; int64_t us_of_day;
@@ -493,6 +521,15 @@ static int ms_bind_param(BetlContext *ctx, SQLHSTMT hstmt,
         rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 26, 6,
                               &b->ts_val, 0, &b->ind);
+        break;
+    case MS_DECIMAL128:
+        /* Bind decimal as a text parameter — the driver coerces text
+         * into NUMERIC(p, s) on the server side without us needing to
+         * pack a SQL_NUMERIC_STRUCT manually. */
+        rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
+                              SQL_C_CHAR, SQL_DECIMAL,
+                              (SQLULEN)b->dec_precision, b->dec_scale,
+                              b->str_buf, (SQLLEN)b->str_cap, &b->ind);
         break;
     case MS_UNSUPPORTED:
     default:
@@ -573,6 +610,18 @@ static int ms_sink_run(void *state) {
             if (strcmp(out_cols[i], schema.children[j]->name) == 0) {
                 col_to_child[i] = j;
                 bufs[i].type = arrow_to_ms(schema.children[j]->format);
+                if (bufs[i].type == MS_DECIMAL128) {
+                    int p = 0, sc = 0;
+                    if (ms_decimal_pscale(schema.children[j]->format, &p, &sc) != 0) {
+                        betl_set_error(s->ctx,
+                            "mssql.upsert: column '%s' has malformed decimal format '%s'",
+                            out_cols[i], schema.children[j]->format);
+                        rc = BETL_ERR_TYPE;
+                        goto cleanup_pre;
+                    }
+                    bufs[i].dec_precision = p;
+                    bufs[i].dec_scale     = sc;
+                }
                 break;
             }
         }
@@ -589,9 +638,10 @@ static int ms_sink_run(void *state) {
             rc = BETL_ERR_UNSUPPORTED;
             goto cleanup_pre;
         }
-        /* Pre-allocate utf8 scratch so SQLBindParameter has a stable
+        /* Pre-allocate scratch so SQLBindParameter has a stable
          * non-NULL pointer. ms_fill_cell will grow it on demand. */
-        if (bufs[i].type == MS_UTF8 && ensure_str_cap(&bufs[i], 64) != 0) {
+        if ((bufs[i].type == MS_UTF8 || bufs[i].type == MS_DECIMAL128)
+            && ensure_str_cap(&bufs[i], 64) != 0) {
             rc = BETL_ERR_INTERNAL;
             goto cleanup_pre;
         }

@@ -29,6 +29,7 @@
 #include <libpq-fe.h>
 
 #include "runtime/date_util.h"
+#include "runtime/decimal_util.h"
 
 #include "betl/provider.h"
 
@@ -105,6 +106,7 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
 #define PG_OID_DATE        1082
 #define PG_OID_TIMESTAMP   1114
 #define PG_OID_TIMESTAMPTZ 1184
+#define PG_OID_NUMERIC     1700
 
 /* Internal column-format tags. The 'D' / 'T' codes mirror what
  * betl-ssisexpr uses internally and map to Arrow "tdD" / "tsu:".
@@ -119,6 +121,7 @@ static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     }
     if (t == PG_OID_DATE)      { *out = 'D'; return 0; }
     if (t == PG_OID_TIMESTAMP) { *out = 'T'; return 0; }
+    if (t == PG_OID_NUMERIC)   { *out = 'N'; return 0; }
     if (t == PG_OID_TIMESTAMPTZ) { *out_is_tztz = 1; return -1; }
     return -1;
 }
@@ -133,6 +136,15 @@ static void pgr_release_int64_leaf(struct ArrowArray *arr) {
 }
 
 static void pgr_release_date32_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static void pgr_release_decimal128_leaf(struct ArrowArray *arr) {
     if (arr->n_buffers >= 2 && arr->buffers) {
         free((void *)arr->buffers[0]);
         free((void *)arr->buffers[1]);
@@ -168,6 +180,12 @@ static void pgr_release_schema_named(struct ArrowSchema *sch) {
     sch->release = NULL;
 }
 
+static void pgr_release_schema_named_owned_format(struct ArrowSchema *sch) {
+    free((void *)sch->name);
+    free((void *)sch->format);
+    sch->release = NULL;
+}
+
 static void pgr_release_schema_struct(struct ArrowSchema *sch) {
     for (int64_t i = 0; i < sch->n_children; ++i) {
         if (sch->children[i] && sch->children[i]->release) {
@@ -200,6 +218,9 @@ typedef struct {
     int      n_cols;
     char   **col_names;
     char    *col_fmts;
+    int     *col_precisions;     /* decimal columns only */
+    int     *col_scales;         /* decimal columns only */
+    char   **col_fmt_strings;    /* heap-owned "d:p,s" for decimal cols */
 
     int      eof;
 } PgReadState;
@@ -343,7 +364,13 @@ static void pgr_destroy(void *state) {
         for (int c = 0; c < s->n_cols; ++c) free(s->col_names[c]);
         free(s->col_names);
     }
+    if (s->col_fmt_strings) {
+        for (int c = 0; c < s->n_cols; ++c) free(s->col_fmt_strings[c]);
+        free(s->col_fmt_strings);
+    }
     free(s->col_fmts);
+    free(s->col_precisions);
+    free(s->col_scales);
     free(s->connection);
     free(s->query);
     free(s);
@@ -371,9 +398,13 @@ static int pgr_resolve_schema(PgReadState *s) {
         return -1;
     }
     s->n_cols = n;
-    s->col_names = calloc((size_t)n, sizeof *s->col_names);
-    s->col_fmts  = malloc((size_t)n);
-    if (!s->col_names || !s->col_fmts) {
+    s->col_names       = calloc((size_t)n, sizeof *s->col_names);
+    s->col_fmts        = malloc((size_t)n);
+    s->col_precisions  = calloc((size_t)n, sizeof *s->col_precisions);
+    s->col_scales      = calloc((size_t)n, sizeof *s->col_scales);
+    s->col_fmt_strings = calloc((size_t)n, sizeof *s->col_fmt_strings);
+    if (!s->col_names || !s->col_fmts || !s->col_precisions
+        || !s->col_scales || !s->col_fmt_strings) {
         betl_set_error(s->ctx, "postgres.read: out of memory");
         PQclear(r);
         return -1;
@@ -392,13 +423,48 @@ static int pgr_resolve_schema(PgReadState *s) {
             } else {
                 betl_set_error(s->ctx,
                     "postgres.read: column '%s' has unsupported OID %u "
-                    "(supported: int*, text/varchar/bpchar, date, timestamp)",
+                    "(supported: int*, text/varchar/bpchar, date, timestamp, numeric)",
                     PQfname(r, c), (unsigned)t);
             }
             PQclear(r);
             return -1;
         }
         s->col_fmts[c]  = fmt;
+        if (fmt == 'N') {
+            /* NUMERIC: typmod-4 encodes (precision<<16) | scale. -1 means
+             * "no constraint" — we need a defined precision/scale to
+             * emit Arrow's `d:p,s` format string, so reject it with a
+             * helpful hint. */
+            int typmod = PQfmod(r, c);
+            if (typmod < (int)sizeof(int32_t)) {
+                betl_set_error(s->ctx,
+                    "postgres.read: column '%s' is unconstrained NUMERIC "
+                    "(no precision/scale). Cast it in your query, "
+                    "e.g. `CAST(%s AS NUMERIC(12, 2))`",
+                    PQfname(r, c), PQfname(r, c));
+                PQclear(r);
+                return -1;
+            }
+            int p = (typmod - 4) >> 16;
+            int sc = (typmod - 4) & 0xFFFF;
+            if (p < 1 || p > 38 || sc < 0 || sc > p) {
+                betl_set_error(s->ctx,
+                    "postgres.read: column '%s' NUMERIC(%d,%d) is outside the "
+                    "supported [1,38] precision range", PQfname(r, c), p, sc);
+                PQclear(r);
+                return -1;
+            }
+            s->col_precisions[c] = p;
+            s->col_scales[c]     = sc;
+            char buf[24];
+            snprintf(buf, sizeof buf, "d:%d,%d", p, sc);
+            s->col_fmt_strings[c] = strdup(buf);
+            if (!s->col_fmt_strings[c]) {
+                betl_set_error(s->ctx, "postgres.read: out of memory");
+                PQclear(r);
+                return -1;
+            }
+        }
         s->col_names[c] = strdup(PQfname(r, c));
         if (!s->col_names[c]) {
             betl_set_error(s->ctx, "postgres.read: out of memory");
@@ -474,6 +540,27 @@ static int pgr_build_date32_leaf(struct ArrowArray *out,
     return 0;
 }
 
+static int pgr_build_decimal128_leaf(struct ArrowArray *out,
+                                     const betl_dec128 *vals,
+                                     const uint8_t *nulls,
+                                     size_t n) {
+    betl_dec128 *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0 : vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = pgr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = pgr_release_decimal128_leaf;
+    return 0;
+}
+
 static int pgr_build_utf8_leaf(struct ArrowArray *out,
                                const char *const *strs, const size_t *lens,
                                const uint8_t *nulls, size_t n) {
@@ -535,13 +622,39 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
     if (!kids) return ENOMEM;
     for (int i = 0; i < s->n_cols; ++i) {
         const char *fmt = "u";
+        int owned_format = 0;
         switch (s->col_fmts[i]) {
             case 'l': fmt = "l";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
+            case 'N':
+                /* Duplicate so the schema can outlive the source's state. */
+                fmt = strdup(s->col_fmt_strings[i]);
+                owned_format = 1;
+                if (!fmt) {
+                    for (int k = 0; k < i; ++k) {
+                        if (kids[k]->release) kids[k]->release(kids[k]);
+                        free(kids[k]);
+                    }
+                    free(kids);
+                    return ENOMEM;
+                }
+                break;
             default:  fmt = "u";    break;
         }
         kids[i] = pgr_new_leaf(s->col_names[i], fmt);
+        if (!kids[i]) {
+            if (owned_format) free((void *)fmt);
+            for (int k = 0; k < i; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids);
+            return ENOMEM;
+        }
+        if (owned_format) {
+            kids[i]->release = pgr_release_schema_named_owned_format;
+        }
         if (!kids[i]) {
             for (int k = 0; k < i; ++k) {
                 if (kids[k]->release) kids[k]->release(kids[k]);
@@ -603,12 +716,13 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
     int rc = EIO;
     /* i64 staging is shared between 'l' (int64) and 'T' (timestamp_us)
      * — both are int64 under the hood. */
-    int64_t **i64_cols = calloc((size_t)s->n_cols, sizeof *i64_cols);
-    int32_t **d32_cols = calloc((size_t)s->n_cols, sizeof *d32_cols);
+    int64_t **i64_cols  = calloc((size_t)s->n_cols, sizeof *i64_cols);
+    int32_t **d32_cols  = calloc((size_t)s->n_cols, sizeof *d32_cols);
+    betl_dec128 **d128_cols = calloc((size_t)s->n_cols, sizeof *d128_cols);
     const char ***u8s_cols = calloc((size_t)s->n_cols, sizeof *u8s_cols);
     size_t  **u8l_cols = calloc((size_t)s->n_cols, sizeof *u8l_cols);
     uint8_t **null_cols = calloc((size_t)s->n_cols, sizeof *null_cols);
-    if (!i64_cols || !d32_cols || !u8s_cols || !u8l_cols || !null_cols) {
+    if (!i64_cols || !d32_cols || !d128_cols || !u8s_cols || !u8l_cols || !null_cols) {
         betl_set_error(s->ctx, "postgres.read: out of memory");
         goto cleanup;
     }
@@ -627,6 +741,12 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'D') {
             d32_cols[c] = malloc((size_t)n_rows * sizeof(int32_t));
             if (!d32_cols[c]) {
+                betl_set_error(s->ctx, "postgres.read: out of memory");
+                goto cleanup;
+            }
+        } else if (s->col_fmts[c] == 'N') {
+            d128_cols[c] = malloc((size_t)n_rows * sizeof(betl_dec128));
+            if (!d128_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
                 goto cleanup;
             }
@@ -679,6 +799,17 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                     goto cleanup;
                 }
                 i64_cols[c][row] = us;
+            } else if (s->col_fmts[c] == 'N') {
+                betl_dec128 dv;
+                if (betl_dec128_parse(v, (size_t)PQgetlength(r, row, c),
+                                      s->col_scales[c], &dv) != 0) {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': '%s' is not a valid "
+                        "NUMERIC(%d,%d)", row, s->col_names[c], v,
+                        s->col_precisions[c], s->col_scales[c]);
+                    goto cleanup;
+                }
+                d128_cols[c][row] = dv;
             } else {
                 u8s_cols[c][row] = v;       /* borrowed from PGresult */
                 u8l_cols[c][row] = (size_t)PQgetlength(r, row, c);
@@ -702,6 +833,9 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'D') {
             brc = pgr_build_date32_leaf(kids[c], d32_cols[c], null_cols[c],
                                         (size_t)n_rows);
+        } else if (s->col_fmts[c] == 'N') {
+            brc = pgr_build_decimal128_leaf(kids[c], d128_cols[c],
+                                            null_cols[c], (size_t)n_rows);
         } else {
             brc = pgr_build_utf8_leaf(kids[c], u8s_cols[c], u8l_cols[c],
                                       null_cols[c], (size_t)n_rows);
@@ -748,6 +882,10 @@ cleanup:
     if (d32_cols) {
         for (int c = 0; c < s->n_cols; ++c) free(d32_cols[c]);
         free(d32_cols);
+    }
+    if (d128_cols) {
+        for (int c = 0; c < s->n_cols; ++c) free(d128_cols[c]);
+        free(d128_cols);
     }
     if (u8s_cols) {
         for (int c = 0; c < s->n_cols; ++c) free((void *)u8s_cols[c]);

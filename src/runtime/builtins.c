@@ -9,6 +9,7 @@
 #include "betl/provider.h"
 
 #include "runtime/date_util.h"
+#include "runtime/decimal_util.h"
 #include "runtime/literal_expr.h"
 #include "runtime/transforms.h"
 
@@ -88,6 +89,14 @@ static void release_schema_named(struct ArrowSchema *sch) {
     sch->release = NULL;
 }
 
+static void release_schema_named_owned_format(struct ArrowSchema *sch) {
+    /* Variant for decimal columns: `format` was strdup'd (e.g. "d:12,2")
+     * and needs freeing alongside `name`. */
+    free((void *)sch->name);
+    free((void *)sch->format);
+    sch->release = NULL;
+}
+
 static void release_schema_struct(struct ArrowSchema *sch) {
     for (int64_t i = 0; i < sch->n_children; ++i) {
         if (sch->children[i] && sch->children[i]->release) {
@@ -108,6 +117,14 @@ static void release_array_int64_leaf(struct ArrowArray *arr) {
 }
 
 static void release_array_date32_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static void release_array_decimal128_leaf(struct ArrowArray *arr) {
     if (arr->n_buffers >= 2 && arr->buffers) {
         free((void *)arr->buffers[1]);
     }
@@ -744,6 +761,7 @@ typedef enum {
     CSV_T_UTF8         = 2,
     CSV_T_DATE32       = 3,  /* Arrow tdD — int32 days since 1970-01-01 */
     CSV_T_TIMESTAMP_US = 4,  /* Arrow tsu: — int64 micros since 1970-01-01 */
+    CSV_T_DECIMAL128   = 5,  /* Arrow d:p,s — int128 + (precision, scale) */
 } CsvType;
 
 /* Per-column: schema fields (name, type) are set at init and live for
@@ -752,10 +770,14 @@ typedef enum {
 typedef struct {
     char    *name;
     CsvType  type;
-    int64_t *i64_vals;     /* [row_cap] — int64 + timestamp_us */
-    int32_t *d32_vals;     /* [row_cap] — date32 */
-    char   **u8_strs;      /* [row_cap] heap strings (NUL-terminated) */
-    size_t  *u8_lens;      /* [row_cap] cached string lengths */
+    int      dec_precision;  /* decimal columns only */
+    int      dec_scale;      /* decimal columns only */
+    char    *fmt_string;     /* heap-owned: "d:p,s" for decimal cols, NULL otherwise */
+    int64_t *i64_vals;       /* [row_cap] — int64 + timestamp_us */
+    int32_t *d32_vals;       /* [row_cap] — date32 */
+    betl_dec128 *d128_vals;  /* [row_cap] — decimal128 */
+    char   **u8_strs;        /* [row_cap] heap strings (NUL-terminated) */
+    size_t  *u8_lens;        /* [row_cap] cached string lengths */
 } CsvCol;
 
 typedef struct {
@@ -979,6 +1001,11 @@ static int csv_alloc_staging(CsvState *s) {
                                  s->batch_size * sizeof *p);
             if (!p) return -1;
             col->d32_vals = p;
+        } else if (col->type == CSV_T_DECIMAL128) {
+            betl_dec128 *p = realloc(col->d128_vals,
+                                     s->batch_size * sizeof *p);
+            if (!p) return -1;
+            col->d128_vals = p;
         } else {
             char **sp = realloc(col->u8_strs,
                                 s->batch_size * sizeof *sp);
@@ -1034,6 +1061,14 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
             }
             col->i64_vals[row_idx] = us;
             free(field);
+        } else if (col->type == CSV_T_DECIMAL128) {
+            betl_dec128 v;
+            if (betl_dec128_parse(field, flen, col->dec_scale, &v) != 0) {
+                free(field);
+                goto bad_field;
+            }
+            col->d128_vals[row_idx] = v;
+            free(field);
         } else {
             col->u8_strs[row_idx] = field;
             col->u8_lens[row_idx] = flen;
@@ -1074,8 +1109,10 @@ static void csv_state_clear_columns(CsvState *s) {
         for (size_t c = 0; c < s->n_cols; ++c) {
             CsvCol *col = &s->cols[c];
             free(col->name);
+            free(col->fmt_string);
             free(col->i64_vals);
             free(col->d32_vals);
+            free(col->d128_vals);
             if (col->u8_strs) {
                 for (size_t r = 0; r < s->n_rows; ++r) free(col->u8_strs[r]);
                 free(col->u8_strs);
@@ -1163,13 +1200,34 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
         c->err = 1; return -1;
     }
     CsvType t;
+    int prec = 0, scale = 0;
     if      (strcmp(type, "int64")     == 0) t = CSV_T_INT64;
     else if (strcmp(type, "utf8")      == 0) t = CSV_T_UTF8;
     else if (strcmp(type, "date")      == 0) t = CSV_T_DATE32;
     else if (strcmp(type, "timestamp") == 0) t = CSV_T_TIMESTAMP_US;
+    else if (strcmp(type, "decimal")   == 0) {
+        t = CSV_T_DECIMAL128;
+        /* Required: precision + scale ints in the same {} block. */
+        char *vbuf2 = malloc(value_len + 1);
+        if (!vbuf2) { free(name); free(type); c->err = 1; return -1; }
+        memcpy(vbuf2, value, value_len); vbuf2[value_len] = '\0';
+        int64_t pv = 0, sv = 0;
+        int ok = (json_int64(vbuf2, "precision", &pv) == 0)
+              && (json_int64(vbuf2, "scale",     &sv) == 0);
+        free(vbuf2);
+        if (!ok || pv < 1 || pv > 38 || sv < 0 || sv > (int)pv) {
+            snprintf(c->err_msg, sizeof c->err_msg,
+                     "decimal column needs precision in [1,38] and "
+                     "scale in [0,precision]");
+            free(name); free(type); c->err = 1; return -1;
+        }
+        prec  = (int)pv;
+        scale = (int)sv;
+    }
     else {
         snprintf(c->err_msg, sizeof c->err_msg,
-                 "unsupported schema type '%s' (supported: int64, utf8, date, timestamp)", type);
+                 "unsupported schema type '%s' (supported: int64, utf8, date, "
+                 "timestamp, decimal)", type);
         free(name); free(type); c->err = 1; return -1;
     }
     free(type);
@@ -1182,6 +1240,14 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     memset(col, 0, sizeof *col);
     col->name = name;
     col->type = t;
+    col->dec_precision = prec;
+    col->dec_scale     = scale;
+    if (t == CSV_T_DECIMAL128) {
+        char buf[24];
+        snprintf(buf, sizeof buf, "d:%d,%d", prec, scale);
+        col->fmt_string = strdup(buf);
+        if (!col->fmt_string) { c->err = 1; return -1; }
+    }
     return 0;
 }
 
@@ -1344,12 +1410,13 @@ static void csv_destroy(void *state) {
     free(s);
 }
 
-static const char *csv_format_for(CsvType t) {
-    switch (t) {
+static const char *csv_format_for_col(const CsvCol *c) {
+    switch (c->type) {
         case CSV_T_INT64:        return "l";
         case CSV_T_DATE32:       return "tdD";
         case CSV_T_TIMESTAMP_US: return "tsu:";
         case CSV_T_UTF8:         return "u";
+        case CSV_T_DECIMAL128:   return c->fmt_string ? c->fmt_string : "u";
     }
     return "u";
 }
@@ -1375,10 +1442,27 @@ static int csv_stream_get_schema(struct ArrowArrayStream *st,
             free(kids);
             return 1;
         }
-        child->format  = csv_format_for(s->cols[i].type);
+        if (s->cols[i].type == CSV_T_DECIMAL128) {
+            /* "d:p,s" needs its own allocation tied to the schema's
+             * lifetime, since the stream may be released before the
+             * downstream consumer is done with the schema. */
+            child->format  = strdup(csv_format_for_col(&s->cols[i]));
+            child->release = release_schema_named_owned_format;
+            if (!child->format) {
+                free(child); free(name);
+                for (size_t j = 0; j < i; ++j) {
+                    if (kids[j]->release) kids[j]->release(kids[j]);
+                    free(kids[j]);
+                }
+                free(kids);
+                return 1;
+            }
+        } else {
+            child->format  = csv_format_for_col(&s->cols[i]);
+            child->release = release_schema_named;
+        }
         child->name    = name;
         child->flags   = ARROW_FLAG_NULLABLE;
-        child->release = release_schema_named;
         kids[i] = child;
     }
 
@@ -1526,6 +1610,34 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
             kids[c]->n_buffers  = 2;
             kids[c]->buffers    = bufs;
             kids[c]->release    = release_array_date32_leaf;
+        } else if (s->cols[c].type == CSV_T_DECIMAL128) {
+            betl_dec128 *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
+            if (!vals) {
+                free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            if (n > 0) memcpy(vals, s->cols[c].d128_vals,
+                              (size_t)n * sizeof *vals);
+            const void **bufs = malloc(2 * sizeof *bufs);
+            if (!bufs) {
+                free(vals); free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            bufs[0] = NULL;
+            bufs[1] = vals;
+            kids[c]->length     = n;
+            kids[c]->null_count = 0;
+            kids[c]->n_buffers  = 2;
+            kids[c]->buffers    = bufs;
+            kids[c]->release    = release_array_decimal128_leaf;
         } else {
             if (csv_build_utf8_leaf(kids[c], s->cols[c].u8_strs,
                                     s->cols[c].u8_lens, (size_t)n) != 0) {
@@ -1747,6 +1859,15 @@ static int csv_write_render_cell(FILE *fp, char delim,
         }
         return rc < 0 ? -1 : 0;
     }
+    if (strncmp(fmt, "d:", 2) == 0) {
+        int p = 0, s = 0;
+        if (sscanf(fmt + 2, "%d,%d", &p, &s) != 2) return -2;
+        const betl_dec128 *vals = col->buffers[1];
+        char buf[48];
+        int n = betl_dec128_format(vals[off], s, buf, sizeof buf);
+        if (n < 0) return -1;
+        return csv_write_utf8_cell(fp, delim, buf, (size_t)n);
+    }
     return -2; /* unsupported format */
 }
 
@@ -1782,11 +1903,16 @@ static int csv_write_sink_run(void *state) {
      * file so a bad type doesn't leave a half-written artefact behind. */
     for (int64_t i = 0; i < n_cols; ++i) {
         const char *fmt = schema.children[i]->format;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0
-                     && strcmp(fmt, "tdD") != 0 && strcmp(fmt, "tsu:") != 0)) {
+        int ok = fmt && (strcmp(fmt, "l")    == 0 ||
+                         strcmp(fmt, "u")    == 0 ||
+                         strcmp(fmt, "tdD")  == 0 ||
+                         strcmp(fmt, "tsu:") == 0 ||
+                         strncmp(fmt, "d:", 2) == 0);
+        if (!ok) {
             betl_set_error(s->ctx,
                 "csv.write: column '%s' has unsupported Arrow format '%s' "
-                "(supported: int64 'l', utf8 'u', date 'tdD', timestamp 'tsu:')",
+                "(supported: int64 'l', utf8 'u', date 'tdD', timestamp 'tsu:', "
+                "decimal 'd:p,s')",
                 schema.children[i]->name ? schema.children[i]->name : "?",
                 fmt ? fmt : "(null)");
             schema.release(&schema);
