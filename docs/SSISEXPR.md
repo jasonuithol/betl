@@ -75,17 +75,27 @@ underlying Arrow value kinds.
 | `DT_WSTR`        | `u` (utf8) | utf8 | `(DT_WSTR, N)` accepted; the length is parsed and ignored — betl strings are variable-length. |
 | `DT_STR`         | `u` (utf8) | utf8 | `(DT_STR, N, cp)` accepted; cp parsed and ignored. |
 | `DT_DBDATE`      | `tdD` (date32) | date32 | Days since 1970-01-01 (int32). |
-| `DT_DBTIMESTAMP` | `tsu:` (timestamp_us) | timestamp_us | Microseconds since 1970-01-01 UTC. |
+| `DT_DBTIMESTAMP` | `tsu:` (timestamp_us) | timestamp_us | Microseconds since 1970-01-01 UTC (or `tsu:UTC` for explicitly-tz columns; same int64 layout). |
 | `DT_DBTIMESTAMP2`| `tsu:` (timestamp_us) | timestamp_us | Alias for `DT_DBTIMESTAMP`. |
+| `DT_NUMERIC`     | `d:p,s` (decimal128) | decimal128 | int128 + scale. `(DT_NUMERIC, p, s)` cast accepts string / int / float / existing decimal (with rescale). `DT_DECIMAL` is an accepted alias. |
+| `DT_GUID`        | `w:16` (fixed_binary[16]) | uuid | 16 raw bytes; canonical `xxxxxxxx-xxxx-...` text form on cast to/from string. |
+
+Time-zone-aware timestamps flow into the engine as the same int64
+microseconds-since-epoch UTC values as plain timestamps (Arrow
+`tsu:UTC`); the tz annotation lives on the schema, not the row data.
 
 Not yet supported (the cast / typed-NULL will produce a parse error):
 
-- `DT_NUMERIC(p, s)` and `DT_DECIMAL(s)` — no fixed-precision decimal
-  yet. Use `DT_R8` for now, or store as `DT_I8` cents.
-- `DT_DBTIME` / `DT_DBTIME2` — time-of-day without a date.
-- `DT_DBTIMESTAMPOFFSET` — timestamp with tz offset.
-- `DT_GUID`, `DT_IMAGE`, `DT_NTEXT`, `DT_BYTES`, `DT_DATE` (the
-  obsolete float-of-days form).
+- `DT_DBTIME` / `DT_DBTIME2` — time-of-day without a date. (The
+  underlying `ttu` columns do flow through the engine as int64
+  micros, but the `DT_DBTIME` cast syntax isn't wired yet. Use
+  `DATEPART("hour"/"minute"/"second", ts)` as the workaround.)
+- `DT_DBTIMESTAMPOFFSET` — distinct cast for the offset-aware type;
+  use `DT_DBTIMESTAMP` and read `tsu:UTC` columns as plain timestamps.
+- `DT_BYTES` / `DT_IMAGE` — binary columns; the Arrow `z` leaf shape
+  isn't plumbed yet.
+- `DT_NTEXT` — treat as `DT_WSTR`.
+- `DT_DATE` (the obsolete float-of-days form) — use `DT_DBDATE`.
 
 ## Casts
 
@@ -93,6 +103,7 @@ Not yet supported (the cast / typed-NULL will produce a parse error):
 (DT_xx) value
 (DT_WSTR, N) value
 (DT_STR, N, cp) value
+(DT_NUMERIC, p, s) value
 ```
 
 | From → To | Behaviour |
@@ -100,11 +111,20 @@ Not yet supported (the cast / typed-NULL will produce a parse error):
 | numeric → numeric | Normal C-style truncation / promotion. |
 | string → numeric  | `strtoll` / `strtod` of the full string; an unparseable suffix is an error. |
 | numeric → bool    | `0` → FALSE, anything else → TRUE. |
+| decimal → bool    | `0` → FALSE, anything else → TRUE. |
 | string → date     | Parses `YYYY-MM-DD`. Other forms error. |
-| string → timestamp | Parses `YYYY-MM-DD HH:MM:SS[.uuuuuu]`; `T` also accepted as separator. Trailing tz (e.g. `Z` or `+02:00`) errors — see "Not yet supported". |
+| string → timestamp | Parses `YYYY-MM-DD HH:MM:SS[.uuuuuu]`; `T` also accepted as separator. A trailing tz suffix (`Z`, `+HH:MM`, `+HHMM`, `+HH`) is accepted and normalised to UTC. |
 | date → timestamp  | Midnight on that date (00:00:00.000000). |
 | timestamp → date  | Truncates time-of-day. |
-| numeric / bool / date / timestamp → string | ISO 8601 for date/timestamp; `%g` for float; "True" / "False" for bool. |
+| string → decimal  | `(DT_NUMERIC, p, s)` parses with the target scale; over-scale digits must be zero or the cast errors (no silent rounding). |
+| int / float → decimal | Promoted to the target scale. Float goes via `printf("%.*f", scale, …)` so libc rounding rules apply. |
+| decimal → decimal | Rescaled. Widening scale multiplies by 10ⁿ; narrowing truncates. |
+| decimal → int     | Truncates fractional part. |
+| decimal → float   | Lossy via int128 → double / 10ˢᶜᵃˡᵉ. |
+| decimal → string  | Renders with exactly the scale's fractional digits (zero-padded). |
+| string → uuid     | Parses the canonical dashed-hex 36-char form (case-insensitive). |
+| uuid → string     | Renders lower-case dashed-hex. |
+| numeric / bool / date / timestamp / decimal / uuid → string | ISO 8601 for date/timestamp; `%g` for float; "True" / "False" for bool; canonical text for decimal / uuid. |
 | date / timestamp → numeric | **Error** — not implicit. Pull the part you want with `DATEPART` / `YEAR` / `MONTH` / `DAY`. |
 
 ## NULL semantics (three-valued logic)
@@ -136,7 +156,7 @@ is NULL.
 | `-x`, `!x`, `~x` | Unary negate, logical NOT, bitwise NOT (int only). |
 | `*` `/` `%` | Multiplicative. Integer divide-by-zero is an error; float `0/0` follows IEEE 754. |
 | `+` `-` | Additive. **`+` on two strings is concatenation**, matching SSIS. |
-| `<` `<=` `>` `>=` | Numeric / string / temporal compare; mixed temporal (date vs timestamp) promotes the date to midnight. |
+| `<` `<=` `>` `>=` | Numeric / string / temporal / decimal / uuid compare. Mixed temporal (date vs timestamp) promotes the date to midnight; mixed decimal scales promote to the wider scale; decimal vs int / float falls back to a double-precision compare (~16 decimal digits of precision). UUIDs compare byte-wise. |
 | `==` `!=` | Equality, same rules as ordering. |
 | `&&` `\|\|` | 3VL logical AND / OR (see above). |
 | `? :` | Ternary: cond must be DT_BOOL (or NULL → result is NULL). |
@@ -224,20 +244,29 @@ for v2.
   now, expose project variables as pipeline parameters and reference
   them with `${params.foo}` substitution before the expression is
   compiled.
-- **`DT_NUMERIC(p, s)` / `DT_DECIMAL(s)`** — no fixed-precision
-  decimal type in betl. Workaround: store currency as `DT_I8` cents,
-  do display rounding in the reporting layer.
+- **Decimal arithmetic.** Decimals can be read, cast, compared,
+  rescaled, and rendered — but `+ - * /` between two `DT_NUMERIC`
+  operands isn't wired. Workaround: cast both sides to `(DT_R8)`,
+  compute, and (DT_NUMERIC, p, s) back. Lossy but adequate for
+  typical SSIS migrations where decimal math happens in SQL.
+- **`DT_DBTIME` / `DT_DBTIME2` casts.** Time columns flow through
+  the engine as int64 micros-of-day (Arrow `ttu`), but the
+  `(DT_DBTIME)` cast syntax isn't recognised. Workaround:
+  `DATEPART("hour"/"minute"/"second", ts)` for extraction; embed
+  in a timestamp for arithmetic.
+- **Binary columns** (`DT_BYTES`, `DT_IMAGE`). The Arrow `z`
+  variable-length leaf shape isn't plumbed yet; read as `DT_WSTR`
+  via the source if you only need text comparisons.
 - **Bitwise operators** — `&` `|` `^` `<<` `>>`.
 - **`TOKEN(str, delim, n)`, `TOKENCOUNT(str, delim)`** — string
   splitting.
 - **`HEX(n)`, `CODEPOINT(s)`** — value introspection.
 - **Locale-aware parsing** — date / number parsers are ASCII /
   invariant-culture only. SSIS' `LocaleID` setting doesn't apply.
-- **Time-zone-aware timestamps** — input strings can't carry a `Z`
-  or `+HH:MM` suffix. Cast `TIMESTAMPTZ` columns to `TIMESTAMP` in
-  your `postgres.read` query.
-- **`DT_DBTIME` / `DT_DBTIME2`** — time-of-day type. Workaround:
-  embed in a timestamp at a fixed reference date.
+- **Narrow-width Arrow integers.** `int8`/`int16`/`int32` are
+  accepted at the schema layer and round-trip correctly through
+  databases (target column widths are preserved by the driver) but
+  widen to int64 in betl's in-memory representation.
 
 ## Error handling
 

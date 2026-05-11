@@ -89,13 +89,13 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 
 | Kind | Component | Status | Notes |
 |---|---|---|---|
-| SOURCE | `csv.read` | ✓ | Streaming; RFC 4180 quoted fields incl. multi-line; int64 / utf8 / date / timestamp |
-| SOURCE | `postgres.read` | ✓ | Run a SELECT, stream rows; libpq cursor; int / text / DATE / TIMESTAMP; nulls supported |
-| SOURCE | `mssql.read` | ✓ | Run a SELECT, stream rows; unixODBC + FreeTDS; int / varchar / DATE / DATETIME2; nulls supported |
+| SOURCE | `csv.read` | ✓ | Streaming; RFC 4180; types: int(8/16/32/64) / float(32/64) / utf8 / date / timestamp / timestamptz / time / uuid / decimal(p,s) |
+| SOURCE | `postgres.read` | ✓ | libpq cursor; int / text / float / DATE / TIMESTAMP[TZ] / TIME / NUMERIC / uuid; nulls supported |
+| SOURCE | `mssql.read` | ✓ | unixODBC + FreeTDS; int / varchar / float / DATE / DATETIME2 / DATETIMEOFFSET / TIME / DECIMAL / UNIQUEIDENTIFIER; nulls supported |
 | SOURCE | `betl.gen_int64` / `betl.gen_strings` | ✓ | Test generators |
-| SINK | `csv.write` | ✓ | RFC 4180 quoting, header / delimiter; date / timestamp rendered as ISO 8601 |
-| SINK | `postgres.upsert` | ✓ | INSERT…ON CONFLICT; 4 conflict modes; libpq; binds DATE / TIMESTAMP |
-| SINK | `mssql.upsert` | ✓ | MERGE; 4 conflict modes; unixODBC + FreeTDS; binds DATE / DATETIME2 |
+| SINK | `csv.write` | ✓ | RFC 4180; renders all source types as ISO 8601 / canonical text |
+| SINK | `postgres.upsert` | ✓ | INSERT…ON CONFLICT; 4 conflict modes; binds every source type incl. NUMERIC / TIMESTAMPTZ / uuid / TIME |
+| SINK | `mssql.upsert` | ✓ | MERGE; 4 conflict modes; binds DATE / DATETIME2 / DATETIMEOFFSET / DECIMAL / UNIQUEIDENTIFIER / TIME via SQL_C_CHAR text |
 | SINK | `betl.count_rows` | ✓ | Smoke / assertion sink |
 | TRANSFORM | `filter` | ✓ | Predicate via the expression engine |
 | TRANSFORM | `map` | ✓ | `add:` (append) and `select:` (project / rename) |
@@ -112,7 +112,7 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 | TASK | `lua.task` | ✓ | Standalone Lua script with host bridges |
 | ENGINE | `literal` | ✓ | Constant expressions (built-in) |
 | ENGINE | `lua` | ✓ | Lua 5.4 (provider plugin) |
-| ENGINE | `ssisexpr` | ✓ | SSIS Expression Language — typed `(DT_*)` casts, 3VL nulls, ~30 functions incl. dates (provider plugin); see [`docs/SSISEXPR.md`](docs/SSISEXPR.md) |
+| ENGINE | `ssisexpr` | ✓ | SSIS Expression Language — typed `(DT_*)` casts (incl. NUMERIC / GUID / dates), 3VL nulls, ~30 functions, decimal+uuid comparisons (provider plugin); see [`docs/SSISEXPR.md`](docs/SSISEXPR.md) |
 
 ### Missing on purpose at v0.1
 
@@ -120,6 +120,12 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 - No `pivot` / `unpivot` reshape, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
+- Binary / `BYTEA` columns. (Different Arrow leaf shape from
+  everything else; planned for v2.)
+- Narrow-width Arrow buffers. `int8`/`int16`/`int32`/`float32` are
+  accepted in CSV schema and DB type-mapping but widened to int64 /
+  float64 in-memory. Target column widths still round-trip correctly
+  because the DB driver coerces on insert.
 
 ## Pipeline parallelism
 

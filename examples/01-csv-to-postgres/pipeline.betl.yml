@@ -56,18 +56,20 @@ pipeline:
         path: ${params.src_dir}/orders-${params.load_date}.csv
         delimiter: ","
         header: true
-        # Schema declares each column's logical type. csv.read currently
-        # supports: int64, utf8, date, timestamp. unit_price is in whole
-        # cents to stay inside int64 (decimal types are a future addition).
+        # Schema declares each column's logical type. csv.read supports
+        # int8/16/32/64, float32/64, utf8, date, timestamp, timestamptz,
+        # time, uuid, and decimal(p, s). Currency lives in NUMERIC(12, 2);
+        # ordered_at is a plain TIMESTAMP (no tz, normalised at write
+        # time if you upsert into a TIMESTAMPTZ column).
         schema:
           columns:
-            - { name: order_id,    type: int64     }
-            - { name: customer_id, type: int64     }
-            - { name: sku,         type: utf8      }
-            - { name: quantity,    type: int64     }
-            - { name: unit_price,  type: int64     }    # cents
-            - { name: ordered_at,  type: timestamp }    # YYYY-MM-DD HH:MM:SS[.uuuuuu]
-            - { name: notes,       type: utf8      }
+            - { name: order_id,    type: int64 }
+            - { name: customer_id, type: int64 }
+            - { name: sku,         type: utf8  }
+            - { name: quantity,    type: int32 }
+            - { name: unit_price,  type: decimal, precision: 12, scale: 2 }
+            - { name: ordered_at,  type: timestamp }   # YYYY-MM-DD HH:MM:SS[.uuuuuu]
+            - { name: notes,       type: utf8  }
 
       - id: clean
         type: lua.map
