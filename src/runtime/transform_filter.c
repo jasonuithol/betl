@@ -144,11 +144,18 @@ static int ensure_schema(FilterState *f, struct ArrowSchema *sch_keep) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = sch_keep->children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_fixed = fmt && betl_tx_fixed_width_for_fmt(fmt[0]) != 0
+                       && (fmt[0] == 'c' || fmt[0] == 'C' ||
+                           fmt[0] == 's' || fmt[0] == 'S' ||
+                           fmt[0] == 'i' || fmt[0] == 'I' ||
+                           fmt[0] == 'l' || fmt[0] == 'L' ||
+                           fmt[0] == 'f' || fmt[0] == 'g');
+        int is_utf8  = fmt && strcmp(fmt, "u") == 0;
+        if (!is_fixed && !is_utf8) {
             for (size_t k = 0; k < i; ++k) free(names[k]);
             free(names); free(fmts);
             fset_err(f, "filter: column '%s' has unsupported format '%s' "
-                        "(v0.1 supports int64 and utf8)",
+                        "(supports fixed-width primitive ints/floats and utf8)",
                      (c && c->name) ? c->name : "?", fmt ? fmt : "(none)");
             return -1;
         }
@@ -268,9 +275,10 @@ static int filt_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
     for (size_t c = 0; c < f->n_cols; ++c) {
         kids[c] = calloc(1, sizeof **kids);
         int crc;
-        if (f->col_fmts[c] == 'l') {
-            crc = betl_tx_build_int64_filtered(kids[c], in_arr.children[c],
-                                               keep, length, n_kept);
+        size_t w = betl_tx_fixed_width_for_fmt(f->col_fmts[c]);
+        if (w != 0) {
+            crc = betl_tx_build_fixed_filtered(kids[c], in_arr.children[c],
+                                               w, keep, length, n_kept);
         } else {
             crc = betl_tx_build_utf8_filtered (kids[c], in_arr.children[c],
                                                keep, length, n_kept);

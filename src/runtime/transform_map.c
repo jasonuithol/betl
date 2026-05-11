@@ -358,9 +358,16 @@ static int map_ensure_ready(MapState *m) {
     for (size_t i = 0; i < m->n_input_cols; ++i) {
         struct ArrowSchema *c = m->input_schema.children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_fixed = fmt && betl_tx_fixed_width_for_fmt(fmt[0]) != 0
+                       && (fmt[0] == 'c' || fmt[0] == 'C' ||
+                           fmt[0] == 's' || fmt[0] == 'S' ||
+                           fmt[0] == 'i' || fmt[0] == 'I' ||
+                           fmt[0] == 'l' || fmt[0] == 'L' ||
+                           fmt[0] == 'f' || fmt[0] == 'g');
+        int is_utf8  = fmt && strcmp(fmt, "u") == 0;
+        if (!is_fixed && !is_utf8) {
             mset_err(m, "map: input column '%s' has unsupported format '%s' "
-                        "(v0.1 supports int64 and utf8)",
+                        "(supports fixed-width primitive ints/floats and utf8)",
                      (c && c->name) ? c->name : "?", fmt ? fmt : "(none)");
             return -1;
         }
@@ -419,29 +426,44 @@ static int map_ensure_ready(MapState *m) {
     return 0;
 }
 
-/* Map "l" / "u" / "b" desired_format to an Arrow leaf schema's
- * `format` string. */
+/* Map a desired_format string to an Arrow leaf schema's `format`
+ * string. Accepts every primitive format the in-tree engines can
+ * produce — and currently they all happen to be identity-mapped. */
 static const char *desired_to_format(const char *desired) {
     if (strcmp(desired, "l") == 0) return "l";
+    if (strcmp(desired, "L") == 0) return "L";
+    if (strcmp(desired, "c") == 0) return "c";
+    if (strcmp(desired, "C") == 0) return "C";
+    if (strcmp(desired, "s") == 0) return "s";
+    if (strcmp(desired, "S") == 0) return "S";
+    if (strcmp(desired, "i") == 0) return "i";
+    if (strcmp(desired, "I") == 0) return "I";
+    if (strcmp(desired, "f") == 0) return "f";
+    if (strcmp(desired, "g") == 0) return "g";
     if (strcmp(desired, "u") == 0) return "u";
     if (strcmp(desired, "b") == 0) return "b";
     return NULL;
 }
 
-/* Deep-copy an int64 leaf, applying src's offset so the destination
- * starts at offset 0. Used by select mode (where the same input column
- * may be referenced more than once and ownership cannot be moved). */
-static int deepcopy_int64_leaf(struct ArrowArray *dst,
-                               const struct ArrowArray *src) {
+/* Deep-copy a fixed-width primitive leaf, applying src's offset so the
+ * destination starts at offset 0. Used by select mode (where the same
+ * input column may be referenced more than once and ownership cannot be
+ * moved). Element width given by `elem_size`. */
+static int deepcopy_fixed_leaf(struct ArrowArray *dst,
+                               const struct ArrowArray *src,
+                               size_t elem_size) {
+    if (elem_size == 0) return -1;
     int64_t length = src->length;
     int64_t offset = src->offset;
     int64_t null_count = src->null_count;
 
-    int64_t *vals = malloc((size_t)(length ? length : 1) * sizeof *vals);
+    uint8_t *vals = malloc((size_t)(length ? length : 1) * elem_size);
     if (!vals) return -1;
     if (length > 0) {
-        const int64_t *svals = src->buffers[1];
-        memcpy(vals, svals + offset, (size_t)length * sizeof *vals);
+        const uint8_t *svals = src->buffers[1];
+        memcpy(vals,
+               svals + (size_t)offset * elem_size,
+               (size_t)length * elem_size);
     }
 
     uint8_t *vmap = NULL;
@@ -470,7 +492,7 @@ static int deepcopy_int64_leaf(struct ArrowArray *dst,
     dst->n_buffers  = 2;
     dst->n_children = 0;
     dst->buffers    = bufs;
-    dst->release    = betl_tx_release_int64_leaf;
+    dst->release    = betl_tx_release_int64_leaf;  /* same shape: 2 buffers */
     return 0;
 }
 
@@ -583,7 +605,19 @@ static int map_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
             fmt = desired_to_format(s->out_format);
         } else {
             char ch = m->input_col_fmts[s->from_idx];
-            fmt = (ch == 'l') ? "l" : "u";
+            switch (ch) {
+                case 'l': fmt = "l"; break;
+                case 'L': fmt = "L"; break;
+                case 'c': fmt = "c"; break;
+                case 'C': fmt = "C"; break;
+                case 's': fmt = "s"; break;
+                case 'S': fmt = "S"; break;
+                case 'i': fmt = "i"; break;
+                case 'I': fmt = "I"; break;
+                case 'f': fmt = "f"; break;
+                case 'g': fmt = "g"; break;
+                default:  fmt = "u"; break;
+            }
         }
         if (!fmt) {
             for (size_t k = 0; k < i; ++k) {
@@ -693,8 +727,10 @@ static int map_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
                 }
             } else {
                 const struct ArrowArray *src = in_arr.children[s->from_idx];
-                if (m->input_col_fmts[s->from_idx] == 'l') {
-                    rc = deepcopy_int64_leaf(leaf, src);
+                char ch = m->input_col_fmts[s->from_idx];
+                size_t w = betl_tx_fixed_width_for_fmt(ch);
+                if (w != 0) {
+                    rc = deepcopy_fixed_leaf(leaf, src, w);
                 } else {
                     rc = deepcopy_utf8_leaf(leaf, src);
                 }

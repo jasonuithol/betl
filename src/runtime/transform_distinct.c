@@ -207,7 +207,14 @@ static int distinct_resolve_schema(DistinctState *d) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = sch.children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_fixed = fmt && betl_tx_fixed_width_for_fmt(fmt[0]) != 0
+                       && (fmt[0] == 'c' || fmt[0] == 'C' ||
+                           fmt[0] == 's' || fmt[0] == 'S' ||
+                           fmt[0] == 'i' || fmt[0] == 'I' ||
+                           fmt[0] == 'l' || fmt[0] == 'L' ||
+                           fmt[0] == 'f' || fmt[0] == 'g');
+        int is_utf8  = fmt && strcmp(fmt, "u") == 0;
+        if (!is_fixed && !is_utf8) {
             dset_err(d, "distinct: input column '%s' has unsupported format '%s'",
                      (c && c->name) ? c->name : "?", fmt ? fmt : "(none)");
             goto done;
@@ -292,13 +299,37 @@ static void read_key_cell(const struct ArrowArray *col, char fmt, size_t r,
         const uint8_t *valid = col->buffers[0];
         if (!betl_tx_bit_at(valid, row)) { *is_null = 1; return; }
     }
-    if (fmt == 'l') {
-        *i64v = ((const int64_t *)col->buffers[1])[row];
-    } else {
-        const int32_t *off = col->buffers[1];
-        const char    *dat = col->buffers[2];
-        *u8p   = dat + off[row];
-        *u8len = (size_t)(off[row + 1] - off[row]);
+    switch (fmt) {
+        case 'l': *i64v = ((const int64_t  *)col->buffers[1])[row]; return;
+        case 'L': *i64v = (int64_t)((const uint64_t *)col->buffers[1])[row]; return;
+        case 'c': *i64v = ((const int8_t   *)col->buffers[1])[row]; return;
+        case 'C': *i64v = ((const uint8_t  *)col->buffers[1])[row]; return;
+        case 's': *i64v = ((const int16_t  *)col->buffers[1])[row]; return;
+        case 'S': *i64v = ((const uint16_t *)col->buffers[1])[row]; return;
+        case 'i': *i64v = ((const int32_t  *)col->buffers[1])[row]; return;
+        case 'I': *i64v = (int64_t)((const uint32_t *)col->buffers[1])[row]; return;
+        case 'f': {
+            /* Floats hash by their raw IEEE-754 bit pattern after a
+             * widening to double; this matches "equal iff bitwise equal"
+             * (so NaNs are not equal to themselves — consistent with how
+             * SQL DISTINCT typically treats them). */
+            float f = ((const float *)col->buffers[1])[row];
+            double d = (double)f;
+            memcpy(i64v, &d, sizeof d);
+            return;
+        }
+        case 'g': {
+            double d = ((const double *)col->buffers[1])[row];
+            memcpy(i64v, &d, sizeof d);
+            return;
+        }
+        default: {
+            const int32_t *off = col->buffers[1];
+            const char    *dat = col->buffers[2];
+            *u8p   = dat + off[row];
+            *u8len = (size_t)(off[row + 1] - off[row]);
+            return;
+        }
     }
 }
 
@@ -317,7 +348,14 @@ static int seen_contains(const DistinctState *d, const struct ArrowArray *batch,
             uint8_t seen_null = d->seen.null_mask[k][i];
             if (is_null != (int)seen_null) { all_eq = 0; break; }
             if (is_null) continue;       /* both null → equal */
-            if (d->keys[k].fmt == 'l') {
+            char kfmt = d->keys[k].fmt;
+            int is_fixed = betl_tx_fixed_width_for_fmt(kfmt) != 0
+                           && (kfmt == 'c' || kfmt == 'C' ||
+                               kfmt == 's' || kfmt == 'S' ||
+                               kfmt == 'i' || kfmt == 'I' ||
+                               kfmt == 'l' || kfmt == 'L' ||
+                               kfmt == 'f' || kfmt == 'g');
+            if (is_fixed) {
                 if (d->seen.i64[k][i] != v_i64) { all_eq = 0; break; }
             } else {
                 if (d->seen.u8l[k][i] != v_u8l) { all_eq = 0; break; }
@@ -355,7 +393,14 @@ static int seen_add(DistinctState *d, const struct ArrowArray *batch,
         d->seen.u8s[k][i] = NULL;
         d->seen.u8l[k][i] = 0;
         if (is_null) continue;
-        if (d->keys[k].fmt == 'l') {
+        char kfmt = d->keys[k].fmt;
+        int is_fixed = betl_tx_fixed_width_for_fmt(kfmt) != 0
+                       && (kfmt == 'c' || kfmt == 'C' ||
+                           kfmt == 's' || kfmt == 'S' ||
+                           kfmt == 'i' || kfmt == 'I' ||
+                           kfmt == 'l' || kfmt == 'L' ||
+                           kfmt == 'f' || kfmt == 'g');
+        if (is_fixed) {
             d->seen.i64[k][i] = v_i64;
         } else {
             char *dup = malloc(v_u8l + 1);
@@ -434,9 +479,10 @@ static int dist_get_next(struct ArrowArrayStream *st,
         for (size_t c = 0; c < d->n_cols; ++c) {
             kids[c] = calloc(1, sizeof **kids);
             if (!kids[c]) { build_failed = 1; break; }
-            int crc = (d->col_fmts[c] == 'l')
-                ? betl_tx_build_int64_filtered(kids[c], batch.children[c],
-                                               keep, length, n_kept)
+            size_t w = betl_tx_fixed_width_for_fmt(d->col_fmts[c]);
+            int crc = (w != 0)
+                ? betl_tx_build_fixed_filtered(kids[c], batch.children[c],
+                                               w, keep, length, n_kept)
                 : betl_tx_build_utf8_filtered (kids[c], batch.children[c],
                                                keep, length, n_kept);
             if (crc != 0) { build_failed = 1; break; }

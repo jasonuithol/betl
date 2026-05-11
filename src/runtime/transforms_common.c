@@ -240,11 +240,13 @@ struct ArrowSchema *betl_tx_new_leaf_schema(const char *name, const char *format
  *  preserving NULL-ness from the input via the validity bitmap.    *
  * ============================================================== */
 
-int betl_tx_build_int64_filtered(struct ArrowArray *out,
+int betl_tx_build_fixed_filtered(struct ArrowArray *out,
                                  const struct ArrowArray *src,
+                                 size_t elem_size,
                                  const uint8_t *keep, size_t n_rows,
                                  size_t n_kept) {
-    int64_t *vals = malloc((n_kept ? n_kept : 1) * sizeof *vals);
+    if (elem_size == 0) return -1;
+    uint8_t *vals = malloc((n_kept ? n_kept : 1) * elem_size);
     if (!vals) return -1;
     size_t bytes = (n_kept + 7) / 8;
     uint8_t *vmap = malloc(bytes ? bytes : 1);
@@ -253,7 +255,7 @@ int betl_tx_build_int64_filtered(struct ArrowArray *out,
 
     int64_t null_count = 0;
     const uint8_t *src_valid = (src->null_count > 0) ? src->buffers[0] : NULL;
-    const int64_t *src_vals  = src->buffers[1];
+    const uint8_t *src_vals  = src->buffers[1];
     size_t off = (size_t)src->offset;
     size_t w = 0;
     for (size_t i = 0; i < n_rows; ++i) {
@@ -264,7 +266,9 @@ int betl_tx_build_int64_filtered(struct ArrowArray *out,
             vmap[w / 8] &= (uint8_t)~(1u << (w % 8));
             ++null_count;
         } else {
-            vals[w] = src_vals[row];
+            memcpy(vals + w * elem_size,
+                   src_vals + row * elem_size,
+                   elem_size);
         }
         ++w;
     }
@@ -280,8 +284,16 @@ int betl_tx_build_int64_filtered(struct ArrowArray *out,
     out->n_buffers  = 2;
     out->n_children = 0;
     out->buffers    = bufs;
-    out->release    = betl_tx_release_int64_leaf;
+    out->release    = betl_tx_release_int64_leaf;  /* same shape: free bufs[0,1] */
     return 0;
+}
+
+int betl_tx_build_int64_filtered(struct ArrowArray *out,
+                                 const struct ArrowArray *src,
+                                 const uint8_t *keep, size_t n_rows,
+                                 size_t n_kept) {
+    return betl_tx_build_fixed_filtered(out, src, sizeof(int64_t),
+                                        keep, n_rows, n_kept);
 }
 
 int betl_tx_build_utf8_filtered(struct ArrowArray *out,

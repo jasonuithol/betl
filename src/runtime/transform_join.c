@@ -85,7 +85,14 @@ static int jtab_set_schema(JTab *t, const struct ArrowSchema *sch,
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = sch->children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_fixed = fmt && betl_tx_fixed_width_for_fmt(fmt[0]) != 0
+                       && (fmt[0] == 'c' || fmt[0] == 'C' ||
+                           fmt[0] == 's' || fmt[0] == 'S' ||
+                           fmt[0] == 'i' || fmt[0] == 'I' ||
+                           fmt[0] == 'l' || fmt[0] == 'L' ||
+                           fmt[0] == 'f' || fmt[0] == 'g');
+        int is_utf8  = fmt && strcmp(fmt, "u") == 0;
+        if (!is_fixed && !is_utf8) {
             snprintf(err, err_cap, "column '%s' has unsupported format '%s'",
                      (c && c->name) ? c->name : "?", fmt ? fmt : "(none)");
             return -1;
@@ -101,17 +108,17 @@ static int jtab_set_schema(JTab *t, const struct ArrowSchema *sch,
 static int jtab_grow_rows(JTab *t) {
     size_t nc = t->row_cap ? t->row_cap * 2 : 64;
     for (size_t c = 0; c < t->n_cols; ++c) {
-        if (t->fmts[c] == 'l') {
-            int64_t *p = realloc(t->i64[c], nc * sizeof *p);
-            if (!p) return -1;
-            t->i64[c] = p;
-        } else {
+        if (t->fmts[c] == 'u') {
             char **sp = realloc(t->u8s[c], nc * sizeof *sp);
             if (!sp) return -1;
             t->u8s[c] = sp;
             size_t *lp = realloc(t->u8l[c], nc * sizeof *lp);
             if (!lp) return -1;
             t->u8l[c] = lp;
+        } else {
+            int64_t *p = realloc(t->i64[c], nc * sizeof *p);
+            if (!p) return -1;
+            t->i64[c] = p;
         }
     }
     t->row_cap = nc;
@@ -122,9 +129,26 @@ static int jtab_stash(JTab *t, size_t c,
                       const struct ArrowArray *src,
                       size_t row_idx, size_t r) {
     size_t row = row_idx + (size_t)src->offset;
-    if (t->fmts[c] == 'l') {
-        t->i64[c][r] = ((const int64_t *)src->buffers[1])[row];
-        return 0;
+    char fmt = t->fmts[c];
+    switch (fmt) {
+        case 'l': t->i64[c][r] = ((const int64_t *)src->buffers[1])[row]; return 0;
+        case 'L': t->i64[c][r] = (int64_t)((const uint64_t *)src->buffers[1])[row]; return 0;
+        case 'c': t->i64[c][r] = ((const int8_t   *)src->buffers[1])[row]; return 0;
+        case 'C': t->i64[c][r] = ((const uint8_t  *)src->buffers[1])[row]; return 0;
+        case 's': t->i64[c][r] = ((const int16_t  *)src->buffers[1])[row]; return 0;
+        case 'S': t->i64[c][r] = ((const uint16_t *)src->buffers[1])[row]; return 0;
+        case 'i': t->i64[c][r] = ((const int32_t  *)src->buffers[1])[row]; return 0;
+        case 'I': t->i64[c][r] = (int64_t)((const uint32_t *)src->buffers[1])[row]; return 0;
+        case 'g': {
+            double d = ((const double *)src->buffers[1])[row];
+            memcpy(&t->i64[c][r], &d, sizeof d); return 0;
+        }
+        case 'f': {
+            float f = ((const float *)src->buffers[1])[row];
+            double d = (double)f;
+            memcpy(&t->i64[c][r], &d, sizeof d); return 0;
+        }
+        default: break;
     }
     const int32_t *off = src->buffers[1];
     const char    *dat = src->buffers[2];
@@ -402,16 +426,23 @@ static int join_materialize(JoinState *j) {
 static int row_keys_equal(const JoinState *j, size_t lr, size_t rr) {
     for (size_t k = 0; k < j->n_keys; ++k) {
         const JoinKey *key = &j->keys[k];
-        if (key->fmt == 'l') {
-            if (j->L.i64[key->left_idx][lr] != j->R.i64[key->right_idx][rr]) {
-                return 0;
-            }
-        } else {
+        char fmt = key->fmt;
+        if (fmt == 'u') {
             size_t la = j->L.u8l[key->left_idx][lr];
             size_t lb = j->R.u8l[key->right_idx][rr];
             if (la != lb) return 0;
             if (la && memcmp(j->L.u8s[key->left_idx][lr],
                              j->R.u8s[key->right_idx][rr], la) != 0) {
+                return 0;
+            }
+        } else if (fmt == 'f' || fmt == 'g') {
+            double a, b;
+            memcpy(&a, &j->L.i64[key->left_idx][lr],  sizeof a);
+            memcpy(&b, &j->R.i64[key->right_idx][rr], sizeof b);
+            if (a != b) return 0;     /* NaN != NaN — consistent with SQL */
+        } else {
+            /* All fixed-width int keys compare via the widened int64 slot. */
+            if (j->L.i64[key->left_idx][lr] != j->R.i64[key->right_idx][rr]) {
                 return 0;
             }
         }
@@ -440,15 +471,28 @@ static uint8_t *join_build_validity(const uint8_t *nulls, size_t n,
     return bm;
 }
 
-static int join_build_int64_leaf(struct ArrowArray *out,
+/* Emit a fixed-width leaf in the original format, narrowing the int64
+ * stash slot (or memcpy-reinterpreting it for floats). */
+static int join_build_fixed_leaf(struct ArrowArray *out, char fmt,
                                  JTab *side, int col_idx,
                                  const size_t *rows,
                                  const uint8_t *nulls, size_t n) {
-    int64_t *v = malloc((n ? n : 1) * sizeof *v);
+    size_t w = betl_tx_fixed_width_for_fmt(fmt);
+    if (w == 0) return -1;
+    uint8_t *v = malloc((n ? n : 1) * w);
     if (!v) return -1;
     for (size_t i = 0; i < n; ++i) {
-        if (nulls && nulls[i]) v[i] = 0;
-        else                   v[i] = side->i64[col_idx][rows[i]];
+        int64_t slot = (nulls && nulls[i]) ? 0 : side->i64[col_idx][rows[i]];
+        switch (fmt) {
+            case 'l': case 'L': memcpy(v + i * 8, &slot, 8); break;
+            case 'c': case 'C': v[i] = (uint8_t)slot; break;
+            case 's': case 'S': { uint16_t b = (uint16_t)slot; memcpy(v + i * 2, &b, 2); break; }
+            case 'i': case 'I': { uint32_t b = (uint32_t)slot; memcpy(v + i * 4, &b, 4); break; }
+            case 'g': memcpy(v + i * 8, &slot, 8); break;
+            case 'f': { double d; memcpy(&d, &slot, sizeof d);
+                        float f = (float)d; memcpy(v + i * 4, &f, 4); break; }
+            default: free(v); return -1;
+        }
     }
     int64_t null_count = 0;
     uint8_t *vmap = join_build_validity(nulls, n, &null_count);
@@ -621,14 +665,16 @@ static int join_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         int rc;
         if (c < j->L.n_cols) {
             int idx = (int)c;
-            rc = (j->L.fmts[idx] == 'l')
-                 ? join_build_int64_leaf(kids[c], &j->L, idx, lr, ln, n)
-                 : join_build_utf8_leaf (kids[c], &j->L, idx, lr, ln, n);
+            char fmt = j->L.fmts[idx];
+            rc = (fmt == 'u')
+                 ? join_build_utf8_leaf (kids[c], &j->L, idx, lr, ln, n)
+                 : join_build_fixed_leaf(kids[c], fmt, &j->L, idx, lr, ln, n);
         } else {
             int idx = (int)(c - j->L.n_cols);
-            rc = (j->R.fmts[idx] == 'l')
-                 ? join_build_int64_leaf(kids[c], &j->R, idx, rr, rn, n)
-                 : join_build_utf8_leaf (kids[c], &j->R, idx, rr, rn, n);
+            char fmt = j->R.fmts[idx];
+            rc = (fmt == 'u')
+                 ? join_build_utf8_leaf (kids[c], &j->R, idx, rr, rn, n)
+                 : join_build_fixed_leaf(kids[c], fmt, &j->R, idx, rr, rn, n);
         }
         if (rc != 0) {
             jset_err(j, "join: failed to build output column");

@@ -119,7 +119,14 @@ static int limit_resolve_schema(LimitState *l) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = sch.children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_fixed = fmt && betl_tx_fixed_width_for_fmt(fmt[0]) != 0
+                       && (fmt[0] == 'c' || fmt[0] == 'C' ||
+                           fmt[0] == 's' || fmt[0] == 'S' ||
+                           fmt[0] == 'i' || fmt[0] == 'I' ||
+                           fmt[0] == 'l' || fmt[0] == 'L' ||
+                           fmt[0] == 'f' || fmt[0] == 'g');
+        int is_utf8  = fmt && strcmp(fmt, "u") == 0;
+        if (!is_fixed && !is_utf8) {
             lset_err(l, "limit: input column has unsupported format '%s'",
                      fmt ? fmt : "(none)");
             goto done;
@@ -157,9 +164,10 @@ static int slice_batch(LimitState *l, struct ArrowArray *src, size_t n_take,
     for (size_t c = 0; c < l->n_cols; ++c) {
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
-        int crc = (l->col_fmts[c] == 'l')
-            ? betl_tx_build_int64_filtered(kids[c], src->children[c],
-                                           keep, length, n_take)
+        size_t w = betl_tx_fixed_width_for_fmt(l->col_fmts[c]);
+        int crc = (w != 0)
+            ? betl_tx_build_fixed_filtered(kids[c], src->children[c],
+                                           w, keep, length, n_take)
             : betl_tx_build_utf8_filtered (kids[c], src->children[c],
                                            keep, length, n_take);
         if (crc != 0) { build_failed = 1; break; }

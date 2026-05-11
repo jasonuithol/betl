@@ -47,6 +47,19 @@ void betl_tx_release_int64_leaf(struct ArrowArray *arr);
 void betl_tx_release_utf8_leaf (struct ArrowArray *arr);
 void betl_tx_release_struct    (struct ArrowArray *arr);
 
+/* Element width in bytes for fixed-width primitive Arrow formats.
+ * Returns 0 for non-fixed-width / unknown formats, and for formats
+ * that need element-specific handling (e.g. utf8). */
+static inline size_t betl_tx_fixed_width_for_fmt(char fmt) {
+    switch (fmt) {
+        case 'c': case 'C': case 'b': return 1;
+        case 's': case 'S':           return 2;
+        case 'i': case 'I': case 'f': return 4;
+        case 'l': case 'L': case 'g': return 8;
+        default: return 0;
+    }
+}
+
 /* Schema leaf with a strdup'd `name` and a static-literal `format`. */
 void betl_tx_release_schema_named_leaf(struct ArrowSchema *sch);
 
@@ -76,6 +89,14 @@ int betl_tx_build_int64_filtered(struct ArrowArray *out,
                                  size_t n_kept);
 int betl_tx_build_utf8_filtered (struct ArrowArray *out,
                                  const struct ArrowArray *src,
+                                 const uint8_t *keep, size_t n_rows,
+                                 size_t n_kept);
+
+/* Same shape, but for any fixed-width primitive leaf (1/2/4/8-byte
+ * element). Element width given by `elem_size`. */
+int betl_tx_build_fixed_filtered(struct ArrowArray *out,
+                                 const struct ArrowArray *src,
+                                 size_t elem_size,
                                  const uint8_t *keep, size_t n_rows,
                                  size_t n_kept);
 

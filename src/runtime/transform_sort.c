@@ -196,7 +196,14 @@ static int sort_resolve(SortState *s) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = sch.children[i];
         const char *fmt = (c && c->format) ? c->format : NULL;
-        if (!fmt || (strcmp(fmt, "l") != 0 && strcmp(fmt, "u") != 0)) {
+        int is_fixed = fmt && betl_tx_fixed_width_for_fmt(fmt[0]) != 0
+                       && (fmt[0] == 'c' || fmt[0] == 'C' ||
+                           fmt[0] == 's' || fmt[0] == 'S' ||
+                           fmt[0] == 'i' || fmt[0] == 'I' ||
+                           fmt[0] == 'l' || fmt[0] == 'L' ||
+                           fmt[0] == 'f' || fmt[0] == 'g');
+        int is_utf8  = fmt && strcmp(fmt, "u") == 0;
+        if (!is_fixed && !is_utf8) {
             sset_err(s, "sort: input column '%s' has unsupported format '%s'",
                      (c && c->name) ? c->name : "?", fmt ? fmt : "(none)");
             ok = 0; break;
@@ -245,17 +252,21 @@ done:
 static int sort_grow_rows(SortState *s) {
     size_t nc = s->row_cap ? s->row_cap * 2 : 64;
     for (size_t c = 0; c < s->n_input_cols; ++c) {
-        if (s->col_fmts[c] == 'l') {
-            int64_t *p = realloc(s->i64_vals[c], nc * sizeof *p);
-            if (!p) return -1;
-            s->i64_vals[c] = p;
-        } else {
+        if (s->col_fmts[c] == 'u') {
             char **sp = realloc(s->u8_strs[c], nc * sizeof *sp);
             if (!sp) return -1;
             s->u8_strs[c] = sp;
             size_t *lp = realloc(s->u8_lens[c], nc * sizeof *lp);
             if (!lp) return -1;
             s->u8_lens[c] = lp;
+        } else {
+            /* All fixed-width types stash through the int64 slot: ints widen
+             * (signed extension for c/s/i/l, zero for C/S/I/L), floats are
+             * stored bit-for-bit via memcpy and reinterpreted at compare /
+             * emit time. */
+            int64_t *p = realloc(s->i64_vals[c], nc * sizeof *p);
+            if (!p) return -1;
+            s->i64_vals[c] = p;
         }
     }
     s->row_cap = nc;
@@ -266,9 +277,36 @@ static int sort_stash_cell(SortState *s, size_t c,
                            const struct ArrowArray *src,
                            size_t row_idx, size_t r) {
     size_t row = row_idx + (size_t)src->offset;
-    if (s->col_fmts[c] == 'l') {
-        s->i64_vals[c][r] = ((const int64_t *)src->buffers[1])[row];
-        return 0;
+    char fmt = s->col_fmts[c];
+    switch (fmt) {
+        case 'l':
+            s->i64_vals[c][r] = ((const int64_t *)src->buffers[1])[row]; return 0;
+        case 'L':
+            s->i64_vals[c][r] = (int64_t)((const uint64_t *)src->buffers[1])[row]; return 0;
+        case 'c':
+            s->i64_vals[c][r] = ((const int8_t   *)src->buffers[1])[row]; return 0;
+        case 'C':
+            s->i64_vals[c][r] = ((const uint8_t  *)src->buffers[1])[row]; return 0;
+        case 's':
+            s->i64_vals[c][r] = ((const int16_t  *)src->buffers[1])[row]; return 0;
+        case 'S':
+            s->i64_vals[c][r] = ((const uint16_t *)src->buffers[1])[row]; return 0;
+        case 'i':
+            s->i64_vals[c][r] = ((const int32_t  *)src->buffers[1])[row]; return 0;
+        case 'I':
+            s->i64_vals[c][r] = (int64_t)((const uint32_t *)src->buffers[1])[row]; return 0;
+        case 'g': {
+            double d = ((const double *)src->buffers[1])[row];
+            memcpy(&s->i64_vals[c][r], &d, sizeof d);
+            return 0;
+        }
+        case 'f': {
+            float f = ((const float *)src->buffers[1])[row];
+            double d = (double)f;
+            memcpy(&s->i64_vals[c][r], &d, sizeof d);
+            return 0;
+        }
+        default: break;
     }
     const int32_t *off = src->buffers[1];
     const char    *dat = src->buffers[2];
@@ -337,12 +375,19 @@ static int sort_cmp_rows(const void *a, const void *b) {
     for (size_t k = 0; k < s->n_keys; ++k) {
         SortKey *key = &s->keys[k];
         int dir = key->asc ? 1 : -1;
-        if (key->fmt == 'l') {
-            int64_t va = s->i64_vals[key->col_idx][ra];
-            int64_t vb = s->i64_vals[key->col_idx][rb];
+        char fmt = key->fmt;
+        if (fmt == 'f' || fmt == 'g') {
+            double va, vb;
+            memcpy(&va, &s->i64_vals[key->col_idx][ra], sizeof va);
+            memcpy(&vb, &s->i64_vals[key->col_idx][rb], sizeof vb);
             if (va < vb) return -1 * dir;
             if (va > vb) return  1 * dir;
-        } else {
+        } else if (fmt == 'L') {
+            uint64_t va = (uint64_t)s->i64_vals[key->col_idx][ra];
+            uint64_t vb = (uint64_t)s->i64_vals[key->col_idx][rb];
+            if (va < vb) return -1 * dir;
+            if (va > vb) return  1 * dir;
+        } else if (fmt == 'u') {
             const char *sa = s->u8_strs[key->col_idx][ra];
             const char *sb = s->u8_strs[key->col_idx][rb];
             size_t la = s->u8_lens[key->col_idx][ra];
@@ -351,6 +396,11 @@ static int sort_cmp_rows(const void *a, const void *b) {
             int c = memcmp(sa, sb, mn);
             if (c != 0) return c * dir;
             if (la != lb) return (la < lb ? -1 : 1) * dir;
+        } else {
+            int64_t va = s->i64_vals[key->col_idx][ra];
+            int64_t vb = s->i64_vals[key->col_idx][rb];
+            if (va < vb) return -1 * dir;
+            if (va > vb) return  1 * dir;
         }
     }
     if (ra < rb) return -1;
@@ -358,11 +408,45 @@ static int sort_cmp_rows(const void *a, const void *b) {
     return 0;
 }
 
-static int sort_build_int64(struct ArrowArray *out,
+/* Emit a fixed-width leaf in the original format. The int64 slot already
+ * holds the value (widened for narrow ints, memcpy'd bits for floats);
+ * we just narrow it back. */
+static int sort_build_fixed(struct ArrowArray *out, char fmt,
                             const int64_t *src, const size_t *order, size_t n) {
-    int64_t *vals = malloc((n ? n : 1) * sizeof *vals);
+    size_t w = betl_tx_fixed_width_for_fmt(fmt);
+    if (w == 0) return -1;
+    uint8_t *vals = malloc((n ? n : 1) * w);
     if (!vals) return -1;
-    for (size_t i = 0; i < n; ++i) vals[i] = src[order[i]];
+    for (size_t i = 0; i < n; ++i) {
+        int64_t v = src[order[i]];
+        switch (fmt) {
+            case 'l': case 'L': {
+                memcpy(vals + i * 8, &v, 8); break;
+            }
+            case 'c': case 'C': {
+                uint8_t b = (uint8_t)v;
+                vals[i] = b; break;
+            }
+            case 's': case 'S': {
+                uint16_t b = (uint16_t)v;
+                memcpy(vals + i * 2, &b, 2); break;
+            }
+            case 'i': case 'I': {
+                uint32_t b = (uint32_t)v;
+                memcpy(vals + i * 4, &b, 4); break;
+            }
+            case 'g': {
+                memcpy(vals + i * 8, &v, 8); break;
+            }
+            case 'f': {
+                double d;
+                memcpy(&d, &v, sizeof d);
+                float  f = (float)d;
+                memcpy(vals + i * 4, &f, 4); break;
+            }
+            default: free(vals); return -1;
+        }
+    }
     const void **bufs = malloc(2 * sizeof *bufs);
     if (!bufs) { free(vals); return -1; }
     bufs[0] = NULL; bufs[1] = vals;
@@ -370,7 +454,7 @@ static int sort_build_int64(struct ArrowArray *out,
     out->null_count = 0;
     out->n_buffers = 2;
     out->buffers = bufs;
-    out->release = betl_tx_release_int64_leaf;
+    out->release = betl_tx_release_int64_leaf;  /* free bufs[0,1] same shape */
     return 0;
 }
 
@@ -434,10 +518,11 @@ static int sort_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
     for (size_t c = 0; c < n_total; ++c) {
         kids[c] = calloc(1, sizeof **kids);
         int rc;
-        if (s->col_fmts[c] == 'l') {
-            rc = sort_build_int64(kids[c], s->i64_vals[c], order, n);
-        } else {
+        if (s->col_fmts[c] == 'u') {
             rc = sort_build_utf8(kids[c], s->u8_strs[c], s->u8_lens[c], order, n);
+        } else {
+            rc = sort_build_fixed(kids[c], s->col_fmts[c],
+                                  s->i64_vals[c], order, n);
         }
         if (!kids[c] || rc != 0) {
             free(kids[c]);
