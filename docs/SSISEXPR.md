@@ -80,20 +80,19 @@ underlying Arrow value kinds.
 | `DT_NUMERIC`     | `d:p,s` (decimal128) | decimal128 | int128 + scale. `(DT_NUMERIC, p, s)` cast accepts string / int / float / existing decimal (with rescale). `DT_DECIMAL` is an accepted alias. |
 | `DT_GUID`        | `w:16` (fixed_binary[16]) | uuid | 16 raw bytes; canonical `xxxxxxxx-xxxx-...` text form on cast to/from string. |
 | `DT_BYTES`       | `z` (binary) | bytes | Variable-length byte arrays. Lower-case hex on cast to/from string. `DT_IMAGE` is an accepted alias. |
+| `DT_DBTIME`      | `ttu` (time_us) | int64 | Time-of-day cast — parses `HH:MM:SS[.uuuuuu]` to int64 micros-of-day. Result is plain int64 (no distinct time kind), so stringifying via `(DT_WSTR)` gives the raw micros; pipe to a `ttu` sink for `HH:MM:SS` output. `DT_DBTIME2` is an accepted alias. |
 
 Time-zone-aware timestamps flow into the engine as the same int64
 microseconds-since-epoch UTC values as plain timestamps (Arrow
 `tsu:UTC`); the tz annotation lives on the schema, not the row data.
+`DT_DBTIMESTAMPOFFSET` is an accepted alias for `DT_DBTIMESTAMP`
+(the offset is normalised at provider boundary).
+
+`DT_NTEXT` is an accepted alias for `DT_WSTR`; `DT_TEXT` an alias
+for `DT_STR`.
 
 Not yet supported (the cast / typed-NULL will produce a parse error):
 
-- `DT_DBTIME` / `DT_DBTIME2` — time-of-day without a date. (The
-  underlying `ttu` columns do flow through the engine as int64
-  micros, but the `DT_DBTIME` cast syntax isn't wired yet. Use
-  `DATEPART("hour"/"minute"/"second", ts)` as the workaround.)
-- `DT_DBTIMESTAMPOFFSET` — distinct cast for the offset-aware type;
-  use `DT_DBTIMESTAMP` and read `tsu:UTC` columns as plain timestamps.
-- `DT_NTEXT` — treat as `DT_WSTR`.
 - `DT_DATE` (the obsolete float-of-days form) — use `DT_DBDATE`.
 
 ## Casts
@@ -247,11 +246,6 @@ for v2.
   now, expose project variables as pipeline parameters and reference
   them with `${params.foo}` substitution before the expression is
   compiled.
-- **`DT_DBTIME` / `DT_DBTIME2` casts.** Time columns flow through
-  the engine as int64 micros-of-day (Arrow `ttu`), but the
-  `(DT_DBTIME)` cast syntax isn't recognised. Workaround:
-  `DATEPART("hour"/"minute"/"second", ts)` for extraction; embed
-  in a timestamp for arithmetic.
 - **Bitwise operators** — `&` `|` `^` `<<` `>>`.
 - **Locale-aware parsing** — date / number parsers are ASCII /
   invariant-culture only. SSIS' `LocaleID` setting doesn't apply.

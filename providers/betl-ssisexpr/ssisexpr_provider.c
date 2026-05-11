@@ -71,6 +71,7 @@ typedef enum {
     DT_DBTIMESTAMP,     /* Arrow tsu: — micros since 1970-01-01 UTC, no tz */
     DT_DBTIMESTAMP2,    /* alias for DT_DBTIMESTAMP (SSIS distinguishes
                          * by precision; we treat both as us-precision) */
+    DT_DBTIME,          /* time-of-day; result is int64 micros-of-day */
     DT_NUMERIC,         /* Arrow d:p,s — int128 + (precision, scale) */
     DT_GUID,            /* Arrow w:16 — 16-byte UUID */
     DT_BYTES,           /* Arrow z — variable-length bytes */
@@ -520,10 +521,15 @@ static int parse_dt(const char *name, SsisDt *out) {
     else if (strcasecmp(name, "DT_R8")           == 0) { *out = DT_R8;           return 1; }
     else if (strcasecmp(name, "DT_BOOL")         == 0) { *out = DT_BOOL;         return 1; }
     else if (strcasecmp(name, "DT_WSTR")         == 0) { *out = DT_WSTR;         return 1; }
+    else if (strcasecmp(name, "DT_NTEXT")        == 0) { *out = DT_WSTR;         return 1; }
     else if (strcasecmp(name, "DT_STR")          == 0) { *out = DT_STR;          return 1; }
+    else if (strcasecmp(name, "DT_TEXT")         == 0) { *out = DT_STR;          return 1; }
     else if (strcasecmp(name, "DT_DBDATE")       == 0) { *out = DT_DBDATE;       return 1; }
     else if (strcasecmp(name, "DT_DBTIMESTAMP")  == 0) { *out = DT_DBTIMESTAMP;  return 1; }
     else if (strcasecmp(name, "DT_DBTIMESTAMP2") == 0) { *out = DT_DBTIMESTAMP2; return 1; }
+    else if (strcasecmp(name, "DT_DBTIMESTAMPOFFSET") == 0) { *out = DT_DBTIMESTAMP; return 1; }
+    else if (strcasecmp(name, "DT_DBTIME")       == 0) { *out = DT_DBTIME;       return 1; }
+    else if (strcasecmp(name, "DT_DBTIME2")      == 0) { *out = DT_DBTIME;       return 1; }
     else if (strcasecmp(name, "DT_NUMERIC")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_DECIMAL")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_GUID")         == 0) { *out = DT_GUID;         return 1; }
@@ -1568,6 +1574,38 @@ static int parse_iso_ts(const char *s, size_t n, int64_t *out_us) {
     return 0;
 }
 
+/* Parse HH:MM:SS[.uuuuuu] → int64 micros-of-day. Returns 0 on success. */
+static int parse_iso_time(const char *s, size_t n, int64_t *out_us) {
+    if (n < 8) return -1;
+    for (size_t i = 0; i < 8; ++i) {
+        char c = s[i];
+        int expect_digit = (i != 2 && i != 5);
+        if (expect_digit && !(c >= '0' && c <= '9')) return -1;
+        if (!expect_digit && c != ':') return -1;
+    }
+    int hh = (s[0]-'0')*10 + (s[1]-'0');
+    int mm = (s[3]-'0')*10 + (s[4]-'0');
+    int ss = (s[6]-'0')*10 + (s[7]-'0');
+    if (hh > 23 || mm > 59 || ss > 59) return -1;
+    int64_t us = (int64_t)hh * 3600000000LL
+               + (int64_t)mm * 60000000LL
+               + (int64_t)ss * 1000000LL;
+    if (n > 8) {
+        if (s[8] != '.') return -1;
+        if (n > 15) return -1;  /* >6 fractional digits */
+        int frac = 0; int mult = 100000;
+        for (size_t i = 9; i < n; ++i) {
+            char c = s[i];
+            if (c < '0' || c > '9') return -1;
+            frac += (c - '0') * mult;
+            mult /= 10;
+        }
+        us += frac;
+    }
+    *out_us = us;
+    return 0;
+}
+
 /* Format a date32 as YYYY-MM-DD. Returns bytes written (no NUL), or -1. */
 static int fmt_date_iso(int32_t days, char *buf, size_t cap) {
     int y = 0; unsigned m = 0, d = 0;
@@ -1853,6 +1891,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     int to_bool  = (dt == DT_BOOL);
     int to_date  = (dt == DT_DBDATE);
     int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2);
+    int to_time  = (dt == DT_DBTIME);
     int to_dec   = (dt == DT_NUMERIC);
     int to_uuid  = (dt == DT_GUID);
     int to_bytes = (dt == DT_BYTES);
@@ -1986,6 +2025,23 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             return 0;
         }
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
+    }
+    if (to_time) {
+        /* Result is int64 micros-of-day. The engine has no distinct
+         * time-of-day kind, so stringifying via (DT_WSTR) gives the raw
+         * micros — use DATEPART or pipe to a `ttu` sink for HH:MM:SS
+         * output. ttu source columns already arrive as int64 (see
+         * cache_schema), so (DT_DBTIME) on a time column is identity. */
+        out->kind = VK_INT64;
+        if (in->kind == VK_INT64) { out->i64 = in->i64; return 0; }
+        if (in->kind == VK_UTF8) {
+            int64_t us;
+            if (parse_iso_time(in->str, in->str_n, &us) != 0)
+                return eval_err(E, "cast string -> DT_DBTIME: expected HH:MM:SS[.uuuuuu]");
+            out->i64 = us;
+            return 0;
+        }
+        return eval_err(E, "cast non-string/non-int -> DT_DBTIME not supported");
     }
     if (to_bytes) {
         out->kind = VK_BYTES;

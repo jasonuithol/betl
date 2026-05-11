@@ -1152,6 +1152,79 @@ int main(int argc, char **argv) {
         eng->release(h);
     }
 
+    /* --- 39: DT_DBTIME cast ------------------------------------------- *
+     * Parses HH:MM:SS to int64 micros-of-day. */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DBTIME) \"12:34:56\"", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) {
+            /* 12*3600 + 34*60 + 56 = 45296 seconds → 45_296_000_000 us */
+            CHECK(get_i64(&out, 0) == 45296000000LL);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* With fractional seconds. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DBTIME) \"00:00:01.500000\"", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 1500000LL);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* DT_DBTIME2 is an alias. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DBTIME2) \"23:59:59\"", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) {
+            CHECK(get_i64(&out, 0) == 86399000000LL);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Out-of-range rejects. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "(DT_DBTIME) \"25:00:00\"", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+
+    /* --- 40: DT_NTEXT / DT_DBTIMESTAMPOFFSET aliases ------------------ */
+    {
+        /* DT_NTEXT behaves as DT_WSTR. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_NTEXT) [id]", "u", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.n_buffers == 3) {
+            const int32_t *off = out.buffers[1];
+            const char    *dat = out.buffers[2];
+            CHECK(off[1] - off[0] == 1);
+            CHECK(dat[off[0]] == '0');
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* DT_DBTIMESTAMPOFFSET parses the same ISO timestamp form. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_DBTIMESTAMPOFFSET) \"2025-06-01 12:00:00\"", "tsu:", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int64_t *v = out.buffers[1];
+            /* 2025-06-01 12:00 UTC */
+            CHECK(v[0] == 1748779200000000LL);
+        }
+        if (out.release) out.release(&out);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;
