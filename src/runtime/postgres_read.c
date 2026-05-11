@@ -109,6 +109,8 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
 #define PG_OID_TIMESTAMPTZ 1184
 #define PG_OID_NUMERIC     1700
 #define PG_OID_UUID        2950
+#define PG_OID_FLOAT4      700
+#define PG_OID_FLOAT8      701
 
 /* Internal column-format tags. Map to Arrow leaf formats:
  *   'l' → "l"      'u' → "u"      'D' → "tdD"
@@ -120,6 +122,9 @@ static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     if (t == PG_OID_INT8 || t == PG_OID_INT4 || t == PG_OID_INT2) {
         *out = 'l'; return 0;
     }
+    if (t == PG_OID_FLOAT4 || t == PG_OID_FLOAT8) {
+        *out = 'g'; return 0;
+    }
     if (t == PG_OID_TEXT || t == PG_OID_VARCHAR || t == PG_OID_BPCHAR) {
         *out = 'u'; return 0;
     }
@@ -130,6 +135,10 @@ static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     if (t == PG_OID_UUID)        { *out = 'U'; return 0; }
     return -1;
 }
+
+/* Forward decl: lives further down with the rest of the leaf builders. */
+static uint8_t *pgr_build_validity(const uint8_t *nulls, size_t n,
+                                   int64_t *out_null_count);
 
 static void pgr_release_int64_leaf(struct ArrowArray *arr) {
     if (arr->n_buffers >= 2 && arr->buffers) {
@@ -165,6 +174,36 @@ static void pgr_release_uuid_leaf(struct ArrowArray *arr) {
     }
     free(arr->buffers);
     arr->release = NULL;
+}
+
+static void pgr_release_float64_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static int pgr_build_float64_leaf(struct ArrowArray *out,
+                                  const double *vals,
+                                  const uint8_t *nulls,
+                                  size_t n) {
+    double *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0.0 : vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = pgr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = pgr_release_float64_leaf;
+    return 0;
 }
 
 static void pgr_release_utf8_leaf(struct ArrowArray *arr) {
@@ -663,6 +702,7 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
         int owned_format = 0;
         switch (s->col_fmts[i]) {
             case 'l': fmt = "l";    break;
+            case 'g': fmt = "g";    break;
             case 'D': fmt = "tdD";  break;
             case 'T': fmt = "tsu:"; break;
             case 'Z': fmt = "tsu:UTC"; break;
@@ -758,12 +798,13 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
      * — both are int64 under the hood. */
     int64_t **i64_cols  = calloc((size_t)s->n_cols, sizeof *i64_cols);
     int32_t **d32_cols  = calloc((size_t)s->n_cols, sizeof *d32_cols);
+    double  **f64_cols  = calloc((size_t)s->n_cols, sizeof *f64_cols);
     betl_dec128 **d128_cols = calloc((size_t)s->n_cols, sizeof *d128_cols);
     uint8_t **uuid_cols = calloc((size_t)s->n_cols, sizeof *uuid_cols);
     const char ***u8s_cols = calloc((size_t)s->n_cols, sizeof *u8s_cols);
     size_t  **u8l_cols = calloc((size_t)s->n_cols, sizeof *u8l_cols);
     uint8_t **null_cols = calloc((size_t)s->n_cols, sizeof *null_cols);
-    if (!i64_cols || !d32_cols || !d128_cols || !uuid_cols
+    if (!i64_cols || !d32_cols || !f64_cols || !d128_cols || !uuid_cols
         || !u8s_cols || !u8l_cols || !null_cols) {
         betl_set_error(s->ctx, "postgres.read: out of memory");
         goto cleanup;
@@ -795,6 +836,12 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'U') {
             uuid_cols[c] = malloc((size_t)n_rows * 16);
             if (!uuid_cols[c]) {
+                betl_set_error(s->ctx, "postgres.read: out of memory");
+                goto cleanup;
+            }
+        } else if (s->col_fmts[c] == 'g') {
+            f64_cols[c] = malloc((size_t)n_rows * sizeof(double));
+            if (!f64_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
                 goto cleanup;
             }
@@ -876,6 +923,16 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                         "valid UUID", row, s->col_names[c], v);
                     goto cleanup;
                 }
+            } else if (s->col_fmts[c] == 'g') {
+                char *end = NULL;
+                double dv = strtod(v, &end);
+                if (end == v || *end != '\0') {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': '%s' is not a "
+                        "valid float", row, s->col_names[c], v);
+                    goto cleanup;
+                }
+                f64_cols[c][row] = dv;
             } else {
                 u8s_cols[c][row] = v;       /* borrowed from PGresult */
                 u8l_cols[c][row] = (size_t)PQgetlength(r, row, c);
@@ -905,6 +962,9 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'U') {
             brc = pgr_build_uuid_leaf(kids[c], uuid_cols[c],
                                       null_cols[c], (size_t)n_rows);
+        } else if (s->col_fmts[c] == 'g') {
+            brc = pgr_build_float64_leaf(kids[c], f64_cols[c],
+                                         null_cols[c], (size_t)n_rows);
         } else {
             brc = pgr_build_utf8_leaf(kids[c], u8s_cols[c], u8l_cols[c],
                                       null_cols[c], (size_t)n_rows);
@@ -959,6 +1019,10 @@ cleanup:
     if (uuid_cols) {
         for (int c = 0; c < s->n_cols; ++c) free(uuid_cols[c]);
         free(uuid_cols);
+    }
+    if (f64_cols) {
+        for (int c = 0; c < s->n_cols; ++c) free(f64_cols[c]);
+        free(f64_cols);
     }
     if (u8s_cols) {
         for (int c = 0; c < s->n_cols; ++c) free((void *)u8s_cols[c]);

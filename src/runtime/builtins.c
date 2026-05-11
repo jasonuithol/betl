@@ -141,6 +141,14 @@ static void release_array_uuid_leaf(struct ArrowArray *arr) {
     arr->release = NULL;
 }
 
+static void release_array_float64_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
 static void release_array_utf8_leaf(struct ArrowArray *arr) {
     /* utf8 leaf has 3 buffers: validity (may be NULL), int32 offsets,
      * raw byte data. */
@@ -773,6 +781,7 @@ typedef enum {
     CSV_T_DECIMAL128    = 5,  /* Arrow d:p,s — int128 + (precision, scale) */
     CSV_T_TIMESTAMP_TZ  = 6,  /* Arrow tsu:UTC — int64 micros normalised to UTC */
     CSV_T_UUID          = 7,  /* Arrow w:16   — fixed 16 bytes per cell */
+    CSV_T_FLOAT64       = 8,  /* Arrow g      — 64-bit IEEE float */
 } CsvType;
 
 /* Per-column: schema fields (name, type) are set at init and live for
@@ -786,6 +795,7 @@ typedef struct {
     char    *fmt_string;     /* heap-owned: "d:p,s" for decimal cols, NULL otherwise */
     int64_t *i64_vals;       /* [row_cap] — int64 + timestamp_us */
     int32_t *d32_vals;       /* [row_cap] — date32 */
+    double  *f64_vals;       /* [row_cap] — float64 */
     betl_dec128 *d128_vals;  /* [row_cap] — decimal128 */
     uint8_t *uuid_vals;      /* [row_cap*16] — uuid */
     char   **u8_strs;        /* [row_cap] heap strings (NUL-terminated) */
@@ -1023,6 +1033,10 @@ static int csv_alloc_staging(CsvState *s) {
             uint8_t *p = realloc(col->uuid_vals, s->batch_size * 16);
             if (!p) return -1;
             col->uuid_vals = p;
+        } else if (col->type == CSV_T_FLOAT64) {
+            double *p = realloc(col->f64_vals, s->batch_size * sizeof *p);
+            if (!p) return -1;
+            col->f64_vals = p;
         } else {
             char **sp = realloc(col->u8_strs,
                                 s->batch_size * sizeof *sp);
@@ -1101,6 +1115,15 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
                 goto bad_field;
             }
             free(field);
+        } else if (col->type == CSV_T_FLOAT64) {
+            char *endp = NULL;
+            double v = strtod(field, &endp);
+            if (endp == field || *endp != '\0') {
+                free(field);
+                goto bad_field;
+            }
+            col->f64_vals[row_idx] = v;
+            free(field);
         } else {
             col->u8_strs[row_idx] = field;
             col->u8_lens[row_idx] = flen;
@@ -1146,6 +1169,7 @@ static void csv_state_clear_columns(CsvState *s) {
             free(col->d32_vals);
             free(col->d128_vals);
             free(col->uuid_vals);
+            free(col->f64_vals);
             if (col->u8_strs) {
                 for (size_t r = 0; r < s->n_rows; ++r) free(col->u8_strs[r]);
                 free(col->u8_strs);
@@ -1234,7 +1258,19 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     }
     CsvType t;
     int prec = 0, scale = 0;
+    /* Narrower integer widths are accepted for source-schema fidelity
+     * but widened to int64 in-memory. Target column widths are
+     * preserved at the DB level (e.g. pg INT2 still gets INT2 if the
+     * pipeline upserts into an INT2 column). */
     if      (strcmp(type, "int64")     == 0) t = CSV_T_INT64;
+    else if (strcmp(type, "int32")     == 0) t = CSV_T_INT64;
+    else if (strcmp(type, "int16")     == 0) t = CSV_T_INT64;
+    else if (strcmp(type, "int8")      == 0) t = CSV_T_INT64;
+    /* float32 widens to float64 in-memory (same in-memory layout in Arrow
+     * via the `g` leaf); the target column's REAL/FLOAT declaration
+     * preserves DB-level width. */
+    else if (strcmp(type, "float32")   == 0) t = CSV_T_FLOAT64;
+    else if (strcmp(type, "float64")   == 0) t = CSV_T_FLOAT64;
     else if (strcmp(type, "utf8")      == 0) t = CSV_T_UTF8;
     else if (strcmp(type, "date")      == 0) t = CSV_T_DATE32;
     else if (strcmp(type, "timestamp")   == 0) t = CSV_T_TIMESTAMP_US;
@@ -1261,8 +1297,8 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     }
     else {
         snprintf(c->err_msg, sizeof c->err_msg,
-                 "unsupported schema type '%s' (supported: int64, utf8, date, "
-                 "timestamp, decimal)", type);
+                 "unsupported schema type '%s' (supported: int8/16/32/64, "
+                 "utf8, date, timestamp, timestamptz, uuid, decimal)", type);
         free(name); free(type); c->err = 1; return -1;
     }
     free(type);
@@ -1453,6 +1489,7 @@ static const char *csv_format_for_col(const CsvCol *c) {
         case CSV_T_TIMESTAMP_TZ: return "tsu:UTC";
         case CSV_T_UTF8:         return "u";
         case CSV_T_UUID:         return "w:16";
+        case CSV_T_FLOAT64:      return "g";
         case CSV_T_DECIMAL128:   return c->fmt_string ? c->fmt_string : "u";
     }
     return "u";
@@ -1676,6 +1713,34 @@ static int csv_stream_get_next(struct ArrowArrayStream *st,
             kids[c]->n_buffers  = 2;
             kids[c]->buffers    = bufs;
             kids[c]->release    = release_array_decimal128_leaf;
+        } else if (s->cols[c].type == CSV_T_FLOAT64) {
+            double *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
+            if (!vals) {
+                free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            if (n > 0) memcpy(vals, s->cols[c].f64_vals,
+                              (size_t)n * sizeof *vals);
+            const void **bufs = malloc(2 * sizeof *bufs);
+            if (!bufs) {
+                free(vals); free(kids[c]);
+                for (size_t k = 0; k < c; ++k) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+                free(kids); return 1;
+            }
+            bufs[0] = NULL;
+            bufs[1] = vals;
+            kids[c]->length     = n;
+            kids[c]->null_count = 0;
+            kids[c]->n_buffers  = 2;
+            kids[c]->buffers    = bufs;
+            kids[c]->release    = release_array_float64_leaf;
         } else if (s->cols[c].type == CSV_T_UUID) {
             size_t bytes = (size_t)((n > 0 ? n : 1)) * 16;
             uint8_t *vals = malloc(bytes);
@@ -1898,6 +1963,11 @@ static int csv_write_render_cell(FILE *fp, char delim,
         return csv_write_utf8_cell(fp, delim, data + start,
                                    (size_t)(end - start));
     }
+    if (strcmp(fmt, "g") == 0) {
+        const double *vals = col->buffers[1];
+        if (fprintf(fp, "%.17g", vals[off]) < 0) return -1;
+        return 0;
+    }
     if (strcmp(fmt, "tdD") == 0) {
         const int32_t *vals = col->buffers[1];
         int y = 0; unsigned m = 0, d = 0;
@@ -1998,6 +2068,7 @@ static int csv_write_sink_run(void *state) {
     for (int64_t i = 0; i < n_cols; ++i) {
         const char *fmt = schema.children[i]->format;
         int ok = fmt && (strcmp(fmt, "l")        == 0 ||
+                         strcmp(fmt, "g")        == 0 ||
                          strcmp(fmt, "u")        == 0 ||
                          strcmp(fmt, "tdD")      == 0 ||
                          strcmp(fmt, "tsu:")     == 0 ||
