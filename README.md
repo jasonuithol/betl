@@ -89,13 +89,13 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 
 | Kind | Component | Status | Notes |
 |---|---|---|---|
-| SOURCE | `csv.read` | ✓ | Streaming; RFC 4180; types: int(8/16/32/64) / float(32/64) / utf8 / date / timestamp / timestamptz / time / uuid / decimal(p,s) |
-| SOURCE | `postgres.read` | ✓ | libpq cursor; int / text / float / DATE / TIMESTAMP[TZ] / TIME / NUMERIC / uuid; nulls supported |
-| SOURCE | `mssql.read` | ✓ | unixODBC + FreeTDS; int / varchar / float / DATE / DATETIME2 / DATETIMEOFFSET / TIME / DECIMAL / UNIQUEIDENTIFIER; nulls supported |
+| SOURCE | `csv.read` | ✓ | Streaming; RFC 4180; types: int(8/16/32/64) / float(32/64) / utf8 / date / timestamp / timestamptz / time / uuid / decimal(p,s) / binary (hex) |
+| SOURCE | `postgres.read` | ✓ | libpq cursor; int / text / float / DATE / TIMESTAMP[TZ] / TIME / NUMERIC / uuid / BYTEA; nulls supported |
+| SOURCE | `mssql.read` | ✓ | unixODBC + FreeTDS; int / varchar / float / DATE / DATETIME2 / DATETIMEOFFSET / TIME / DECIMAL / UNIQUEIDENTIFIER / VARBINARY; nulls supported |
 | SOURCE | `betl.gen_int64` / `betl.gen_strings` | ✓ | Test generators |
-| SINK | `csv.write` | ✓ | RFC 4180; renders all source types as ISO 8601 / canonical text |
-| SINK | `postgres.upsert` | ✓ | INSERT…ON CONFLICT; 4 conflict modes; binds every source type incl. NUMERIC / TIMESTAMPTZ / uuid / TIME |
-| SINK | `mssql.upsert` | ✓ | MERGE; 4 conflict modes; binds DATE / DATETIME2 / DATETIMEOFFSET / DECIMAL / UNIQUEIDENTIFIER / TIME via SQL_C_CHAR text |
+| SINK | `csv.write` | ✓ | RFC 4180; renders all source types as ISO 8601 / canonical text (binary as lower-case hex) |
+| SINK | `postgres.upsert` | ✓ | INSERT…ON CONFLICT; 4 conflict modes; binds every source type incl. NUMERIC / TIMESTAMPTZ / uuid / TIME / BYTEA |
+| SINK | `mssql.upsert` | ✓ | MERGE; 4 conflict modes; binds DATE / DATETIME2 / DATETIMEOFFSET / DECIMAL / UNIQUEIDENTIFIER / TIME via SQL_C_CHAR text; VARBINARY via SQL_C_BINARY |
 | SINK | `betl.count_rows` | ✓ | Smoke / assertion sink |
 | TRANSFORM | `filter` | ✓ | Predicate via the expression engine |
 | TRANSFORM | `map` | ✓ | `add:` (append) and `select:` (project / rename) |
@@ -120,8 +120,6 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 - No `pivot` / `unpivot` reshape, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
-- Binary / `BYTEA` columns. (Different Arrow leaf shape from
-  everything else; planned for v2.)
 - Narrow-width Arrow buffers. `int8`/`int16`/`int32`/`float32` are
   accepted in CSV schema and DB type-mapping but widened to int64 /
   float64 in-memory. Target column widths still round-trip correctly

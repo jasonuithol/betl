@@ -8,6 +8,7 @@
 
 #include "betl/provider.h"
 
+#include "runtime/binary_util.h"
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
 #include "runtime/literal_expr.h"
@@ -783,6 +784,7 @@ typedef enum {
     CSV_T_UUID          = 7,  /* Arrow w:16   — fixed 16 bytes per cell */
     CSV_T_FLOAT64       = 8,  /* Arrow g      — 64-bit IEEE float */
     CSV_T_TIME_US       = 9,  /* Arrow ttu    — int64 micros of day */
+    CSV_T_BINARY        = 10, /* Arrow z      — variable-length bytes */
 } CsvType;
 
 /* Per-column: schema fields (name, type) are set at init and live for
@@ -1038,6 +1040,18 @@ static int csv_alloc_staging(CsvState *s) {
             double *p = realloc(col->f64_vals, s->batch_size * sizeof *p);
             if (!p) return -1;
             col->f64_vals = p;
+        } else if (col->type == CSV_T_BINARY) {
+            /* Binary reuses the utf8 staging (heap buffers + length
+             * array) — same Arrow leaf shape, just a different format
+             * string and no UTF-8 validity requirement. */
+            char **sp = realloc(col->u8_strs,
+                                s->batch_size * sizeof *sp);
+            if (!sp) return -1;
+            col->u8_strs = sp;
+            size_t *lp = realloc(col->u8_lens,
+                                 s->batch_size * sizeof *lp);
+            if (!lp) return -1;
+            col->u8_lens = lp;
         } else {
             char **sp = realloc(col->u8_strs,
                                 s->batch_size * sizeof *sp);
@@ -1124,6 +1138,18 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
                 goto bad_field;
             }
             free(field);
+        } else if (col->type == CSV_T_BINARY) {
+            /* Decode bare lower/upper-case hex (e.g. "deadbeef") into
+             * a fresh heap buffer. Stored in the utf8 slot since the
+             * Arrow leaf shape is identical to u. */
+            size_t out_cap = flen / 2;
+            uint8_t *raw = malloc(out_cap ? out_cap : 1);
+            if (!raw) { free(field); goto bad_field; }
+            int nb = betl_hex_decode(field, flen, raw, out_cap);
+            if (nb < 0) { free(raw); free(field); goto bad_field; }
+            free(field);
+            col->u8_strs[row_idx] = (char *)raw;
+            col->u8_lens[row_idx] = (size_t)nb;
         } else if (col->type == CSV_T_FLOAT64) {
             char *endp = NULL;
             double v = strtod(field, &endp);
@@ -1144,10 +1170,11 @@ static int csv_parse_record_typed(CsvState *s, size_t rec_len,
     return 0;
 bad_field:
 bad_shape:
-    /* Free any utf8 cells we already wrote into this row before the
-     * error so the next attempt (or destroy) doesn't double-free. */
+    /* Free any utf8 / binary cells we already wrote into this row
+     * before the error so the next attempt (or destroy) doesn't
+     * double-free. Both share the u8_strs slot. */
     for (size_t k = 0; k < got; ++k) {
-        if (s->cols[k].type == CSV_T_UTF8) {
+        if (s->cols[k].type == CSV_T_UTF8 || s->cols[k].type == CSV_T_BINARY) {
             free(s->cols[k].u8_strs[row_idx]);
             s->cols[k].u8_strs[row_idx] = NULL;
         }
@@ -1155,12 +1182,13 @@ bad_shape:
     return -1;
 }
 
-/* Free per-row utf8 strings stored in the staging arrays for the
- * current batch, AFTER the Arrow leaf builder has copied them. */
+/* Free per-row utf8 / binary strings stored in the staging arrays for
+ * the current batch, AFTER the Arrow leaf builder has copied them. */
 static void csv_free_batch_strings(CsvState *s) {
     for (size_t c = 0; c < s->n_cols; ++c) {
         CsvCol *col = &s->cols[c];
-        if (col->type != CSV_T_UTF8 || !col->u8_strs) continue;
+        if ((col->type != CSV_T_UTF8 && col->type != CSV_T_BINARY)
+            || !col->u8_strs) continue;
         for (size_t r = 0; r < s->n_rows; ++r) {
             free(col->u8_strs[r]);
             col->u8_strs[r] = NULL;
@@ -1286,6 +1314,7 @@ static int csv_schema_visit(const char *value, size_t value_len, void *user) {
     else if (strcmp(type, "timestamptz") == 0) t = CSV_T_TIMESTAMP_TZ;
     else if (strcmp(type, "time")        == 0) t = CSV_T_TIME_US;
     else if (strcmp(type, "uuid")        == 0) t = CSV_T_UUID;
+    else if (strcmp(type, "binary")      == 0) t = CSV_T_BINARY;
     else if (strcmp(type, "decimal")     == 0) {
         t = CSV_T_DECIMAL128;
         /* Required: precision + scale ints in the same {} block. */
@@ -1501,6 +1530,7 @@ static const char *csv_format_for_col(const CsvCol *c) {
         case CSV_T_UTF8:         return "u";
         case CSV_T_UUID:         return "w:16";
         case CSV_T_FLOAT64:      return "g";
+        case CSV_T_BINARY:       return "z";
         case CSV_T_DECIMAL128:   return c->fmt_string ? c->fmt_string : "u";
     }
     return "u";
@@ -2051,6 +2081,22 @@ static int csv_write_render_cell(FILE *fp, char delim,
         if (betl_uuid_format(&vals[off * 16], buf, 36) < 0) return -1;
         return csv_write_utf8_cell(fp, delim, buf, 36);
     }
+    if (strcmp(fmt, "z") == 0) {
+        /* Variable-length binary: render as bare lower-case hex. */
+        const int32_t *offs = col->buffers[1];
+        const uint8_t *data = col->buffers[2];
+        int32_t start = offs[off];
+        int32_t end   = offs[off + 1];
+        size_t  len   = (size_t)(end - start);
+        if (len == 0) return csv_write_utf8_cell(fp, delim, "", 0);
+        char *hex = malloc(len * 2);
+        if (!hex) return -1;
+        int n = betl_hex_encode(data + start, len, hex, len * 2);
+        if (n < 0) { free(hex); return -1; }
+        int rc = csv_write_utf8_cell(fp, delim, hex, (size_t)n);
+        free(hex);
+        return rc;
+    }
     return -2; /* unsupported format */
 }
 
@@ -2094,6 +2140,7 @@ static int csv_write_sink_run(void *state) {
                          strcmp(fmt, "tsu:UTC")  == 0 ||
                          strcmp(fmt, "ttu")      == 0 ||
                          strcmp(fmt, "w:16")     == 0 ||
+                         strcmp(fmt, "z")        == 0 ||
                          strncmp(fmt, "d:", 2)   == 0);
         if (!ok) {
             betl_set_error(s->ctx,

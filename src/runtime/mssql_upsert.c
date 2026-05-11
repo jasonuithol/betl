@@ -30,6 +30,7 @@
 #include <sqltypes.h>
 
 #include "betl/provider.h"
+#include "runtime/binary_util.h"
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
 #include "runtime/uuid_util.h"
@@ -129,6 +130,7 @@ typedef enum {
     MS_DECIMAL128,
     MS_UUID,
     MS_TIME_US,
+    MS_BINARY,
     MS_UNSUPPORTED
 } MsColType;
 
@@ -143,6 +145,7 @@ static MsColType arrow_to_ms(const char *fmt) {
     if (strcmp(fmt, "tsu:UTC")  == 0) return MS_TIMESTAMP_TZ;
     if (strcmp(fmt, "w:16")     == 0) return MS_UUID;
     if (strcmp(fmt, "ttu")      == 0) return MS_TIME_US;
+    if (strcmp(fmt, "z")        == 0) return MS_BINARY;
     if (strncmp(fmt, "d:", 2)   == 0) return MS_DECIMAL128;
     return MS_UNSUPPORTED;
 }
@@ -477,6 +480,22 @@ static int ms_fill_cell(BetlContext *ctx,
         b->ind = (SQLLEN)n;
         return BETL_OK;
     }
+    case MS_BINARY: {
+        /* Copy the row's bytes into the bound scratch buffer. */
+        const int32_t *offs = col->buffers[1];
+        const uint8_t *data = col->buffers[2];
+        int32_t start = offs[off];
+        int32_t end   = offs[off + 1];
+        size_t  len   = (size_t)(end - start);
+        if (ensure_str_cap(b, len ? len : 1) != 0) {
+            betl_set_error(ctx, "mssql.upsert: OOM staging binary column '%s'",
+                           col_name);
+            return BETL_ERR_INTERNAL;
+        }
+        if (len > 0) memcpy(b->str_buf, data + start, len);
+        b->ind = (SQLLEN)len;
+        return BETL_OK;
+    }
     case MS_TIME_US: {
         const int64_t *vals = col->buffers[1];
         char tmp[20];
@@ -628,6 +647,14 @@ static int ms_bind_param(BetlContext *ctx, SQLHSTMT hstmt,
                               SQL_C_CHAR, SQL_TYPE_TIME, 16, 6,
                               b->str_buf, (SQLLEN)b->str_cap, &b->ind);
         break;
+    case MS_BINARY:
+        /* SQL_VARBINARY column-size hint of 8000 covers typical SQL
+         * Server VARBINARY(N); VARBINARY(MAX) works too — the driver
+         * uses the actual byte count via `ind`. */
+        rc = SQLBindParameter(hstmt, slot, SQL_PARAM_INPUT,
+                              SQL_C_BINARY, SQL_VARBINARY, 8000, 0,
+                              b->str_buf, (SQLLEN)b->str_cap, &b->ind);
+        break;
     case MS_UNSUPPORTED:
     default:
         betl_set_error(ctx,
@@ -739,7 +766,7 @@ static int ms_sink_run(void *state) {
          * non-NULL pointer. ms_fill_cell will grow it on demand. */
         if ((bufs[i].type == MS_UTF8 || bufs[i].type == MS_DECIMAL128
              || bufs[i].type == MS_TIMESTAMP_TZ || bufs[i].type == MS_UUID
-             || bufs[i].type == MS_TIME_US)
+             || bufs[i].type == MS_TIME_US     || bufs[i].type == MS_BINARY)
             && ensure_str_cap(&bufs[i], 64) != 0) {
             rc = BETL_ERR_INTERNAL;
             goto cleanup_pre;

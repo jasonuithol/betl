@@ -508,6 +508,15 @@ if(LIBPQ_FOUND)
         PASS_REGULAR_EXPRESSION "ok: pg_upsert uuid roundtrip test passed"
     )
 
+    # --- postgres.upsert BYTEA roundtrip test -------------------------------
+    add_executable(test_pg_upsert_binary test_pg_upsert_binary.c)
+    target_link_libraries(test_pg_upsert_binary PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_upsert_binary COMMAND test_pg_upsert_binary)
+    set_tests_properties(pg_upsert_binary PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_upsert binary roundtrip test passed"
+    )
+
     # --- postgres.read streaming stress test (no Lua) -----------------------
     # Verifies VmHWM stays bounded across a 2MB result set with a small
     # batch_size — proves the libpq cursor path actually streams rather

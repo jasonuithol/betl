@@ -110,6 +110,7 @@ add_library(betl_core STATIC
     src/runtime/connections.c
     src/runtime/context.c
     src/runtime/date_util.c
+    src/runtime/binary_util.c
     src/runtime/decimal_util.c
     src/runtime/exec.c
     src/runtime/uuid_util.c

@@ -26,6 +26,7 @@
 #include <sqlext.h>
 #include <sqltypes.h>
 
+#include "runtime/binary_util.h"
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
 #include "runtime/uuid_util.h"
@@ -139,6 +140,10 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
     case SQL_FLOAT:
     case SQL_DOUBLE:
         *out = 'g'; return 0;
+    case SQL_BINARY:
+    case SQL_VARBINARY:
+    case SQL_LONGVARBINARY:
+        *out = 'B'; return 0;
     case SQL_DECIMAL:
     case SQL_NUMERIC:
         *out = 'N'; return 0;
@@ -510,6 +515,15 @@ static int msr_resolve_schema(MsReadState *s) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
                 return -1;
             }
+        } else if (fmt == 'B') {
+            /* Binary reuses the utf8 staging slots (heap-owned buffer
+             * pointers + lengths) — same Arrow leaf shape. */
+            s->cols[c].u8_strs = calloc(s->batch_size, sizeof(char *));
+            s->cols[c].u8_lens = calloc(s->batch_size, sizeof(size_t));
+            if (!s->cols[c].u8_strs || !s->cols[c].u8_lens) {
+                betl_set_error(s->ctx, "mssql.read: out of memory");
+                return -1;
+            }
         } else {
             s->cols[c].u8_strs = calloc(s->batch_size, sizeof(char *));
             s->cols[c].u8_lens = calloc(s->batch_size, sizeof(size_t));
@@ -761,6 +775,7 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
             case 'Z': fmt = "tsu:UTC"; break;
             case 'M': fmt = "ttu"; break;
             case 'U': fmt = "w:16"; break;
+            case 'B': fmt = "z"; break;
             case 'N':
                 fmt = strdup(s->col_fmt_strings[i]);
                 owned = 1;
@@ -1025,6 +1040,59 @@ static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
             col->nulls[row]    = 0;
             col->i64_vals[row] = (int64_t)days * 86400000000LL + us_of_day;
         }
+        return 0;
+    }
+    if (s->col_fmts[c] == 'B') {
+        /* Binary varies in length; use SQL_C_BINARY with the same
+         * truncate-and-resize pattern as the SQL_C_CHAR utf8 path. */
+        SQLCHAR small[1024];
+        SQLLEN ind = 0;
+        SQLRETURN gr = SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                  SQL_C_BINARY, small, sizeof small, &ind);
+        if (!SQL_SUCCEEDED(gr)) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(binary) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row]   = 1;
+            col->u8_strs[row] = NULL;
+            col->u8_lens[row] = 0;
+            return 0;
+        }
+        size_t total_len = (size_t)ind;
+        uint8_t *dup = malloc(total_len ? total_len : 1);
+        if (!dup) {
+            betl_set_error(s->ctx, "mssql.read: out of memory");
+            return -1;
+        }
+        if (gr == SQL_SUCCESS) {
+            if (total_len > 0) memcpy(dup, small, total_len);
+        } else {
+            /* SUCCESS_WITH_INFO: small was truncated; SQL_C_BINARY
+             * doesn't NUL-terminate, so the full prefix fits. */
+            size_t got = sizeof small;
+            if (got > total_len) got = total_len;
+            memcpy(dup, small, got);
+            if (got < total_len) {
+                SQLLEN ind2 = 0;
+                SQLRETURN gr2 = SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                           SQL_C_BINARY, dup + got,
+                                           (SQLLEN)(total_len - got),
+                                           &ind2);
+                if (!SQL_SUCCEEDED(gr2)) {
+                    free(dup);
+                    betl_set_error(s->ctx,
+                        "mssql.read: SQLGetData(binary cont) col %d row %zu failed",
+                        (int)(c + 1), row);
+                    return -1;
+                }
+            }
+        }
+        col->nulls[row]   = 0;
+        col->u8_strs[row] = (char *)dup;
+        col->u8_lens[row] = total_len;
         return 0;
     }
     /* utf8 — handle truncation by re-reading the tail when the first

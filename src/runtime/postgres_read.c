@@ -28,6 +28,7 @@
 
 #include <libpq-fe.h>
 
+#include "runtime/binary_util.h"
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
 #include "runtime/uuid_util.h"
@@ -112,6 +113,7 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
 #define PG_OID_FLOAT4      700
 #define PG_OID_FLOAT8      701
 #define PG_OID_TIME        1083
+#define PG_OID_BYTEA       17
 
 /* Internal column-format tags. Map to Arrow leaf formats:
  *   'l' → "l"      'u' → "u"      'D' → "tdD"
@@ -135,6 +137,7 @@ static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
     if (t == PG_OID_TIME)        { *out = 'M'; return 0; }
     if (t == PG_OID_NUMERIC)     { *out = 'N'; return 0; }
     if (t == PG_OID_UUID)        { *out = 'U'; return 0; }
+    if (t == PG_OID_BYTEA)       { *out = 'B'; return 0; }
     return -1;
 }
 
@@ -710,6 +713,7 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
             case 'Z': fmt = "tsu:UTC"; break;
             case 'M': fmt = "ttu"; break;
             case 'U': fmt = "w:16"; break;
+            case 'B': fmt = "z"; break;
             case 'N':
                 /* Duplicate so the schema can outlive the source's state. */
                 fmt = strdup(s->col_fmt_strings[i]);
@@ -804,10 +808,16 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
     double  **f64_cols  = calloc((size_t)s->n_cols, sizeof *f64_cols);
     betl_dec128 **d128_cols = calloc((size_t)s->n_cols, sizeof *d128_cols);
     uint8_t **uuid_cols = calloc((size_t)s->n_cols, sizeof *uuid_cols);
+    /* Binary uses owned per-row heap buffers (we hex-decode out of the
+     * PGresult), with the same buffer-of-pointers layout the utf8 path
+     * borrows from. */
+    uint8_t ***bin_cols = calloc((size_t)s->n_cols, sizeof *bin_cols);
+    size_t  **bin_lens  = calloc((size_t)s->n_cols, sizeof *bin_lens);
     const char ***u8s_cols = calloc((size_t)s->n_cols, sizeof *u8s_cols);
     size_t  **u8l_cols = calloc((size_t)s->n_cols, sizeof *u8l_cols);
     uint8_t **null_cols = calloc((size_t)s->n_cols, sizeof *null_cols);
     if (!i64_cols || !d32_cols || !f64_cols || !d128_cols || !uuid_cols
+        || !bin_cols || !bin_lens
         || !u8s_cols || !u8l_cols || !null_cols) {
         betl_set_error(s->ctx, "postgres.read: out of memory");
         goto cleanup;
@@ -846,6 +856,13 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'g') {
             f64_cols[c] = malloc((size_t)n_rows * sizeof(double));
             if (!f64_cols[c]) {
+                betl_set_error(s->ctx, "postgres.read: out of memory");
+                goto cleanup;
+            }
+        } else if (s->col_fmts[c] == 'B') {
+            bin_cols[c] = calloc((size_t)n_rows, sizeof(uint8_t *));
+            bin_lens[c] = calloc((size_t)n_rows, sizeof(size_t));
+            if (!bin_cols[c] || !bin_lens[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
                 goto cleanup;
             }
@@ -937,6 +954,35 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                         "valid UUID", row, s->col_names[c], v);
                     goto cleanup;
                 }
+            } else if (s->col_fmts[c] == 'B') {
+                /* BYTEA in text mode comes back as "\xHEX...". Strip
+                 * the prefix and hex-decode. (bytea_output=escape
+                 * isn't supported — set bytea_output=hex if not
+                 * default; it has been the pg default since 9.0.) */
+                size_t vn = (size_t)PQgetlength(r, row, c);
+                if (vn < 2 || v[0] != '\\' || v[1] != 'x') {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': BYTEA value does "
+                        "not start with \\x (bytea_output must be 'hex')",
+                        row, s->col_names[c]);
+                    goto cleanup;
+                }
+                size_t bytes = (vn - 2) / 2;
+                uint8_t *raw = malloc(bytes ? bytes : 1);
+                if (!raw) {
+                    betl_set_error(s->ctx, "postgres.read: out of memory");
+                    goto cleanup;
+                }
+                int nb = betl_hex_decode(v + 2, vn - 2, raw, bytes);
+                if (nb < 0) {
+                    free(raw);
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': malformed BYTEA "
+                        "hex payload", row, s->col_names[c]);
+                    goto cleanup;
+                }
+                bin_cols[c][row] = raw;
+                bin_lens[c][row] = (size_t)nb;
             } else if (s->col_fmts[c] == 'g') {
                 char *end = NULL;
                 double dv = strtod(v, &end);
@@ -980,6 +1026,12 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         } else if (s->col_fmts[c] == 'g') {
             brc = pgr_build_float64_leaf(kids[c], f64_cols[c],
                                          null_cols[c], (size_t)n_rows);
+        } else if (s->col_fmts[c] == 'B') {
+            /* Arrow `z` and `u` share the same buffer layout
+             * (validity + int32 offsets + bytes), so the utf8
+             * builder works directly. */
+            brc = pgr_build_utf8_leaf(kids[c], (const char *const *)bin_cols[c],
+                                      bin_lens[c], null_cols[c], (size_t)n_rows);
         } else {
             brc = pgr_build_utf8_leaf(kids[c], u8s_cols[c], u8l_cols[c],
                                       null_cols[c], (size_t)n_rows);
@@ -1038,6 +1090,19 @@ cleanup:
     if (f64_cols) {
         for (int c = 0; c < s->n_cols; ++c) free(f64_cols[c]);
         free(f64_cols);
+    }
+    if (bin_cols) {
+        for (int c = 0; c < s->n_cols; ++c) {
+            if (bin_cols[c]) {
+                for (int row = 0; row < n_rows; ++row) free(bin_cols[c][row]);
+                free(bin_cols[c]);
+            }
+        }
+        free(bin_cols);
+    }
+    if (bin_lens) {
+        for (int c = 0; c < s->n_cols; ++c) free(bin_lens[c]);
+        free(bin_lens);
     }
     if (u8s_cols) {
         for (int c = 0; c < s->n_cols; ++c) free((void *)u8s_cols[c]);

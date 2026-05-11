@@ -79,6 +79,7 @@ underlying Arrow value kinds.
 | `DT_DBTIMESTAMP2`| `tsu:` (timestamp_us) | timestamp_us | Alias for `DT_DBTIMESTAMP`. |
 | `DT_NUMERIC`     | `d:p,s` (decimal128) | decimal128 | int128 + scale. `(DT_NUMERIC, p, s)` cast accepts string / int / float / existing decimal (with rescale). `DT_DECIMAL` is an accepted alias. |
 | `DT_GUID`        | `w:16` (fixed_binary[16]) | uuid | 16 raw bytes; canonical `xxxxxxxx-xxxx-...` text form on cast to/from string. |
+| `DT_BYTES`       | `z` (binary) | bytes | Variable-length byte arrays. Lower-case hex on cast to/from string. `DT_IMAGE` is an accepted alias. |
 
 Time-zone-aware timestamps flow into the engine as the same int64
 microseconds-since-epoch UTC values as plain timestamps (Arrow
@@ -92,8 +93,6 @@ Not yet supported (the cast / typed-NULL will produce a parse error):
   `DATEPART("hour"/"minute"/"second", ts)` as the workaround.)
 - `DT_DBTIMESTAMPOFFSET` — distinct cast for the offset-aware type;
   use `DT_DBTIMESTAMP` and read `tsu:UTC` columns as plain timestamps.
-- `DT_BYTES` / `DT_IMAGE` — binary columns; the Arrow `z` leaf shape
-  isn't plumbed yet.
 - `DT_NTEXT` — treat as `DT_WSTR`.
 - `DT_DATE` (the obsolete float-of-days form) — use `DT_DBDATE`.
 
@@ -254,9 +253,6 @@ for v2.
   `(DT_DBTIME)` cast syntax isn't recognised. Workaround:
   `DATEPART("hour"/"minute"/"second", ts)` for extraction; embed
   in a timestamp for arithmetic.
-- **Binary columns** (`DT_BYTES`, `DT_IMAGE`). The Arrow `z`
-  variable-length leaf shape isn't plumbed yet; read as `DT_WSTR`
-  via the source if you only need text comparisons.
 - **Bitwise operators** — `&` `|` `^` `<<` `>>`.
 - **`TOKEN(str, delim, n)`, `TOKENCOUNT(str, delim)`** — string
   splitting.

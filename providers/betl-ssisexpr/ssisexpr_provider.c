@@ -73,6 +73,7 @@ typedef enum {
                          * by precision; we treat both as us-precision) */
     DT_NUMERIC,         /* Arrow d:p,s — int128 + (precision, scale) */
     DT_GUID,            /* Arrow w:16 — 16-byte UUID */
+    DT_BYTES,           /* Arrow z — variable-length bytes */
 } SsisDt;
 
 typedef enum {
@@ -520,6 +521,8 @@ static int parse_dt(const char *name, SsisDt *out) {
     else if (strcasecmp(name, "DT_NUMERIC")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_DECIMAL")      == 0) { *out = DT_NUMERIC;      return 1; }
     else if (strcasecmp(name, "DT_GUID")         == 0) { *out = DT_GUID;         return 1; }
+    else if (strcasecmp(name, "DT_BYTES")        == 0) { *out = DT_BYTES;        return 1; }
+    else if (strcasecmp(name, "DT_IMAGE")        == 0) { *out = DT_BYTES;        return 1; }
     return 0;
 }
 
@@ -1089,6 +1092,7 @@ typedef enum {
     VK_TIMESTAMP_US,   /* int64 micros since 1970-01-01 UTC; stored in i64 */
     VK_DECIMAL128,     /* int128 fixed-scale; stored in d128 + dec_scale */
     VK_UUID,           /* 16 raw bytes; stored in `uuid` (zero-copy into batch) */
+    VK_BYTES,          /* variable-length binary; stored in `str` + `str_n` */
 } VKind;
 
 typedef struct {
@@ -1202,6 +1206,16 @@ static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, int dec_scale,
             out->uuid = &v[row * 16];     /* zero-copy into the batch */
             return 0;
         }
+        case 'B': {
+            /* Variable-length binary — same offsets/data layout as
+             * utf8, zero-copy into the input batch. */
+            const int32_t *off = col->buffers[1];
+            const char    *dat = col->buffers[2];
+            out->kind  = VK_BYTES;
+            out->str   = dat + off[row];
+            out->str_n = (size_t)(off[row + 1] - off[row]);
+            return 0;
+        }
         default:
             return eval_err(E, "unsupported column format '%c'", col_fmt);
     }
@@ -1294,6 +1308,15 @@ static int cmp_values(Eval *E, const Value *a, const Value *b, int *out_cmp) {
     if (a->kind == VK_UUID && b->kind == VK_UUID) {
         int c = memcmp(a->uuid, b->uuid, 16);
         *out_cmp = c < 0 ? -1 : (c > 0 ? 1 : 0);
+        return 0;
+    }
+    /* Binary equality / ordering: lexicographic byte compare. */
+    if (a->kind == VK_BYTES && b->kind == VK_BYTES) {
+        size_t m = a->str_n < b->str_n ? a->str_n : b->str_n;
+        int c = m ? memcmp(a->str, b->str, m) : 0;
+        if (c != 0) { *out_cmp = c < 0 ? -1 : 1; return 0; }
+        if (a->str_n == b->str_n) { *out_cmp = 0; return 0; }
+        *out_cmp = a->str_n < b->str_n ? -1 : 1;
         return 0;
     }
     /* Decimal vs decimal — direct compare with scale promotion. */
@@ -1698,6 +1721,7 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     int to_ts    = (dt == DT_DBTIMESTAMP || dt == DT_DBTIMESTAMP2);
     int to_dec   = (dt == DT_NUMERIC);
     int to_uuid  = (dt == DT_GUID);
+    int to_bytes = (dt == DT_BYTES);
 
     if (to_int) {
         out->kind = VK_INT64;
@@ -1769,6 +1793,23 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
         else if (in->kind == VK_UUID) {
             n = format_uuid(in->uuid, buf, sizeof buf);
         }
+        else if (in->kind == VK_BYTES) {
+            /* Hex-encode into a fresh scratch buffer. Skip the stack
+             * 64-byte path — payloads may be larger. */
+            size_t need = in->str_n * 2;
+            char *cp = malloc(need + 1);
+            if (!cp) return eval_err(E, "out of memory");
+            static const char hex[] = "0123456789abcdef";
+            for (size_t i = 0; i < in->str_n; ++i) {
+                uint8_t bb = (uint8_t)in->str[i];
+                cp[i*2]     = hex[bb >> 4];
+                cp[i*2 + 1] = hex[bb & 0xF];
+            }
+            cp[need] = '\0';
+            if (scratch_add(E->scratch, cp) != 0) return eval_err(E, "out of memory");
+            out->str = cp; out->str_n = need;
+            return 0;
+        }
         if (n < 0 || (size_t)n >= sizeof buf) return eval_err(E, "cast -> string overflow");
         char *cp = malloc((size_t)n + 1);
         if (!cp) return eval_err(E, "out of memory");
@@ -1811,6 +1852,45 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             return 0;
         }
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
+    }
+    if (to_bytes) {
+        out->kind = VK_BYTES;
+        if (in->kind == VK_BYTES) {
+            out->str = in->str; out->str_n = in->str_n; return 0;
+        }
+        if (in->kind == VK_UTF8) {
+            /* Hex-decode the input string into a fresh scratch buffer. */
+            if ((in->str_n & 1u) != 0)
+                return eval_err(E, "cast string -> DT_BYTES: expected even-length hex");
+            size_t nb = in->str_n / 2;
+            uint8_t *buf = malloc(nb ? nb : 1);
+            if (!buf) return eval_err(E, "out of memory");
+            static const signed char hv[256] = {
+                ['0']= 0,['1']= 1,['2']= 2,['3']= 3,['4']= 4,
+                ['5']= 5,['6']= 6,['7']= 7,['8']= 8,['9']= 9,
+                ['a']=10,['b']=11,['c']=12,['d']=13,['e']=14,['f']=15,
+                ['A']=10,['B']=11,['C']=12,['D']=13,['E']=14,['F']=15,
+                /* zero-init for everything else means we need a guard */
+            };
+            for (size_t i = 0; i < nb; ++i) {
+                unsigned char h = (unsigned char)in->str[i*2];
+                unsigned char l = (unsigned char)in->str[i*2 + 1];
+                signed char hi = hv[h], lo = hv[l];
+                /* Distinguish "real 0 nibble" from "unset slot": only
+                 * literal '0' chars have value 0; everything else with
+                 * a 0 entry isn't a hex digit. */
+                if ((hi == 0 && h != '0') || (lo == 0 && l != '0')) {
+                    free(buf);
+                    return eval_err(E, "cast string -> DT_BYTES: non-hex char");
+                }
+                buf[i] = (uint8_t)((hi << 4) | lo);
+            }
+            if (scratch_add(E->scratch, (char *)buf) != 0)
+                return eval_err(E, "out of memory");
+            out->str = (const char *)buf; out->str_n = nb;
+            return 0;
+        }
+        return eval_err(E, "cast non-string -> DT_BYTES not supported");
     }
     if (to_uuid) {
         out->kind = VK_UUID;
@@ -2565,6 +2645,7 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
         else if (strcmp(fmt, "tsu:UTC") == 0) e->col_fmts[i] = 'T'; /* same int64 layout */
         else if (strcmp(fmt, "ttu") == 0)     e->col_fmts[i] = 'l'; /* time = int64 micros */
         else if (strcmp(fmt, "w:16") == 0)    e->col_fmts[i] = 'U';
+        else if (strcmp(fmt, "z") == 0)       e->col_fmts[i] = 'B';
         else if (strncmp(fmt, "d:", 2) == 0) {
             /* "d:precision,scale" — extract scale (precision is metadata). */
             int p = 0, s = 0;

@@ -33,6 +33,7 @@
 
 #include "betl/provider.h"
 #include "runtime/date_util.h"
+#include "runtime/binary_util.h"
 #include "runtime/decimal_util.h"
 #include "runtime/pg_sql.h"
 #include "runtime/uuid_util.h"
@@ -274,6 +275,7 @@ typedef enum {
     PG_DECIMAL128,
     PG_UUID,
     PG_TIME_US,
+    PG_BINARY,
     PG_UNSUPPORTED
 } PgColType;
 
@@ -288,6 +290,7 @@ static PgColType arrow_to_pg(const char *fmt) {
     if (strcmp(fmt, "tsu:UTC") == 0) return PG_TIMESTAMP_US;  /* UTC-pinned */
     if (strcmp(fmt, "w:16")    == 0) return PG_UUID;
     if (strcmp(fmt, "ttu")     == 0) return PG_TIME_US;
+    if (strcmp(fmt, "z")       == 0) return PG_BINARY;
     if (strncmp(fmt, "d:", 2)  == 0) return PG_DECIMAL128;
     return PG_UNSUPPORTED;
 }
@@ -410,6 +413,22 @@ static int render_cell(const struct ArrowArray *col, PgColType type,
         char *str = malloc((size_t)n + 1);
         if (!str) return -2;
         memcpy(str, buf, (size_t)n + 1);
+        *out = str;
+        return 0;
+    }
+    case PG_BINARY: {
+        /* "\xHEX..." text form for BYTEA params. */
+        const int32_t *offs = col->buffers[1];
+        const uint8_t *data = col->buffers[2];
+        int32_t start = offs[off];
+        int32_t end   = offs[off + 1];
+        size_t  len   = (size_t)(end - start);
+        char *str = malloc(2 + len * 2 + 1);
+        if (!str) return -2;
+        str[0] = '\\';
+        str[1] = 'x';
+        if (len > 0) betl_hex_encode(data + start, len, str + 2, len * 2);
+        str[2 + len * 2] = '\0';
         *out = str;
         return 0;
     }
