@@ -188,6 +188,9 @@ add_subdirectory(providers/betl-ssisexpr)
 enable_testing()
 add_subdirectory(tests)
 
+# --- Benchmarks ------------------------------------------------------------
+add_subdirectory(bench)
+
 # --- Install ---------------------------------------------------------------
 include(GNUInstallDirs)
 install(TARGETS betl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

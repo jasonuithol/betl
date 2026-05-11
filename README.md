@@ -141,6 +141,11 @@ Components don't need to be thread-safe themselves: each component's
 state is still touched by exactly one thread — the parallelism happens
 *between* components, on the edges.
 
+Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md);
+regenerate with `make bench`. Headline: a 4-stage CPU-bound chain
+hits ~3.5× speedup at default depth=4; trivial single-stage shapes
+are roughly flat (the handoff costs what the work is worth).
+
 ## Provider plugins
 
 The `betl-lua` and `betl-ssisexpr` engines (and any future plugin —

@@ -178,19 +178,23 @@ static void release_array_struct(struct ArrowArray *arr) {
  *  betl.gen_int64 — SOURCE                                         *
  *                                                                  *
  *  Config:                                                         *
- *    row_count  (int, required)   number of rows to emit           *
- *    column     (string, default "id")    column name              *
- *    start      (int, default 0)         first emitted value       *
+ *    row_count   (int, required)   number of rows to emit          *
+ *    column      (string, default "id")    column name             *
+ *    start       (int, default 0)         first emitted value      *
+ *    batch_size  (int, optional)   when set (>0), emit in batches  *
+ *                                  of this size; omit for the      *
+ *                                  legacy "one-batch" behaviour.   *
  *                                                                  *
- *  Output: struct array, single int64 child, all rows in one batch.*
+ *  Output: struct array, single int64 child.                       *
  * ============================================================== */
 
 typedef struct {
     BetlContext *ctx;
     int64_t      row_count;
     int64_t      start;
+    int64_t      batch_size;    /* 0 → emit all rows in one batch */
+    int64_t      emitted_rows;
     char        *column;
-    int          emitted;       /* 0 = not yet, 1 = batch sent */
     char         err[128];
 } GenState;
 
@@ -206,6 +210,16 @@ static int gen_init(BetlContext *ctx, const char *cfg, void **state) {
     }
     int64_t start;
     s->start = (json_int64(cfg, "start", &start) == 0) ? start : 0;
+
+    int64_t bs;
+    if (json_int64(cfg, "batch_size", &bs) == 0) {
+        if (bs <= 0) {
+            betl_set_error(ctx, "gen_int64: `batch_size` must be > 0");
+            free(s);
+            return BETL_ERR_INVALID;
+        }
+        s->batch_size = bs;
+    }
 
     char *col = NULL;
     if (json_string(cfg, "column", &col) == 0 && col) {
@@ -263,15 +277,19 @@ static int gen_stream_get_next(struct ArrowArrayStream *st,
     GenState *s = st->private_data;
     memset(out, 0, sizeof *out);
 
-    if (s->emitted) {
+    if (s->emitted_rows >= s->row_count) {
         /* Empty array signals end-of-stream: release == NULL. */
         return 0;
     }
 
-    int64_t  n   = s->row_count;
+    int64_t remaining = s->row_count - s->emitted_rows;
+    int64_t n = (s->batch_size > 0 && s->batch_size < remaining)
+                    ? s->batch_size
+                    : remaining;
     int64_t *vals = malloc((size_t)((n > 0 ? n : 1)) * sizeof *vals);
     if (!vals) return 1;
-    for (int64_t i = 0; i < n; ++i) vals[i] = s->start + i;
+    int64_t base = s->start + s->emitted_rows;
+    for (int64_t i = 0; i < n; ++i) vals[i] = base + i;
 
     /* Inner int64 leaf array. */
     struct ArrowArray *child = calloc(1, sizeof *child);
@@ -312,7 +330,7 @@ static int gen_stream_get_next(struct ArrowArrayStream *st,
     out->release    = release_array_struct;
     out->private_data = NULL;
 
-    s->emitted = 1;
+    s->emitted_rows += n;
     return 0;
 }
 
