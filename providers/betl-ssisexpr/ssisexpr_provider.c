@@ -17,9 +17,11 @@
  * batch scratch arena (owned by the engine, freed at evaluate exit).
  */
 
+#define _GNU_SOURCE             /* strtod_l / strtoll_l (glibc) */
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <locale.h>             /* newlocale, freelocale, strtod_l on glibc */
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1326,6 +1328,9 @@ typedef struct {
     const struct ArrowArray *batch;
     size_t                   row;
     ScratchStrs             *scratch;
+    /* Locale used by string→number runtime casts. (locale_t)0 means
+     * fall through to the C / POSIX locale. */
+    locale_t                 num_locale;
     char                     err[256];
 } Eval;
 
@@ -2168,7 +2173,9 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             size_t n = in->str_n < sizeof tmp - 1 ? in->str_n : sizeof tmp - 1;
             memcpy(tmp, in->str, n); tmp[n] = '\0';
             char *end = NULL; errno = 0;
-            long long parsed = strtoll(tmp, &end, 10);
+            long long parsed = E->num_locale
+                                   ? strtoll_l(tmp, &end, 10, E->num_locale)
+                                   : strtoll  (tmp, &end, 10);
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> int failed: '%s'", tmp);
             v = (int64_t)parsed;
         }
@@ -2218,7 +2225,9 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             size_t n = in->str_n < sizeof tmp - 1 ? in->str_n : sizeof tmp - 1;
             memcpy(tmp, in->str, n); tmp[n] = '\0';
             char *end = NULL; errno = 0;
-            double v = strtod(tmp, &end);
+            double v = E->num_locale
+                           ? strtod_l(tmp, &end, E->num_locale)
+                           : strtod  (tmp, &end);
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> float failed: '%s'", tmp);
             out->f64 = v;
         }
@@ -3227,6 +3236,10 @@ typedef struct {
     char        *col_fmts;
     int         *col_scales;     /* set for 'N' (decimal) columns; 0 elsewhere */
     size_t       n_cols;
+    /* Number-parse locale. Resolved at compile time from
+     * `$Package::LocaleID` (POSIX form like "de_DE.UTF-8"). Stays
+     * `(locale_t)0` — meaning fall through to C/POSIX — when not set. */
+    locale_t     num_locale;
     char         last_err[512];
 } SsisExpr;
 
@@ -3352,6 +3365,25 @@ static int ssisexpr_compile(BetlContext *ctx,
     }
     e->root = root;
     lex_free(&L);
+
+    /* Resolve `$Package::LocaleID` for locale-aware number parsing.
+     * The value should be a POSIX locale name (e.g. "de_DE.UTF-8");
+     * SSIS' integer LCID values aren't accepted in v1 — document the
+     * POSIX form and let users translate. */
+    const char *lid = betl_get_param(ctx, "$Package::LocaleID");
+    if (lid && *lid) {
+        locale_t loc = newlocale(LC_NUMERIC_MASK, lid, (locale_t)0);
+        if (loc == (locale_t)0) {
+            betl_set_error(ctx, "ssisexpr: unknown LocaleID '%s' "
+                                "(use a POSIX name like 'de_DE.UTF-8')", lid);
+            arena_free(&e->arena);
+            for (size_t i = 0; i < e->n_cols; ++i) free(e->col_names[i]);
+            free(e->col_names); free(e->col_fmts); free(e->col_scales); free(e);
+            return BETL_ERR_INVALID;
+        }
+        e->num_locale = loc;
+    }
+
     *out_handle = e;
     return BETL_OK;
 }
@@ -3364,6 +3396,7 @@ static void ssisexpr_release(void *handle) {
     free(e->col_names);
     free(e->col_fmts);
     free(e->col_scales);
+    if (e->num_locale) freelocale(e->num_locale);
     free(e);
 }
 
@@ -3550,7 +3583,7 @@ static int ssisexpr_evaluate(void *handle,
         .col_scales = e->col_scales, .n_cols = e->n_cols,
     };
     ScratchStrs S = {0};
-    Eval EV = { .batch = input_struct, .scratch = &S };
+    Eval EV = { .batch = input_struct, .scratch = &S, .num_locale = e->num_locale };
 
     for (size_t r = 0; r < length; ++r) {
         if (betl_should_cancel(e->ctx)) {

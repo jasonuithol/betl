@@ -251,13 +251,30 @@ Each part has full-name + short-form aliases matching SSIS / T-SQL:
 The `millisecond` / `microsecond` / `nanosecond` parts are not yet
 implemented.
 
-## Not yet supported
+## Locale-aware number parsing
 
-These tend to be the high-value migration blockers. They're tracked
-for v2.
+String → number runtime casts (`(DT_I*) "..."` and `(DT_R*) "..."`)
+honour the `$Package::LocaleID` pipeline parameter. The value must be
+a **POSIX locale name** like `"de_DE.UTF-8"`; SSIS' integer LCID
+values aren't accepted in v1.
 
-- **Locale-aware parsing** — date / number parsers are ASCII /
-  invariant-culture only. SSIS' `LocaleID` setting doesn't apply.
+```yaml
+parameters:
+  - { name: "$Package::LocaleID", value: "de_DE.UTF-8" }
+```
+
+With that set, `(DT_R8) "1.234,56"` parses as `1234.56`. Without it,
+parsing falls back to the C / POSIX locale (`.` decimal, no group
+separator). An unknown locale name fails at compile time so the
+pipeline can't run with a silently-misinterpreted value.
+
+**Date parsing** stays ISO-only — the `(DT_DBDATE)` / `(DT_DBTIMESTAMP)`
+casts always expect `YYYY-MM-DD[ HH:MM:SS]`. Locale-aware date
+parsing is deferred.
+
+`(DT_NUMERIC, p, s) "..."` is intentionally **not** locale-aware: the
+decimal literal parser always reads `.` as the point so the wire
+format for decimals stays portable.
 
 ## Error handling
 

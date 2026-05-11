@@ -1653,6 +1653,43 @@ int main(int argc, char **argv) {
         eng->release(h);
     }
 
+    /* --- 47: locale-aware number parsing ------------------------------ *
+     * $Package::LocaleID gates string→number runtime casts. POSIX-name
+     * locales only; SSIS' integer LCIDs aren't accepted. */
+    {
+        /* Unknown locale → compile-time error. */
+        rc = betl_context_set_param(ctx, "$Package::LocaleID",
+                                    "definitely-not-a-locale");
+        CHECK(rc == BETL_OK);
+        void *h = NULL;
+        rc = eng->compile(ctx, "(DT_R8) \"1.0\"", &schema, &h);
+        CHECK(rc != BETL_OK);
+        CHECK(h == NULL);
+    }
+    {
+        /* C locale: parsing unchanged from default (decimal '.'). */
+        rc = betl_context_set_param(ctx, "$Package::LocaleID", "C");
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_R8) \"3.5\"", "g", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const double *v = out.buffers[1];
+            CHECK(v[0] == 3.5);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* Same locale, int parse. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_I8) \"-42\"", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == -42);
+        if (out.release) out.release(&out);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;
