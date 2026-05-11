@@ -106,6 +106,8 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 | TRANSFORM | `distinct` | ✓ | Drop duplicate rows; optional `keys:` subset |
 | TRANSFORM | `limit` | ✓ | Keep first N rows |
 | TRANSFORM | `conditional_split` | ✓ | Multi-output router; `from: split:case_name` |
+| TRANSFORM | `unpivot` | ✓ | Wide → long; `value_cols` collapse into `name_col`/`value_col` |
+| TRANSFORM | `pivot` | ✓ | Long → wide on declared `pivot_keys`; sorted-input contract |
 | TRANSFORM | `postgres.lookup` | ✓ | Cached SELECT + linear probe; on_miss error/null/drop |
 | TRANSFORM | `mssql.lookup` | ✓ | Same model over ODBC |
 | TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return |
@@ -117,13 +119,9 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 ### Missing on purpose at v0.1
 
 - No `parquet.*`, no `kafka.*`.
-- No `pivot` / `unpivot` reshape, no window functions.
+- No window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
-- Narrow-width Arrow buffers. `int8`/`int16`/`int32`/`float32` are
-  accepted in CSV schema and DB type-mapping but widened to int64 /
-  float64 in-memory. Target column widths still round-trip correctly
-  because the DB driver coerces on insert.
 
 ## Pipeline parallelism
 

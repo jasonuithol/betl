@@ -293,6 +293,14 @@ set_tests_properties(csv_read PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: csv.read v2 end-to-end test passed"
 )
 
+# --- pivot / unpivot transforms ---------------------------------------------
+add_executable(test_pivot_unpivot test_pivot_unpivot.c)
+target_link_libraries(test_pivot_unpivot PRIVATE betl_core)
+add_test(NAME pivot_unpivot COMMAND test_pivot_unpivot)
+set_tests_properties(pivot_unpivot PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: pivot/unpivot tests passed"
+)
+
 # --- csv.write end-to-end ---------------------------------------------------
 # No Lua dependency: the test pipelines are gen_int64 / gen_strings → csv.write,
 # and the assertions compare exact file bytes after the pipeline runs.
