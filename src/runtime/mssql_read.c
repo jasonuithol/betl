@@ -26,6 +26,8 @@
 #include <sqlext.h>
 #include <sqltypes.h>
 
+#include "runtime/date_util.h"
+
 #include "betl/provider.h"
 
 /* ============================================================== *
@@ -118,6 +120,12 @@ static int sql_type_to_fmt(SQLSMALLINT t, char *out) {
     case SQL_WVARCHAR:
     case SQL_WLONGVARCHAR:
         *out = 'u'; return 0;
+    case SQL_TYPE_DATE:          /* MSSQL DATE */
+    case SQL_DATE:               /* older ODBC alias */
+        *out = 'D'; return 0;
+    case SQL_TYPE_TIMESTAMP:     /* MSSQL DATETIME / DATETIME2 */
+    case SQL_TIMESTAMP:          /* older ODBC alias */
+        *out = 'T'; return 0;
     default:
         return -1;
     }
@@ -176,8 +184,10 @@ static void msr_release_schema_struct(struct ArrowSchema *sch) {
 
 typedef struct {
     /* Per-batch staging — capacity = batch_size; current row count
-     * tracked at the state level. */
+     * tracked at the state level. i64_vals is used for both 'l' and
+     * 'T' (timestamp_us); d32_vals for 'D'. */
     int64_t  *i64_vals;
+    int32_t  *d32_vals;
     char    **u8_strs;
     size_t   *u8_lens;
     uint8_t  *nulls;       /* 1 = null, 0 = valid */
@@ -334,6 +344,7 @@ static void msr_destroy(void *state) {
         msr_free_batch_strings(s);
         for (SQLSMALLINT c = 0; c < s->n_cols; ++c) {
             free(s->cols[c].i64_vals);
+            free(s->cols[c].d32_vals);
             free(s->cols[c].u8_strs);
             free(s->cols[c].u8_lens);
             free(s->cols[c].nulls);
@@ -391,7 +402,7 @@ static int msr_resolve_schema(MsReadState *s) {
         if (sql_type_to_fmt(sql_type, &fmt) != 0) {
             betl_set_error(s->ctx,
                 "mssql.read: column '%s' has unsupported SQL type %d "
-                "(v0.1: int family, char/varchar family)",
+                "(supported: int family, char/varchar family, date, datetime/datetime2)",
                 colname, (int)sql_type);
             return -1;
         }
@@ -407,9 +418,15 @@ static int msr_resolve_schema(MsReadState *s) {
             betl_set_error(s->ctx, "mssql.read: out of memory");
             return -1;
         }
-        if (fmt == 'l') {
+        if (fmt == 'l' || fmt == 'T') {
             s->cols[c].i64_vals = malloc(s->batch_size * sizeof(int64_t));
             if (!s->cols[c].i64_vals) {
+                betl_set_error(s->ctx, "mssql.read: out of memory");
+                return -1;
+            }
+        } else if (fmt == 'D') {
+            s->cols[c].d32_vals = malloc(s->batch_size * sizeof(int32_t));
+            if (!s->cols[c].d32_vals) {
                 betl_set_error(s->ctx, "mssql.read: out of memory");
                 return -1;
             }
@@ -467,6 +484,36 @@ static int msr_build_int64_leaf(struct ArrowArray *out,
     out->n_buffers  = 2;
     out->buffers    = bufs;
     out->release    = msr_release_int64_leaf;
+    return 0;
+}
+
+static void msr_release_date32_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static int msr_build_date32_leaf(struct ArrowArray *out,
+                                 const int32_t *vals,
+                                 const uint8_t *nulls,
+                                 size_t n) {
+    int32_t *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0 : vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = msr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = msr_release_date32_leaf;
     return 0;
 }
 
@@ -530,7 +577,13 @@ static int msr_stream_get_schema(struct ArrowArrayStream *st,
     struct ArrowSchema **kids = calloc((size_t)s->n_cols, sizeof *kids);
     if (!kids) return ENOMEM;
     for (SQLSMALLINT i = 0; i < s->n_cols; ++i) {
-        const char *fmt = (s->col_fmts[i] == 'l') ? "l" : "u";
+        const char *fmt = "u";
+        switch (s->col_fmts[i]) {
+            case 'l': fmt = "l";    break;
+            case 'D': fmt = "tdD";  break;
+            case 'T': fmt = "tsu:"; break;
+            default:  fmt = "u";    break;
+        }
         kids[i] = msr_new_leaf(s->col_names[i], fmt);
         if (!kids[i]) {
             for (SQLSMALLINT k = 0; k < i; ++k) {
@@ -567,6 +620,52 @@ static int msr_read_cell(MsReadState *s, SQLSMALLINT c, size_t row) {
         } else {
             col->nulls[row]    = 0;
             col->i64_vals[row] = (int64_t)v;
+        }
+        return 0;
+    }
+    if (s->col_fmts[c] == 'D') {
+        SQL_DATE_STRUCT ds = {0};
+        SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                      SQL_C_TYPE_DATE, &ds, sizeof ds, &ind))) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(date) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row]    = 1;
+            col->d32_vals[row] = 0;
+        } else {
+            col->nulls[row]    = 0;
+            col->d32_vals[row] = betl_days_from_civil(
+                (int)ds.year, (unsigned)ds.month, (unsigned)ds.day);
+        }
+        return 0;
+    }
+    if (s->col_fmts[c] == 'T') {
+        SQL_TIMESTAMP_STRUCT ts = {0};
+        SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(s->hstmt, (SQLUSMALLINT)(c + 1),
+                                      SQL_C_TYPE_TIMESTAMP, &ts, sizeof ts, &ind))) {
+            betl_set_error(s->ctx,
+                "mssql.read: SQLGetData(timestamp) col %d row %zu failed",
+                (int)(c + 1), row);
+            return -1;
+        }
+        if (ind == SQL_NULL_DATA) {
+            col->nulls[row]    = 1;
+            col->i64_vals[row] = 0;
+        } else {
+            int32_t days = betl_days_from_civil(
+                (int)ts.year, (unsigned)ts.month, (unsigned)ts.day);
+            /* ODBC ts.fraction is in nanoseconds; truncate to micros. */
+            int64_t us_of_day = (int64_t)ts.hour   * 3600000000LL
+                              + (int64_t)ts.minute *   60000000LL
+                              + (int64_t)ts.second *    1000000LL
+                              + (int64_t)ts.fraction / 1000LL;
+            col->nulls[row]    = 0;
+            col->i64_vals[row] = (int64_t)days * 86400000000LL + us_of_day;
         }
         return 0;
     }
@@ -667,9 +766,12 @@ static int msr_stream_get_next(struct ArrowArrayStream *st,
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
         int rc;
-        if (s->col_fmts[c] == 'l') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T') {
             rc = msr_build_int64_leaf(kids[c], s->cols[c].i64_vals,
                                       s->cols[c].nulls, (size_t)n);
+        } else if (s->col_fmts[c] == 'D') {
+            rc = msr_build_date32_leaf(kids[c], s->cols[c].d32_vals,
+                                       s->cols[c].nulls, (size_t)n);
         } else {
             rc = msr_build_utf8_leaf(kids[c], s->cols[c].u8_strs,
                                      s->cols[c].u8_lens,

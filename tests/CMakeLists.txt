@@ -350,6 +350,15 @@ if(ODBC_FOUND)
         )
     endif()
 
+    # --- mssql.read date / datetime2 integration test -----------------------
+    add_executable(test_mssql_read_date test_mssql_read_date.c)
+    target_link_libraries(test_mssql_read_date PRIVATE betl_core betl_odbc)
+    add_test(NAME mssql_read_date COMMAND test_mssql_read_date)
+    set_tests_properties(mssql_read_date PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: mssql_read date/timestamp integration test passed"
+    )
+
     # --- mssql.read streaming stress test (no Lua) --------------------------
     # Verifies VmHWM stays bounded across a 2MB result set with a small
     # batch_size — proves nothing along ODBC / FreeTDS silently buffers
