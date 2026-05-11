@@ -62,6 +62,10 @@ typedef enum {
     DT_I2,
     DT_I4,
     DT_I8,
+    DT_UI1,
+    DT_UI2,
+    DT_UI4,
+    DT_UI8,
     DT_R4,
     DT_R8,
     DT_BOOL,
@@ -550,6 +554,10 @@ static int parse_dt(const char *name, SsisDt *out) {
     else if (strcasecmp(name, "DT_I2")           == 0) { *out = DT_I2;           return 1; }
     else if (strcasecmp(name, "DT_I4")           == 0) { *out = DT_I4;           return 1; }
     else if (strcasecmp(name, "DT_I8")           == 0) { *out = DT_I8;           return 1; }
+    else if (strcasecmp(name, "DT_UI1")          == 0) { *out = DT_UI1;          return 1; }
+    else if (strcasecmp(name, "DT_UI2")          == 0) { *out = DT_UI2;          return 1; }
+    else if (strcasecmp(name, "DT_UI4")          == 0) { *out = DT_UI4;          return 1; }
+    else if (strcasecmp(name, "DT_UI8")          == 0) { *out = DT_UI8;          return 1; }
     else if (strcasecmp(name, "DT_R4")           == 0) { *out = DT_R4;           return 1; }
     else if (strcasecmp(name, "DT_R8")           == 0) { *out = DT_R8;           return 1; }
     else if (strcasecmp(name, "DT_BOOL")         == 0) { *out = DT_BOOL;         return 1; }
@@ -2027,7 +2035,8 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     (void)has_len; (void)len;
     memset(out, 0, sizeof *out);
     if (in->is_null) { out->is_null = 1; return 0; }
-    int to_int   = (dt == DT_I1 || dt == DT_I2 || dt == DT_I4 || dt == DT_I8);
+    int to_int   = (dt == DT_I1 || dt == DT_I2 || dt == DT_I4 || dt == DT_I8 ||
+                    dt == DT_UI1 || dt == DT_UI2 || dt == DT_UI4 || dt == DT_UI8);
     int to_float = (dt == DT_R4 || dt == DT_R8);
     int to_str   = (dt == DT_WSTR || dt == DT_STR);
     int to_bool  = (dt == DT_BOOL);
@@ -2039,30 +2048,54 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     int to_bytes = (dt == DT_BYTES);
 
     if (to_int) {
-        out->kind = VK_INT64;
-        if (in->kind == VK_INT64)        out->i64 = in->i64;
-        else if (in->kind == VK_FLOAT64) out->i64 = (int64_t)in->f64;
-        else if (in->kind == VK_BOOL)    out->i64 = in->b ? 1 : 0;
-        else if (in->kind == VK_TIME_US) out->i64 = in->i64;  /* raw micros-of-day */
+        int64_t v;
+        if (in->kind == VK_INT64)        v = in->i64;
+        else if (in->kind == VK_FLOAT64) v = (int64_t)in->f64;
+        else if (in->kind == VK_BOOL)    v = in->b ? 1 : 0;
+        else if (in->kind == VK_TIME_US) v = in->i64;  /* raw micros-of-day */
         else if (in->kind == VK_UTF8) {
             char tmp[64];
             size_t n = in->str_n < sizeof tmp - 1 ? in->str_n : sizeof tmp - 1;
             memcpy(tmp, in->str, n); tmp[n] = '\0';
             char *end = NULL; errno = 0;
-            long long v = strtoll(tmp, &end, 10);
+            long long parsed = strtoll(tmp, &end, 10);
             if (end == tmp || *end != '\0' || errno != 0) return eval_err(E, "cast string -> int failed: '%s'", tmp);
-            out->i64 = (int64_t)v;
+            v = (int64_t)parsed;
         }
         else if (in->kind == VK_DECIMAL128) {
             /* Truncate fractional part. */
-            i128 v = in->d128;
+            i128 dv = in->d128;
             int s = in->dec_scale;
-            int neg = (v < 0);
-            i128 mag = neg ? -v : v;
+            int neg = (dv < 0);
+            i128 mag = neg ? -dv : dv;
             for (int k = 0; k < s; ++k) mag /= 10;
-            out->i64 = neg ? -(int64_t)mag : (int64_t)mag;
+            v = neg ? -(int64_t)mag : (int64_t)mag;
         }
         else return eval_err(E, "cast date/timestamp -> int not supported");
+
+        /* Narrowing-range check: SSIS' (DT_Ix)/(DT_UIx) error on
+         * out-of-range values, so a betl pipeline gets the failure at
+         * the cast site rather than from a sink driver three steps down. */
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        switch (dt) {
+            case DT_I1:  lo = INT8_MIN;  hi = INT8_MAX;  break;
+            case DT_I2:  lo = INT16_MIN; hi = INT16_MAX; break;
+            case DT_I4:  lo = INT32_MIN; hi = INT32_MAX; break;
+            case DT_UI1: lo = 0; hi = UINT8_MAX;  break;
+            case DT_UI2: lo = 0; hi = UINT16_MAX; break;
+            case DT_UI4: lo = 0; hi = UINT32_MAX; break;
+            case DT_UI8: lo = 0; hi = INT64_MAX;  break;  /* in-memory int64 ceiling */
+            default: break;  /* DT_I8: no narrowing */
+        }
+        if (v < lo || v > hi)
+            return eval_err(E, "cast overflow: value %" PRId64 " out of range for %s",
+                            v,
+                            dt == DT_I1  ? "DT_I1"  : dt == DT_I2  ? "DT_I2"  :
+                            dt == DT_I4  ? "DT_I4"  : dt == DT_UI1 ? "DT_UI1" :
+                            dt == DT_UI2 ? "DT_UI2" : dt == DT_UI4 ? "DT_UI4" :
+                            dt == DT_UI8 ? "DT_UI8" : "DT_I8");
+        out->kind = VK_INT64;
+        out->i64 = v;
         return 0;
     }
     if (to_float) {

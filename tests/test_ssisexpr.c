@@ -1414,6 +1414,73 @@ int main(int argc, char **argv) {
         CHECK(h == NULL);
     }
 
+    /* --- 43: DT_Ix narrowing-range overflow checks -------------------- *
+     * SSIS errors on out-of-range narrowing; betl now matches. */
+    {
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_I2) 32767", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 32767);
+        if (out.release) out.release(&out);
+    }
+    {
+        void *h = NULL;
+        rc = eng->compile(ctx, "(DT_I2) 40000", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        void *h = NULL;
+        rc = eng->compile(ctx, "(DT_I1) (-129)", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        /* DT_UI1: [0, 255]. Negative is out of range. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "(DT_UI1) (-1)", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        /* DT_UI4 upper bound (UINT32_MAX) is in-range. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_UI4) 4294967295", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 4294967295LL);
+        if (out.release) out.release(&out);
+    }
+    {
+        /* DT_I4 with a string source: range still checked. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "(DT_I4) \"3000000000\"", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "l", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        /* DT_I8 has no narrowing — large value stays valid. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_I8) 4294967296", "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3) CHECK(get_i64(&out, 0) == 4294967296LL);
+        if (out.release) out.release(&out);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;
