@@ -176,6 +176,7 @@ set_target_properties(betl PROPERTIES ENABLE_EXPORTS ON)
 # registry load. The subdirectory may set BETL_LUA_FOUND / BETL_LUA_TARGET
 # in the parent scope so tests can gate on availability.
 add_subdirectory(providers/betl-lua)
+add_subdirectory(providers/betl-ssisexpr)
 
 # --- Tests -----------------------------------------------------------------
 enable_testing()

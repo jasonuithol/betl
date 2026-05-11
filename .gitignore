@@ -4,6 +4,9 @@ build-*/
 .cache/
 compile_commands.json
 
+# c-build analyze() forensic artifacts
+.forensics/
+
 # Editor / IDE
 .vscode/
 .idea/

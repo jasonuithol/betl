@@ -228,6 +228,24 @@ if(BETL_LUA_FOUND)
     )
 endif()
 
+# --- SSIS Expression Language engine ----------------------------------------
+# The provider is built in providers/betl-ssisexpr. It is self-contained
+# (no external runtime), so the gating is always-true here — kept as a
+# parallel form to the lua block so future tooling can ignore it the
+# same way.
+if(BETL_SSISEXPR_FOUND)
+    add_executable(test_ssisexpr test_ssisexpr.c)
+    target_link_libraries(test_ssisexpr PRIVATE betl_core)
+    set_target_properties(test_ssisexpr PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_ssisexpr PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_SSISEXPR_TARGET}>"
+    )
+    add_dependencies(test_ssisexpr ${BETL_SSISEXPR_TARGET})
+    add_test(NAME ssisexpr
+        COMMAND test_ssisexpr $<TARGET_FILE:${BETL_SSISEXPR_TARGET}>
+    )
+endif()
+
 # --- pipeline parallelism (async_stream wrapper) ----------------------------
 # Same canonical pipeline run with three queue depths to stress the
 # producer/consumer sync. Registered three times with distinct env vars
