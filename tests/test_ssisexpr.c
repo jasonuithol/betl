@@ -1538,6 +1538,121 @@ int main(int argc, char **argv) {
         if (out.release) out.release(&out);
     }
 
+    /* --- 45: narrow-width Arrow output buffers ----------------------- *
+     * Requesting desired_format "c"/"s"/"i" produces a native int8 /
+     * int16 / int32 buffer. Range checks enforced at store time. */
+    {
+        /* int8 output, in-range. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch, "[id] + 10", "c", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int8_t *v = out.buffers[1];
+            CHECK(v[0] == 10 && v[1] == 11 && v[2] == 12);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* int8 overflow at store time. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "[id] + 200", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "c", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        /* uint8 — negative rejected. */
+        void *h = NULL;
+        rc = eng->compile(ctx, "[id] - 1", &schema, &h);
+        CHECK(rc == BETL_OK);
+        struct ArrowArray out = {0};
+        rc = eng->evaluate(h, &batch, "C", &out);
+        CHECK(rc != BETL_OK);
+        eng->release(h);
+    }
+    {
+        /* int16 output. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch, "[id] * 1000", "s", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int16_t *v = out.buffers[1];
+            CHECK(v[0] == 0 && v[1] == 1000 && v[2] == 2000);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* int32 output. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "[id] * 1000000", "i", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int32_t *v = out.buffers[1];
+            CHECK(v[0] == 0 && v[1] == 1000000 && v[2] == 2000000);
+        }
+        if (out.release) out.release(&out);
+    }
+    {
+        /* float32 output — verify width and value. */
+        struct ArrowArray out = {0};
+        rc = compile_eval(eng, ctx, &schema, &batch,
+                          "(DT_R4) [id] + 0.5", "f", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const float *v = out.buffers[1];
+            CHECK(v[0] == 0.5f && v[1] == 1.5f && v[2] == 2.5f);
+        }
+        if (out.release) out.release(&out);
+    }
+
+    /* --- 46: narrow-width Arrow input columns ------------------------ *
+     * Build a synthetic batch whose `id` column is int16 (Arrow `s`).
+     * Expressions read it transparently via widening. */
+    {
+        struct ArrowSchema xs = {0};
+        struct ArrowSchema xs_id = {0};
+        struct ArrowSchema xs_name = {0};
+        struct ArrowSchema *xs_kids[] = { &xs_id, &xs_name };
+
+        xs.format = "+s"; xs.n_children = 2; xs.children = xs_kids;
+        xs_id.format = "s"; xs_id.name = "id";
+        xs_name.format = "u"; xs_name.name = "name";
+
+        int16_t   id_data[3] = { -100, 200, 30000 };
+        int32_t   off_data[4] = { 0, 1, 2, 3 };
+        const char *name_data = "abc";
+        const void *id_bufs[]    = { NULL, id_data };
+        const void *name_bufs[]  = { NULL, off_data, name_data };
+
+        struct ArrowArray id_a = {0};
+        id_a.length = 3; id_a.n_buffers = 2; id_a.buffers = id_bufs;
+        struct ArrowArray name_a = {0};
+        name_a.length = 3; name_a.n_buffers = 3; name_a.buffers = name_bufs;
+
+        struct ArrowArray b = {0};
+        struct ArrowArray *kids[] = { &id_a, &name_a };
+        b.length = 3; b.n_buffers = 1; b.n_children = 2;
+        const void *root_bufs[] = { NULL };
+        b.buffers  = root_bufs;
+        b.children = kids;
+
+        struct ArrowArray out = {0};
+        void *h = NULL;
+        rc = eng->compile(ctx, "[id] * 2", &xs, &h);
+        CHECK(rc == BETL_OK);
+        rc = eng->evaluate(h, &b, "l", &out);
+        CHECK(rc == BETL_OK);
+        if (out.length == 3 && out.buffers[1]) {
+            const int64_t *v = out.buffers[1];
+            CHECK(v[0] == -200 && v[1] == 400 && v[2] == 60000);
+        }
+        if (out.release) out.release(&out);
+        eng->release(h);
+    }
+
     /* --- 21: syntax error at compile time ----------------------------- */
     {
         void *h = NULL;

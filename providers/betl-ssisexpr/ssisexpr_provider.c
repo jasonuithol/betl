@@ -1001,19 +1001,31 @@ typedef enum {
     LM_T_INT64 = 1, LM_T_UTF8 = 2, LM_T_BOOL = 3, LM_T_FLOAT64 = 4,
     LM_T_DATE32 = 5,      /* Arrow tdD — int32 days since 1970-01-01 */
     LM_T_TIMESTAMP_US = 6, /* Arrow tsu: — int64 micros since 1970-01-01 */
+    LM_T_INT8 = 7,        /* Arrow c  — int8  */
+    LM_T_UINT8 = 8,       /* Arrow C  — uint8 */
+    LM_T_INT16 = 9,       /* Arrow s  — int16 */
+    LM_T_UINT16 = 10,     /* Arrow S  — uint16 */
+    LM_T_INT32 = 11,      /* Arrow i  — int32 */
+    LM_T_UINT32 = 12,     /* Arrow I  — uint32 */
+    LM_T_UINT64 = 13,     /* Arrow L  — uint64; storage shares i64_vals */
+    LM_T_FLOAT32 = 14,    /* Arrow f  — float32 */
 } LmType;
 
 typedef struct {
     LmType   type;
     uint8_t *nulls;
-    int64_t *i64_vals;      /* used by INT64 and TIMESTAMP_US */
+    int64_t *i64_vals;      /* used by INT64, UINT64, TIMESTAMP_US */
     double  *f64_vals;
+    float   *f32_vals;      /* used by FLOAT32 */
     int32_t *u8_offsets;
     char    *u8_data;
     size_t   u8_len;
     size_t   u8_cap;
     uint8_t *b_vals;
     int32_t *d32_vals;      /* used by DATE32 */
+    int8_t  *i8_vals;       /* used by INT8 / UINT8 (sign is interpretation-only) */
+    int16_t *i16_vals;      /* used by INT16 / UINT16 */
+    int32_t *i32_vals;      /* used by INT32 / UINT32 */
 } LmCol;
 
 static int lm_col_init(LmCol *c, LmType type, size_t length) {
@@ -1021,28 +1033,41 @@ static int lm_col_init(LmCol *c, LmType type, size_t length) {
     c->type  = type;
     c->nulls = calloc(length ? length : 1, sizeof *c->nulls);
     if (!c->nulls) return -1;
-    if (type == LM_T_INT64 || type == LM_T_TIMESTAMP_US) {
-        c->i64_vals = calloc(length ? length : 1, sizeof *c->i64_vals);
-        if (!c->i64_vals) { free(c->nulls); c->nulls = NULL; return -1; }
-    } else if (type == LM_T_FLOAT64) {
-        c->f64_vals = calloc(length ? length : 1, sizeof *c->f64_vals);
-        if (!c->f64_vals) { free(c->nulls); c->nulls = NULL; return -1; }
-    } else if (type == LM_T_UTF8) {
-        c->u8_offsets = calloc(length + 1, sizeof *c->u8_offsets);
-        if (!c->u8_offsets) { free(c->nulls); c->nulls = NULL; return -1; }
-        c->u8_cap = 64;
-        c->u8_data = malloc(c->u8_cap);
-        if (!c->u8_data) {
-            free(c->u8_offsets); free(c->nulls);
-            c->u8_offsets = NULL; c->nulls = NULL; return -1;
-        }
-    } else if (type == LM_T_DATE32) {
-        c->d32_vals = calloc(length ? length : 1, sizeof *c->d32_vals);
-        if (!c->d32_vals) { free(c->nulls); c->nulls = NULL; return -1; }
-    } else { /* LM_T_BOOL */
-        c->b_vals = calloc(length ? length : 1, sizeof *c->b_vals);
-        if (!c->b_vals) { free(c->nulls); c->nulls = NULL; return -1; }
+    size_t n = length ? length : 1;
+    int ok = 0;
+    switch (type) {
+        case LM_T_INT64:
+        case LM_T_UINT64:
+        case LM_T_TIMESTAMP_US:
+            c->i64_vals = calloc(n, sizeof *c->i64_vals); ok = c->i64_vals != NULL; break;
+        case LM_T_FLOAT64:
+            c->f64_vals = calloc(n, sizeof *c->f64_vals); ok = c->f64_vals != NULL; break;
+        case LM_T_FLOAT32:
+            c->f32_vals = calloc(n, sizeof *c->f32_vals); ok = c->f32_vals != NULL; break;
+        case LM_T_UTF8:
+            c->u8_offsets = calloc(length + 1, sizeof *c->u8_offsets);
+            if (c->u8_offsets) {
+                c->u8_cap = 64;
+                c->u8_data = malloc(c->u8_cap);
+                ok = c->u8_data != NULL;
+                if (!ok) { free(c->u8_offsets); c->u8_offsets = NULL; }
+            }
+            break;
+        case LM_T_DATE32:
+            c->d32_vals = calloc(n, sizeof *c->d32_vals); ok = c->d32_vals != NULL; break;
+        case LM_T_BOOL:
+            c->b_vals = calloc(n, sizeof *c->b_vals); ok = c->b_vals != NULL; break;
+        case LM_T_INT8:
+        case LM_T_UINT8:
+            c->i8_vals = calloc(n, sizeof *c->i8_vals); ok = c->i8_vals != NULL; break;
+        case LM_T_INT16:
+        case LM_T_UINT16:
+            c->i16_vals = calloc(n, sizeof *c->i16_vals); ok = c->i16_vals != NULL; break;
+        case LM_T_INT32:
+        case LM_T_UINT32:
+            c->i32_vals = calloc(n, sizeof *c->i32_vals); ok = c->i32_vals != NULL; break;
     }
+    if (!ok) { free(c->nulls); c->nulls = NULL; return -1; }
     return 0;
 }
 
@@ -1050,10 +1075,14 @@ static void lm_col_free(LmCol *c) {
     free(c->nulls);
     free(c->i64_vals);
     free(c->f64_vals);
+    free(c->f32_vals);
     free(c->u8_offsets);
     free(c->u8_data);
     free(c->b_vals);
     free(c->d32_vals);
+    free(c->i8_vals);
+    free(c->i16_vals);
+    free(c->i32_vals);
     memset(c, 0, sizeof *c);
 }
 
@@ -1118,6 +1147,18 @@ static void release_date32_leaf(struct ArrowArray *arr) {
     arr->release = NULL;
 }
 
+static void release_narrow_leaf(struct ArrowArray *arr) {
+    /* Shared release for fixed-width numeric leaves (int8/16/32, float32) —
+     * same layout as the int64 / float64 releasers, kept separate purely so
+     * stack traces tell you which leaf width came out. */
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
 static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
     int64_t  null_count = 0;
     uint8_t *vmap = NULL;
@@ -1133,12 +1174,44 @@ static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
     }
     free(c->nulls); c->nulls = NULL;
 
-    if (c->type == LM_T_INT64 || c->type == LM_T_TIMESTAMP_US) {
+    if (c->type == LM_T_INT64 || c->type == LM_T_UINT64 || c->type == LM_T_TIMESTAMP_US) {
         const void **bufs = malloc(2 * sizeof *bufs);
         if (!bufs) { free(vmap); return -1; }
         bufs[0] = vmap; bufs[1] = c->i64_vals; c->i64_vals = NULL;
         out->length = (int64_t)length; out->null_count = null_count;
         out->n_buffers = 2; out->buffers = bufs; out->release = release_int64_leaf;
+        return 0;
+    }
+    if (c->type == LM_T_INT8 || c->type == LM_T_UINT8) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap; bufs[1] = c->i8_vals; c->i8_vals = NULL;
+        out->length = (int64_t)length; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = release_narrow_leaf;
+        return 0;
+    }
+    if (c->type == LM_T_INT16 || c->type == LM_T_UINT16) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap; bufs[1] = c->i16_vals; c->i16_vals = NULL;
+        out->length = (int64_t)length; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = release_narrow_leaf;
+        return 0;
+    }
+    if (c->type == LM_T_INT32 || c->type == LM_T_UINT32) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap; bufs[1] = c->i32_vals; c->i32_vals = NULL;
+        out->length = (int64_t)length; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = release_narrow_leaf;
+        return 0;
+    }
+    if (c->type == LM_T_FLOAT32) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap; bufs[1] = c->f32_vals; c->f32_vals = NULL;
+        out->length = (int64_t)length; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = release_narrow_leaf;
         return 0;
     }
     if (c->type == LM_T_DATE32) {
@@ -1278,9 +1351,43 @@ static int read_col_cell(Eval *E, size_t col_idx, char col_fmt, int dec_scale,
             const int64_t *v = col->buffers[1];
             out->kind = VK_INT64; out->i64 = v[row]; return 0;
         }
+        case 'L': {
+            /* uint64 — values above INT64_MAX wrap to negative; document
+             * but accept (matches SSIS' behavior for unsigned overflow). */
+            const uint64_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 'c': {
+            const int8_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 'C': {
+            const uint8_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 's': {
+            const int16_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 'S': {
+            const uint16_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 'i': {
+            const int32_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
+        case 'I': {
+            const uint32_t *v = col->buffers[1];
+            out->kind = VK_INT64; out->i64 = (int64_t)v[row]; return 0;
+        }
         case 'g': {
             const double *v = col->buffers[1];
             out->kind = VK_FLOAT64; out->f64 = v[row]; return 0;
+        }
+        case 'f': {
+            const float *v = col->buffers[1];
+            out->kind = VK_FLOAT64; out->f64 = (double)v[row]; return 0;
         }
         case 'b': {
             const uint8_t *bitmap = col->buffers[1];
@@ -3146,7 +3253,15 @@ static int cache_schema(SsisExpr *e, const struct ArrowSchema *sch) {
             return -1;
         }
         if (strcmp(fmt, "l") == 0)        e->col_fmts[i] = 'l';
+        else if (strcmp(fmt, "L") == 0)   e->col_fmts[i] = 'L';
+        else if (strcmp(fmt, "c") == 0)   e->col_fmts[i] = 'c';
+        else if (strcmp(fmt, "C") == 0)   e->col_fmts[i] = 'C';
+        else if (strcmp(fmt, "s") == 0)   e->col_fmts[i] = 's';
+        else if (strcmp(fmt, "S") == 0)   e->col_fmts[i] = 'S';
+        else if (strcmp(fmt, "i") == 0)   e->col_fmts[i] = 'i';
+        else if (strcmp(fmt, "I") == 0)   e->col_fmts[i] = 'I';
         else if (strcmp(fmt, "g") == 0)   e->col_fmts[i] = 'g';
+        else if (strcmp(fmt, "f") == 0)   e->col_fmts[i] = 'f';
         else if (strcmp(fmt, "b") == 0)   e->col_fmts[i] = 'b';
         else if (strcmp(fmt, "u") == 0)   e->col_fmts[i] = 'u';
         else if (strcmp(fmt, "tdD") == 0) e->col_fmts[i] = 'D';
@@ -3255,7 +3370,15 @@ static void ssisexpr_release(void *handle) {
 static int format_to_lmtype(const char *fmt, LmType *out) {
     if (!fmt) return -1;
     if      (strcmp(fmt, "l")    == 0) { *out = LM_T_INT64;        return 0; }
+    else if (strcmp(fmt, "L")    == 0) { *out = LM_T_UINT64;       return 0; }
+    else if (strcmp(fmt, "c")    == 0) { *out = LM_T_INT8;         return 0; }
+    else if (strcmp(fmt, "C")    == 0) { *out = LM_T_UINT8;        return 0; }
+    else if (strcmp(fmt, "s")    == 0) { *out = LM_T_INT16;        return 0; }
+    else if (strcmp(fmt, "S")    == 0) { *out = LM_T_UINT16;       return 0; }
+    else if (strcmp(fmt, "i")    == 0) { *out = LM_T_INT32;        return 0; }
+    else if (strcmp(fmt, "I")    == 0) { *out = LM_T_UINT32;       return 0; }
     else if (strcmp(fmt, "g")    == 0) { *out = LM_T_FLOAT64;      return 0; }
+    else if (strcmp(fmt, "f")    == 0) { *out = LM_T_FLOAT32;      return 0; }
     else if (strcmp(fmt, "u")    == 0) { *out = LM_T_UTF8;         return 0; }
     else if (strcmp(fmt, "b")    == 0) { *out = LM_T_BOOL;         return 0; }
     else if (strcmp(fmt, "tdD")  == 0) { *out = LM_T_DATE32;       return 0; }
@@ -3268,6 +3391,18 @@ static int fmt_date_iso(int32_t days, char *buf, size_t cap);
 static int fmt_ts_iso  (int64_t us,   char *buf, size_t cap);
 static int fmt_time_iso(int64_t us_of_day, char *buf, size_t cap);
 
+/* Pull a Value into an int64 staging slot, handling the kinds that the
+ * narrow-integer LM_T_* destinations all accept identically. Range
+ * checking happens at the caller. */
+static int value_to_int64(BetlContext *ctx, const Value *v, int64_t *out) {
+    if      (v->kind == VK_INT64)    *out = v->i64;
+    else if (v->kind == VK_FLOAT64)  *out = (int64_t)v->f64;
+    else if (v->kind == VK_BOOL)     *out = v->b ? 1 : 0;
+    else if (v->kind == VK_TIME_US)  *out = v->i64;
+    else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to int"); return -1; }
+    return 0;
+}
+
 /* Coerce one Value into the LmCol's slot for row_idx. is_null already handled. */
 static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value *v) {
     switch (col->type) {
@@ -3278,11 +3413,57 @@ static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value
             else if (v->kind == VK_TIME_US) col->i64_vals[row_idx] = v->i64;
             else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to int64"); return -1; }
             return 0;
+        case LM_T_UINT64: {
+            int64_t iv;
+            if (value_to_int64(ctx, v, &iv) != 0) return -1;
+            if (iv < 0) {
+                betl_set_error(ctx, "ssisexpr: negative value %" PRId64
+                               " not representable in uint64 column", iv);
+                return -1;
+            }
+            col->i64_vals[row_idx] = iv;
+            return 0;
+        }
+        case LM_T_INT8: case LM_T_UINT8:
+        case LM_T_INT16: case LM_T_UINT16:
+        case LM_T_INT32: case LM_T_UINT32: {
+            int64_t iv;
+            if (value_to_int64(ctx, v, &iv) != 0) return -1;
+            int64_t lo = INT64_MIN, hi = INT64_MAX;
+            const char *tn = "int";
+            switch (col->type) {
+                case LM_T_INT8:   lo = INT8_MIN;  hi = INT8_MAX;  tn = "int8";   break;
+                case LM_T_UINT8:  lo = 0; hi = UINT8_MAX;         tn = "uint8";  break;
+                case LM_T_INT16:  lo = INT16_MIN; hi = INT16_MAX; tn = "int16";  break;
+                case LM_T_UINT16: lo = 0; hi = UINT16_MAX;        tn = "uint16"; break;
+                case LM_T_INT32:  lo = INT32_MIN; hi = INT32_MAX; tn = "int32";  break;
+                case LM_T_UINT32: lo = 0; hi = UINT32_MAX;        tn = "uint32"; break;
+                default: break;
+            }
+            if (iv < lo || iv > hi) {
+                betl_set_error(ctx, "ssisexpr: value %" PRId64
+                               " out of range for %s column", iv, tn);
+                return -1;
+            }
+            switch (col->type) {
+                case LM_T_INT8: case LM_T_UINT8:   col->i8_vals[row_idx]  = (int8_t)iv;  break;
+                case LM_T_INT16: case LM_T_UINT16: col->i16_vals[row_idx] = (int16_t)iv; break;
+                case LM_T_INT32: case LM_T_UINT32: col->i32_vals[row_idx] = (int32_t)iv; break;
+                default: break;
+            }
+            return 0;
+        }
         case LM_T_FLOAT64:
             if (v->kind == VK_INT64)        col->f64_vals[row_idx] = (double)v->i64;
             else if (v->kind == VK_FLOAT64) col->f64_vals[row_idx] = v->f64;
             else if (v->kind == VK_BOOL)    col->f64_vals[row_idx] = v->b ? 1.0 : 0.0;
             else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to float64"); return -1; }
+            return 0;
+        case LM_T_FLOAT32:
+            if (v->kind == VK_INT64)        col->f32_vals[row_idx] = (float)v->i64;
+            else if (v->kind == VK_FLOAT64) col->f32_vals[row_idx] = (float)v->f64;
+            else if (v->kind == VK_BOOL)    col->f32_vals[row_idx] = v->b ? 1.0f : 0.0f;
+            else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to float32"); return -1; }
             return 0;
         case LM_T_BOOL:
             if (v->kind == VK_BOOL)         col->b_vals[row_idx] = v->b ? 1 : 0;

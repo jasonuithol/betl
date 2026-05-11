@@ -318,6 +318,10 @@ typedef enum {
     LM_T_INT64 = 1,
     LM_T_UTF8  = 2,
     LM_T_BOOL  = 3,
+    LM_T_INT8  = 4, LM_T_UINT8  = 5,
+    LM_T_INT16 = 6, LM_T_UINT16 = 7,
+    LM_T_INT32 = 8, LM_T_UINT32 = 9,
+    LM_T_UINT64 = 10,
 } LmType;
 
 /* Per-column output staging. `nulls[i] != 0` means row i is null;
@@ -326,8 +330,13 @@ typedef struct {
     LmType   type;
     uint8_t *nulls;       /* length bytes, malloc'd */
 
-    /* INT64 storage */
+    /* INT64 / UINT64 storage. Unsigned shares the buffer; sign is
+     * interpretation-only. */
     int64_t *i64_vals;    /* length cells */
+    /* Narrow integer storage (signed and unsigned share the buffer). */
+    int8_t  *i8_vals;
+    int16_t *i16_vals;
+    int32_t *i32_vals;
 
     /* UTF8 storage. Strings appended in row order; offsets[i+1]-offsets[i]
      * is the byte length of row i's value. data is grown geometrically. */
@@ -501,11 +510,18 @@ static int luamap_ensure_schema(LuaMap *m) {
             ok = 0; break;
         }
         if      (strcmp(fmt, "l") == 0) types[i] = LM_T_INT64;
+        else if (strcmp(fmt, "L") == 0) types[i] = LM_T_UINT64;
+        else if (strcmp(fmt, "c") == 0) types[i] = LM_T_INT8;
+        else if (strcmp(fmt, "C") == 0) types[i] = LM_T_UINT8;
+        else if (strcmp(fmt, "s") == 0) types[i] = LM_T_INT16;
+        else if (strcmp(fmt, "S") == 0) types[i] = LM_T_UINT16;
+        else if (strcmp(fmt, "i") == 0) types[i] = LM_T_INT32;
+        else if (strcmp(fmt, "I") == 0) types[i] = LM_T_UINT32;
         else if (strcmp(fmt, "u") == 0) types[i] = LM_T_UTF8;
         else {
             luamap_set_err(m,
                 "lua.map: column '%s' has unsupported format '%s' "
-                "(v0.1 supports int64 'l' and utf8 'u')",
+                "(supported: integer widths c/C/s/S/i/I/l/L; utf8 'u')",
                 (c && c->name) ? c->name : "?", fmt);
             ok = 0; break;
         }
@@ -544,6 +560,17 @@ static void release_lm_array_int64_leaf(struct ArrowArray *arr) {
     arr->release = NULL;
 }
 
+static void release_lm_array_narrow_leaf(struct ArrowArray *arr) {
+    /* Same shape as the int64 leaf — keeps int8/16/32 buffers tracked
+     * separately in stack traces. */
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
 static void release_lm_array_utf8_leaf(struct ArrowArray *arr) {
     if (arr->n_buffers >= 3 && arr->buffers) {
         free((void *)arr->buffers[0]);   /* validity, may be NULL */
@@ -577,12 +604,11 @@ static void release_lm_array_struct(struct ArrowArray *arr) {
 
 /* ---- Cell-level marshal helpers -------------------------------- */
 
-/* Push the row_idx-th cell of an int64 leaf onto the Lua stack
- * (nil for null, integer otherwise). Caller has already validated
- * the leaf's format. */
-static void lm_push_int64_cell(lua_State *L,
-                               const struct ArrowArray *col,
-                               size_t row_idx) {
+/* Widen any integer leaf (int8/16/32/64, signed or unsigned) onto the
+ * Lua stack as a Lua integer. type selects how to interpret the buffer. */
+static void lm_push_int_cell(lua_State *L, LmType type,
+                             const struct ArrowArray *col,
+                             size_t row_idx) {
     size_t row = row_idx + (size_t)col->offset;
     if (col->null_count > 0 && col->buffers[0]) {
         const uint8_t *valid = col->buffers[0];
@@ -591,8 +617,19 @@ static void lm_push_int64_cell(lua_State *L,
             return;
         }
     }
-    const int64_t *vals = col->buffers[1];
-    lua_pushinteger(L, vals[row]);
+    int64_t v = 0;
+    switch (type) {
+        case LM_T_INT8:   v = ((const int8_t   *)col->buffers[1])[row]; break;
+        case LM_T_UINT8:  v = ((const uint8_t  *)col->buffers[1])[row]; break;
+        case LM_T_INT16:  v = ((const int16_t  *)col->buffers[1])[row]; break;
+        case LM_T_UINT16: v = ((const uint16_t *)col->buffers[1])[row]; break;
+        case LM_T_INT32:  v = ((const int32_t  *)col->buffers[1])[row]; break;
+        case LM_T_UINT32: v = ((const uint32_t *)col->buffers[1])[row]; break;
+        case LM_T_INT64:
+        case LM_T_UINT64: v = ((const int64_t  *)col->buffers[1])[row]; break;
+        default: lua_pushnil(L); return;
+    }
+    lua_pushinteger(L, v);
 }
 
 /* Same shape for utf8: pushes the row's bytes as a Lua string
@@ -623,28 +660,39 @@ static int lm_col_init(LmCol *c, LmType type, size_t length) {
     c->type  = type;
     c->nulls = calloc(length ? length : 1, sizeof *c->nulls);
     if (!c->nulls) return -1;
-    if (type == LM_T_INT64) {
-        c->i64_vals = calloc(length ? length : 1, sizeof *c->i64_vals);
-        if (!c->i64_vals) { free(c->nulls); c->nulls = NULL; return -1; }
-    } else if (type == LM_T_UTF8) {
-        c->u8_offsets = calloc(length + 1, sizeof *c->u8_offsets);
-        if (!c->u8_offsets) { free(c->nulls); c->nulls = NULL; return -1; }
-        c->u8_cap = 64;
-        c->u8_data = malloc(c->u8_cap);
-        if (!c->u8_data) {
-            free(c->u8_offsets); free(c->nulls);
-            c->u8_offsets = NULL; c->nulls = NULL; return -1;
-        }
-    } else { /* LM_T_BOOL */
-        c->b_vals = calloc(length ? length : 1, sizeof *c->b_vals);
-        if (!c->b_vals) { free(c->nulls); c->nulls = NULL; return -1; }
+    size_t n = length ? length : 1;
+    int ok = 0;
+    switch (type) {
+        case LM_T_INT64: case LM_T_UINT64:
+            c->i64_vals = calloc(n, sizeof *c->i64_vals); ok = c->i64_vals != NULL; break;
+        case LM_T_INT8: case LM_T_UINT8:
+            c->i8_vals  = calloc(n, sizeof *c->i8_vals);  ok = c->i8_vals != NULL;  break;
+        case LM_T_INT16: case LM_T_UINT16:
+            c->i16_vals = calloc(n, sizeof *c->i16_vals); ok = c->i16_vals != NULL; break;
+        case LM_T_INT32: case LM_T_UINT32:
+            c->i32_vals = calloc(n, sizeof *c->i32_vals); ok = c->i32_vals != NULL; break;
+        case LM_T_UTF8:
+            c->u8_offsets = calloc(length + 1, sizeof *c->u8_offsets);
+            if (c->u8_offsets) {
+                c->u8_cap = 64;
+                c->u8_data = malloc(c->u8_cap);
+                ok = c->u8_data != NULL;
+                if (!ok) { free(c->u8_offsets); c->u8_offsets = NULL; }
+            }
+            break;
+        case LM_T_BOOL:
+            c->b_vals = calloc(n, sizeof *c->b_vals); ok = c->b_vals != NULL; break;
     }
+    if (!ok) { free(c->nulls); c->nulls = NULL; return -1; }
     return 0;
 }
 
 static void lm_col_free(LmCol *c) {
     free(c->nulls);
     free(c->i64_vals);
+    free(c->i8_vals);
+    free(c->i16_vals);
+    free(c->i32_vals);
     free(c->u8_offsets);
     free(c->u8_data);
     free(c->b_vals);
@@ -689,7 +737,7 @@ static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
     /* nulls[] is no longer needed once we've digested it into vmap. */
     free(c->nulls); c->nulls = NULL;
 
-    if (c->type == LM_T_INT64) {
+    if (c->type == LM_T_INT64 || c->type == LM_T_UINT64) {
         const void **bufs = malloc(2 * sizeof *bufs);
         if (!bufs) { free(vmap); return -1; }
         bufs[0] = vmap;
@@ -703,6 +751,31 @@ static int lm_col_finalize(LmCol *c, size_t length, struct ArrowArray *out) {
         out->n_children = 0;
         out->buffers    = bufs;
         out->release    = release_lm_array_int64_leaf;
+        return 0;
+    }
+
+    if (c->type == LM_T_INT8 || c->type == LM_T_UINT8 ||
+        c->type == LM_T_INT16 || c->type == LM_T_UINT16 ||
+        c->type == LM_T_INT32 || c->type == LM_T_UINT32) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap;
+        switch (c->type) {
+            case LM_T_INT8: case LM_T_UINT8:
+                bufs[1] = c->i8_vals;  c->i8_vals = NULL; break;
+            case LM_T_INT16: case LM_T_UINT16:
+                bufs[1] = c->i16_vals; c->i16_vals = NULL; break;
+            case LM_T_INT32: case LM_T_UINT32:
+                bufs[1] = c->i32_vals; c->i32_vals = NULL; break;
+            default: break;
+        }
+        out->length     = (int64_t)length;
+        out->null_count = null_count;
+        out->offset     = 0;
+        out->n_buffers  = 2;
+        out->n_children = 0;
+        out->buffers    = bufs;
+        out->release    = release_lm_array_narrow_leaf;
         return 0;
     }
 
@@ -830,7 +903,11 @@ static int lm_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         lua_createtable(m->L, 0, (int)m->n_cols);
         for (size_t c = 0; c < m->n_cols; ++c) {
             switch (m->col_types[c]) {
-                case LM_T_INT64: lm_push_int64_cell(m->L, in_arr.children[c], r); break;
+                case LM_T_INT8: case LM_T_UINT8:
+                case LM_T_INT16: case LM_T_UINT16:
+                case LM_T_INT32: case LM_T_UINT32:
+                case LM_T_INT64: case LM_T_UINT64:
+                    lm_push_int_cell(m->L, m->col_types[c], in_arr.children[c], r); break;
                 case LM_T_UTF8:  lm_push_utf8_cell (m->L, in_arr.children[c], r); break;
                 case LM_T_BOOL:  /* unreachable: schema validation rejects bool input */
                 default:         lua_pushnil(m->L); break;
@@ -867,7 +944,10 @@ static int lm_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
                 if (cols[c].type == LM_T_UTF8) {
                     cols[c].u8_offsets[r + 1] = (int32_t)cols[c].u8_len;
                 }
-            } else if (cols[c].type == LM_T_INT64) {
+            } else if (cols[c].type == LM_T_INT8  || cols[c].type == LM_T_UINT8  ||
+                       cols[c].type == LM_T_INT16 || cols[c].type == LM_T_UINT16 ||
+                       cols[c].type == LM_T_INT32 || cols[c].type == LM_T_UINT32 ||
+                       cols[c].type == LM_T_INT64 || cols[c].type == LM_T_UINT64) {
                 if (t != LUA_TNUMBER) {
                     const char *tn = lua_typename(m->L, t);
                     char copy[64]; snprintf(copy, sizeof copy, "%s", tn);
@@ -884,7 +964,32 @@ static int lm_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
                         "lua.map: row %zu column '%s': non-integer number",
                         r, m->col_names[c]);
                 }
-                cols[c].i64_vals[r] = (int64_t)iv;
+                int64_t v = (int64_t)iv;
+                int64_t lo = INT64_MIN, hi = INT64_MAX;
+                const char *tn = "int";
+                switch (cols[c].type) {
+                    case LM_T_INT8:   lo = INT8_MIN;  hi = INT8_MAX;  tn = "int8";   break;
+                    case LM_T_UINT8:  lo = 0; hi = UINT8_MAX;         tn = "uint8";  break;
+                    case LM_T_INT16:  lo = INT16_MIN; hi = INT16_MAX; tn = "int16";  break;
+                    case LM_T_UINT16: lo = 0; hi = UINT16_MAX;        tn = "uint16"; break;
+                    case LM_T_INT32:  lo = INT32_MIN; hi = INT32_MAX; tn = "int32";  break;
+                    case LM_T_UINT32: lo = 0; hi = UINT32_MAX;        tn = "uint32"; break;
+                    case LM_T_UINT64: lo = 0; hi = INT64_MAX;         tn = "uint64"; break;
+                    default: break;
+                }
+                if (v < lo || v > hi) {
+                    lua_pop(m->L, 2);
+                    return lm_bail(m, cols, m->n_cols, &in_arr,
+                        "lua.map: row %zu column '%s': value %lld out of range for %s",
+                        r, m->col_names[c], (long long)v, tn);
+                }
+                switch (cols[c].type) {
+                    case LM_T_INT8: case LM_T_UINT8:    cols[c].i8_vals[r]  = (int8_t)v;  break;
+                    case LM_T_INT16: case LM_T_UINT16:  cols[c].i16_vals[r] = (int16_t)v; break;
+                    case LM_T_INT32: case LM_T_UINT32:  cols[c].i32_vals[r] = (int32_t)v; break;
+                    case LM_T_INT64: case LM_T_UINT64:  cols[c].i64_vals[r] = v;          break;
+                    default: break;
+                }
             } else { /* LM_T_UTF8 */
                 if (t != LUA_TSTRING) {
                     const char *tn = lua_typename(m->L, t);
@@ -1057,6 +1162,13 @@ static int lua_expr_cache_schema(LuaExpr *e,
             return -1;
         }
         if      (strcmp(fmt, "l") == 0) types[i] = LM_T_INT64;
+        else if (strcmp(fmt, "L") == 0) types[i] = LM_T_UINT64;
+        else if (strcmp(fmt, "c") == 0) types[i] = LM_T_INT8;
+        else if (strcmp(fmt, "C") == 0) types[i] = LM_T_UINT8;
+        else if (strcmp(fmt, "s") == 0) types[i] = LM_T_INT16;
+        else if (strcmp(fmt, "S") == 0) types[i] = LM_T_UINT16;
+        else if (strcmp(fmt, "i") == 0) types[i] = LM_T_INT32;
+        else if (strcmp(fmt, "I") == 0) types[i] = LM_T_UINT32;
         else if (strcmp(fmt, "u") == 0) types[i] = LM_T_UTF8;
         else {
             for (size_t k = 0; k < i; ++k) free(names[k]);
@@ -1227,8 +1339,12 @@ static int lua_expr_evaluate(void *handle,
         lua_createtable(e->L, 0, (int)e->n_cols);
         for (size_t c = 0; c < e->n_cols; ++c) {
             switch (e->col_types[c]) {
-                case LM_T_INT64: lm_push_int64_cell(e->L, input_struct->children[c], r); break;
-                case LM_T_UTF8:  lm_push_utf8_cell (e->L, input_struct->children[c], r); break;
+                case LM_T_INT8: case LM_T_UINT8:
+                case LM_T_INT16: case LM_T_UINT16:
+                case LM_T_INT32: case LM_T_UINT32:
+                case LM_T_INT64: case LM_T_UINT64:
+                    lm_push_int_cell(e->L, e->col_types[c], input_struct->children[c], r); break;
+                case LM_T_UTF8:  lm_push_utf8_cell(e->L, input_struct->children[c], r); break;
                 case LM_T_BOOL:  /* unreachable: not in input */ lua_pushnil(e->L); break;
             }
             lua_setfield(e->L, -2, e->col_names[c]);
