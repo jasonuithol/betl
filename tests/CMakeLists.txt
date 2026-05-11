@@ -437,6 +437,15 @@ if(LIBPQ_FOUND)
         )
     endif()
 
+    # --- postgres.read date / timestamp integration test --------------------
+    add_executable(test_pg_read_date test_pg_read_date.c)
+    target_link_libraries(test_pg_read_date PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_read_date COMMAND test_pg_read_date)
+    set_tests_properties(pg_read_date PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_read date/timestamp integration test passed"
+    )
+
     # --- postgres.read streaming stress test (no Lua) -----------------------
     # Verifies VmHWM stays bounded across a 2MB result set with a small
     # batch_size — proves the libpq cursor path actually streams rather

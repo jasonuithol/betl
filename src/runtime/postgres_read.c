@@ -28,6 +28,8 @@
 
 #include <libpq-fe.h>
 
+#include "runtime/date_util.h"
+
 #include "betl/provider.h"
 
 /* ============================================================== *
@@ -94,24 +96,43 @@ static int pgr_json_int64(const char *json, const char *key, int64_t *out) {
  *  Type mapping + Arrow leaf releases                              *
  * ============================================================== */
 
-#define PG_OID_INT2     21
-#define PG_OID_INT4     23
-#define PG_OID_INT8     20
-#define PG_OID_TEXT     25
-#define PG_OID_VARCHAR  1043
-#define PG_OID_BPCHAR   1042
+#define PG_OID_INT2        21
+#define PG_OID_INT4        23
+#define PG_OID_INT8        20
+#define PG_OID_TEXT        25
+#define PG_OID_VARCHAR     1043
+#define PG_OID_BPCHAR      1042
+#define PG_OID_DATE        1082
+#define PG_OID_TIMESTAMP   1114
+#define PG_OID_TIMESTAMPTZ 1184
 
-static int pg_oid_to_fmt(Oid t, char *out) {
+/* Internal column-format tags. The 'D' / 'T' codes mirror what
+ * betl-ssisexpr uses internally and map to Arrow "tdD" / "tsu:".
+ * Returns 1 if `out_tztz` is filled with 1 (caller-rejected). */
+static int pg_oid_to_fmt(Oid t, char *out, int *out_is_tztz) {
+    *out_is_tztz = 0;
     if (t == PG_OID_INT8 || t == PG_OID_INT4 || t == PG_OID_INT2) {
         *out = 'l'; return 0;
     }
     if (t == PG_OID_TEXT || t == PG_OID_VARCHAR || t == PG_OID_BPCHAR) {
         *out = 'u'; return 0;
     }
+    if (t == PG_OID_DATE)      { *out = 'D'; return 0; }
+    if (t == PG_OID_TIMESTAMP) { *out = 'T'; return 0; }
+    if (t == PG_OID_TIMESTAMPTZ) { *out_is_tztz = 1; return -1; }
     return -1;
 }
 
 static void pgr_release_int64_leaf(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+static void pgr_release_date32_leaf(struct ArrowArray *arr) {
     if (arr->n_buffers >= 2 && arr->buffers) {
         free((void *)arr->buffers[0]);
         free((void *)arr->buffers[1]);
@@ -360,11 +381,20 @@ static int pgr_resolve_schema(PgReadState *s) {
     for (int c = 0; c < n; ++c) {
         Oid t = PQftype(r, c);
         char fmt;
-        if (pg_oid_to_fmt(t, &fmt) != 0) {
-            betl_set_error(s->ctx,
-                "postgres.read: column '%s' has unsupported OID %u "
-                "(v0.1: int*, text/varchar/bpchar)",
-                PQfname(r, c), (unsigned)t);
+        int is_tztz = 0;
+        if (pg_oid_to_fmt(t, &fmt, &is_tztz) != 0) {
+            if (is_tztz) {
+                betl_set_error(s->ctx,
+                    "postgres.read: column '%s' is TIMESTAMP WITH TIME ZONE "
+                    "(OID 1184) — unsupported in v1; cast to TIMESTAMP in your "
+                    "query (e.g. `col AT TIME ZONE 'UTC'`)",
+                    PQfname(r, c));
+            } else {
+                betl_set_error(s->ctx,
+                    "postgres.read: column '%s' has unsupported OID %u "
+                    "(supported: int*, text/varchar/bpchar, date, timestamp)",
+                    PQfname(r, c), (unsigned)t);
+            }
             PQclear(r);
             return -1;
         }
@@ -420,6 +450,27 @@ static int pgr_build_int64_leaf(struct ArrowArray *out,
     out->n_buffers  = 2;
     out->buffers    = bufs;
     out->release    = pgr_release_int64_leaf;
+    return 0;
+}
+
+static int pgr_build_date32_leaf(struct ArrowArray *out,
+                                 const int32_t *vals,
+                                 const uint8_t *nulls,
+                                 size_t n) {
+    int32_t *vbuf = malloc((n ? n : 1) * sizeof *vbuf);
+    if (!vbuf) return -1;
+    for (size_t i = 0; i < n; ++i) vbuf[i] = nulls[i] ? 0 : vals[i];
+    int64_t null_count = 0;
+    uint8_t *vmap = pgr_build_validity(nulls, n, &null_count);
+    if (null_count > 0 && !vmap) { free(vbuf); return -1; }
+    const void **bufs = malloc(2 * sizeof *bufs);
+    if (!bufs) { free(vbuf); free(vmap); return -1; }
+    bufs[0] = vmap; bufs[1] = vbuf;
+    out->length     = (int64_t)n;
+    out->null_count = null_count;
+    out->n_buffers  = 2;
+    out->buffers    = bufs;
+    out->release    = pgr_release_date32_leaf;
     return 0;
 }
 
@@ -483,7 +534,13 @@ static int pgr_stream_get_schema(struct ArrowArrayStream *st,
     struct ArrowSchema **kids = calloc((size_t)s->n_cols, sizeof *kids);
     if (!kids) return ENOMEM;
     for (int i = 0; i < s->n_cols; ++i) {
-        const char *fmt = (s->col_fmts[i] == 'l') ? "l" : "u";
+        const char *fmt = "u";
+        switch (s->col_fmts[i]) {
+            case 'l': fmt = "l";    break;
+            case 'D': fmt = "tdD";  break;
+            case 'T': fmt = "tsu:"; break;
+            default:  fmt = "u";    break;
+        }
         kids[i] = pgr_new_leaf(s->col_names[i], fmt);
         if (!kids[i]) {
             for (int k = 0; k < i; ++k) {
@@ -544,11 +601,14 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
      * PGresult while we read; the Arrow leaf builder copies them into
      * its data buffer, so we can PQclear before returning. */
     int rc = EIO;
+    /* i64 staging is shared between 'l' (int64) and 'T' (timestamp_us)
+     * — both are int64 under the hood. */
     int64_t **i64_cols = calloc((size_t)s->n_cols, sizeof *i64_cols);
+    int32_t **d32_cols = calloc((size_t)s->n_cols, sizeof *d32_cols);
     const char ***u8s_cols = calloc((size_t)s->n_cols, sizeof *u8s_cols);
     size_t  **u8l_cols = calloc((size_t)s->n_cols, sizeof *u8l_cols);
     uint8_t **null_cols = calloc((size_t)s->n_cols, sizeof *null_cols);
-    if (!i64_cols || !u8s_cols || !u8l_cols || !null_cols) {
+    if (!i64_cols || !d32_cols || !u8s_cols || !u8l_cols || !null_cols) {
         betl_set_error(s->ctx, "postgres.read: out of memory");
         goto cleanup;
     }
@@ -558,9 +618,15 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
             betl_set_error(s->ctx, "postgres.read: out of memory");
             goto cleanup;
         }
-        if (s->col_fmts[c] == 'l') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T') {
             i64_cols[c] = malloc((size_t)n_rows * sizeof(int64_t));
             if (!i64_cols[c]) {
+                betl_set_error(s->ctx, "postgres.read: out of memory");
+                goto cleanup;
+            }
+        } else if (s->col_fmts[c] == 'D') {
+            d32_cols[c] = malloc((size_t)n_rows * sizeof(int32_t));
+            if (!d32_cols[c]) {
                 betl_set_error(s->ctx, "postgres.read: out of memory");
                 goto cleanup;
             }
@@ -592,6 +658,27 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
                     goto cleanup;
                 }
                 i64_cols[c][row] = (int64_t)iv;
+            } else if (s->col_fmts[c] == 'D') {
+                int32_t days;
+                if (betl_parse_iso_date(v, (size_t)PQgetlength(r, row, c),
+                                        &days) != 0) {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': '%s' is not a "
+                        "valid YYYY-MM-DD date", row, s->col_names[c], v);
+                    goto cleanup;
+                }
+                d32_cols[c][row] = days;
+            } else if (s->col_fmts[c] == 'T') {
+                int64_t us;
+                if (betl_parse_iso_ts(v, (size_t)PQgetlength(r, row, c),
+                                      &us) != 0) {
+                    betl_set_error(s->ctx,
+                        "postgres.read: row %d col '%s': '%s' is not a "
+                        "valid YYYY-MM-DD HH:MM:SS[.uuuuuu] timestamp",
+                        row, s->col_names[c], v);
+                    goto cleanup;
+                }
+                i64_cols[c][row] = us;
             } else {
                 u8s_cols[c][row] = v;       /* borrowed from PGresult */
                 u8l_cols[c][row] = (size_t)PQgetlength(r, row, c);
@@ -609,9 +696,12 @@ static int pgr_stream_get_next(struct ArrowArrayStream *st,
         kids[c] = calloc(1, sizeof **kids);
         if (!kids[c]) { build_failed = 1; break; }
         int brc;
-        if (s->col_fmts[c] == 'l') {
+        if (s->col_fmts[c] == 'l' || s->col_fmts[c] == 'T') {
             brc = pgr_build_int64_leaf(kids[c], i64_cols[c], null_cols[c],
                                        (size_t)n_rows);
+        } else if (s->col_fmts[c] == 'D') {
+            brc = pgr_build_date32_leaf(kids[c], d32_cols[c], null_cols[c],
+                                        (size_t)n_rows);
         } else {
             brc = pgr_build_utf8_leaf(kids[c], u8s_cols[c], u8l_cols[c],
                                       null_cols[c], (size_t)n_rows);
@@ -654,6 +744,10 @@ cleanup:
     if (i64_cols) {
         for (int c = 0; c < s->n_cols; ++c) free(i64_cols[c]);
         free(i64_cols);
+    }
+    if (d32_cols) {
+        for (int c = 0; c < s->n_cols; ++c) free(d32_cols[c]);
+        free(d32_cols);
     }
     if (u8s_cols) {
         for (int c = 0; c < s->n_cols; ++c) free((void *)u8s_cols[c]);

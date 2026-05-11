@@ -109,6 +109,7 @@ add_library(betl_core STATIC
     src/runtime/builtins.c
     src/runtime/connections.c
     src/runtime/context.c
+    src/runtime/date_util.c
     src/runtime/exec.c
     src/runtime/literal_expr.c
     src/runtime/mssql_sql.c
