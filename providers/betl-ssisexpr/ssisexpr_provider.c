@@ -46,6 +46,7 @@ typedef enum {
     N_BINOP,
     N_TERNARY,
     N_CAST,
+    N_CALL,            /* FNAME(arg1, arg2, ...) */
 } NodeKind;
 
 typedef enum {
@@ -69,6 +70,23 @@ typedef enum {
     OP_AND, OP_OR,
 } Op;
 
+/* Built-in functions. ISNULL / REPLACENULL are special-cased in the
+ * evaluator because they must observe NULL on their first argument
+ * instead of propagating it. All other functions propagate NULL when
+ * any argument is NULL. */
+typedef enum {
+    /* string */
+    FN_LEN, FN_SUBSTRING, FN_LEFT, FN_RIGHT,
+    FN_TRIM, FN_LTRIM, FN_RTRIM,
+    FN_LOWER, FN_UPPER,
+    FN_REPLACE, FN_FINDSTRING, FN_REVERSE,
+    /* null */
+    FN_ISNULL, FN_REPLACENULL,
+    /* numeric */
+    FN_ABS, FN_POWER, FN_SQUARE, FN_SQRT,
+    FN_ROUND, FN_CEILING, FN_FLOOR, FN_SIGN,
+} FnId;
+
 typedef struct Node Node;
 struct Node {
     NodeKind kind;
@@ -83,6 +101,7 @@ struct Node {
         struct { Op op; Node *a; Node *b; } binop;
         struct { Node *cond; Node *t; Node *f; } ternary;
         struct { SsisDt dt; int has_len; int64_t len; Node *a; } cast;
+        struct { FnId fn; Node **args; size_t n_args; } call;
     };
 };
 
@@ -110,7 +129,8 @@ static Node *arena_new(Arena *a, NodeKind k) {
 static void arena_free(Arena *a) {
     for (size_t i = 0; i < a->count; ++i) {
         Node *n = a->nodes[i];
-        if (n->kind == N_LIT_STR) free(n->str.s);
+        if (n->kind == N_LIT_STR)      free(n->str.s);
+        else if (n->kind == N_CALL)    free(n->call.args);
         free(n);
     }
     free(a->nodes);
@@ -372,6 +392,54 @@ static void lex_free(Lex *L) {
 
 
 /* ============================================================== *
+ *  Built-in function table                                         *
+ * ============================================================== */
+
+typedef struct {
+    const char *name;
+    FnId        id;
+    int         min_arity;
+    int         max_arity;
+} FnSpec;
+
+static const FnSpec g_fns[] = {
+    /* string */
+    { "LEN",         FN_LEN,         1, 1 },
+    { "SUBSTRING",   FN_SUBSTRING,   3, 3 },
+    { "LEFT",        FN_LEFT,        2, 2 },
+    { "RIGHT",       FN_RIGHT,       2, 2 },
+    { "TRIM",        FN_TRIM,        1, 1 },
+    { "LTRIM",       FN_LTRIM,       1, 1 },
+    { "RTRIM",       FN_RTRIM,       1, 1 },
+    { "LOWER",       FN_LOWER,       1, 1 },
+    { "UPPER",       FN_UPPER,       1, 1 },
+    { "REPLACE",     FN_REPLACE,     3, 3 },
+    { "FINDSTRING",  FN_FINDSTRING,  3, 3 },
+    { "REVERSE",     FN_REVERSE,     1, 1 },
+    /* null */
+    { "ISNULL",      FN_ISNULL,      1, 1 },
+    { "REPLACENULL", FN_REPLACENULL, 2, 2 },
+    /* numeric */
+    { "ABS",         FN_ABS,         1, 1 },
+    { "POWER",       FN_POWER,       2, 2 },
+    { "SQUARE",      FN_SQUARE,      1, 1 },
+    { "SQRT",        FN_SQRT,        1, 1 },
+    { "ROUND",       FN_ROUND,       2, 2 },
+    { "CEILING",     FN_CEILING,     1, 1 },
+    { "FLOOR",       FN_FLOOR,       1, 1 },
+    { "SIGN",        FN_SIGN,        1, 1 },
+};
+static const size_t g_n_fns = sizeof g_fns / sizeof g_fns[0];
+
+static const FnSpec *lookup_fn(const char *name) {
+    for (size_t i = 0; i < g_n_fns; ++i) {
+        if (strcasecmp(name, g_fns[i].name) == 0) return &g_fns[i];
+    }
+    return NULL;
+}
+
+
+/* ============================================================== *
  *  Parser (Pratt)                                                  *
  * ============================================================== */
 
@@ -408,6 +476,7 @@ static Node *p_add(Par *P);
 static Node *p_mul(Par *P);
 static Node *p_unary(Par *P);
 static Node *p_primary(Par *P);
+static Node *p_call_args(Par *P, const FnSpec *fs);
 
 /* Recognize a SSIS DT_xxx type name. Returns 1 + writes *out on hit. */
 static int parse_dt(const char *name, SsisDt *out) {
@@ -680,7 +749,29 @@ static Node *p_primary(Par *P) {
             n->null_typed.dt = dt;
             return n;
         }
-        case T_IDENT:
+        case T_IDENT: {
+            advance(P);
+            /* IDENT followed by '(' is a function call; otherwise a
+             * column ref. Bracketed identifiers ([X]) are never function
+             * calls — they always refer to columns. */
+            if (check(P, T_LPAREN)) {
+                const FnSpec *fs = lookup_fn(t->str);
+                if (!fs) {
+                    par_err(P, "unknown function '%s'", t->str);
+                    return NULL;
+                }
+                return p_call_args(P, fs);
+            }
+            size_t idx;
+            if (resolve_col(P, t->str, &idx) != 0) {
+                par_err(P, "unknown column '%s'", t->str);
+                return NULL;
+            }
+            Node *n = arena_new(P->arena, N_COLREF);
+            if (!n) return NULL;
+            n->colref.col_idx = idx;
+            return n;
+        }
         case T_BR_IDENT: {
             advance(P);
             size_t idx;
@@ -699,6 +790,47 @@ static Node *p_primary(Par *P) {
             par_err(P, "unexpected token in expression");
             return NULL;
     }
+}
+
+/* Parse the argument list of a function call. We've already consumed
+ * the IDENT and peeked at '('. The lookup has succeeded. */
+static Node *p_call_args(Par *P, const FnSpec *fs) {
+    if (!match(P, T_LPAREN)) { par_err(P, "internal: expected '(' after %s", fs->name); return NULL; }
+    enum { MAX_ARGS = 8 };
+    Node *tmp[MAX_ARGS];
+    int n = 0;
+    if (!check(P, T_RPAREN)) {
+        for (;;) {
+            if (n >= MAX_ARGS) {
+                par_err(P, "%s: too many arguments (max %d)", fs->name, MAX_ARGS);
+                return NULL;
+            }
+            Node *a = p_ternary(P);
+            if (!a) return NULL;
+            tmp[n++] = a;
+            if (match(P, T_COMMA)) continue;
+            break;
+        }
+    }
+    if (!match(P, T_RPAREN)) { par_err(P, "%s: expected ')'", fs->name); return NULL; }
+    if (n < fs->min_arity || n > fs->max_arity) {
+        if (fs->min_arity == fs->max_arity) {
+            par_err(P, "%s: expected %d argument(s), got %d", fs->name, fs->min_arity, n);
+        } else {
+            par_err(P, "%s: expected %d..%d arguments, got %d",
+                    fs->name, fs->min_arity, fs->max_arity, n);
+        }
+        return NULL;
+    }
+    Node *node = arena_new(P->arena, N_CALL);
+    if (!node) return NULL;
+    size_t bytes = (size_t)(n > 0 ? n : 1) * sizeof *node->call.args;
+    node->call.args = malloc(bytes);
+    if (!node->call.args) return NULL;
+    for (int i = 0; i < n; ++i) node->call.args[i] = tmp[i];
+    node->call.fn = fs->id;
+    node->call.n_args = (size_t)n;
+    return node;
 }
 
 
@@ -1188,6 +1320,332 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len, const Value *in
     return eval_err(E, "unsupported cast target");
 }
 
+
+/* ============================================================== *
+ *  Built-in function evaluators                                    *
+ * ============================================================== */
+
+static int require_str(Eval *E, const Value *v, const char *fn) {
+    if (v->kind != VK_UTF8) return eval_err(E, "%s: argument must be string", fn);
+    return 0;
+}
+static int require_int(Eval *E, const Value *v, const char *fn) {
+    if (v->kind != VK_INT64) return eval_err(E, "%s: argument must be integer", fn);
+    return 0;
+}
+static int require_num(Eval *E, const Value *v, const char *fn) {
+    if (v->kind == VK_INT64 || v->kind == VK_FLOAT64) return 0;
+    return eval_err(E, "%s: argument must be numeric", fn);
+}
+
+/* All string-returning functions allocate their result and hand it to
+ * the per-row scratch arena, which frees it after store_value has
+ * copied the bytes into the LmCol. */
+static int emit_str(Eval *E, char *buf, size_t n, Value *out) {
+    if (scratch_add(E->scratch, buf) != 0) return eval_err(E, "out of memory");
+    out->kind = VK_UTF8; out->str = buf; out->str_n = n;
+    return 0;
+}
+
+static int fn_len(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "LEN") != 0) return -1;
+    /* v0.1: byte length. UTF-8 codepoint counting is a future enhancement. */
+    out->kind = VK_INT64; out->i64 = (int64_t)vs[0].str_n;
+    return 0;
+}
+
+static int fn_substring(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "SUBSTRING") != 0) return -1;
+    if (require_int(E, &vs[1], "SUBSTRING") != 0) return -1;
+    if (require_int(E, &vs[2], "SUBSTRING") != 0) return -1;
+    int64_t start  = vs[1].i64;       /* 1-based */
+    int64_t length = vs[2].i64;
+    if (start  < 1) return eval_err(E, "SUBSTRING: start must be >= 1");
+    if (length < 0) return eval_err(E, "SUBSTRING: length must be >= 0");
+    int64_t in_n = (int64_t)vs[0].str_n;
+    int64_t s = start - 1;
+    if (s >= in_n) { out->kind = VK_UTF8; out->str = ""; out->str_n = 0; return 0; }
+    int64_t avail = in_n - s;
+    if (length > avail) length = avail;
+    char *buf = malloc((size_t)length + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    if (length > 0) memcpy(buf, vs[0].str + s, (size_t)length);
+    buf[length] = '\0';
+    return emit_str(E, buf, (size_t)length, out);
+}
+
+static int fn_left(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "LEFT") != 0) return -1;
+    if (require_int(E, &vs[1], "LEFT") != 0) return -1;
+    int64_t n = vs[1].i64;
+    if (n < 0) n = 0;
+    if (n > (int64_t)vs[0].str_n) n = (int64_t)vs[0].str_n;
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    if (n > 0) memcpy(buf, vs[0].str, (size_t)n);
+    buf[n] = '\0';
+    return emit_str(E, buf, (size_t)n, out);
+}
+
+static int fn_right(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "RIGHT") != 0) return -1;
+    if (require_int(E, &vs[1], "RIGHT") != 0) return -1;
+    int64_t n = vs[1].i64;
+    if (n < 0) n = 0;
+    if (n > (int64_t)vs[0].str_n) n = (int64_t)vs[0].str_n;
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    if (n > 0) memcpy(buf, vs[0].str + vs[0].str_n - (size_t)n, (size_t)n);
+    buf[n] = '\0';
+    return emit_str(E, buf, (size_t)n, out);
+}
+
+static int trim_helper(Eval *E, Value *vs, Value *out,
+                       int trim_left, int trim_right, const char *name) {
+    if (require_str(E, &vs[0], name) != 0) return -1;
+    size_t s = 0, e = vs[0].str_n;
+    if (trim_left)  while (s < e && (unsigned char)vs[0].str[s]     <= ' ') ++s;
+    if (trim_right) while (e > s && (unsigned char)vs[0].str[e - 1] <= ' ') --e;
+    size_t n = e - s;
+    char *buf = malloc(n + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    /* Guard on the original length: if the input is empty, vs[0].str
+     * may be NULL (Arrow allows that for length-0 string arrays), and
+     * memcpy(_, NULL, _) is UB even with size 0. */
+    if (vs[0].str_n != 0) memcpy(buf, vs[0].str + s, n);
+    buf[n] = '\0';
+    return emit_str(E, buf, n, out);
+}
+static int fn_trim (Eval *E, Value *vs, Value *out) { return trim_helper(E, vs, out, 1, 1, "TRIM");  }
+static int fn_ltrim(Eval *E, Value *vs, Value *out) { return trim_helper(E, vs, out, 1, 0, "LTRIM"); }
+static int fn_rtrim(Eval *E, Value *vs, Value *out) { return trim_helper(E, vs, out, 0, 1, "RTRIM"); }
+
+static int case_helper(Eval *E, Value *vs, Value *out, int to_upper, const char *name) {
+    if (require_str(E, &vs[0], name) != 0) return -1;
+    size_t n = vs[0].str_n;
+    char *buf = malloc(n + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)vs[0].str[i];
+        buf[i] = (char)(to_upper ? toupper(c) : tolower(c));
+    }
+    buf[n] = '\0';
+    return emit_str(E, buf, n, out);
+}
+static int fn_lower(Eval *E, Value *vs, Value *out) { return case_helper(E, vs, out, 0, "LOWER"); }
+static int fn_upper(Eval *E, Value *vs, Value *out) { return case_helper(E, vs, out, 1, "UPPER"); }
+
+static int fn_reverse(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "REVERSE") != 0) return -1;
+    size_t n = vs[0].str_n;
+    char *buf = malloc(n + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    for (size_t i = 0; i < n; ++i) buf[i] = vs[0].str[n - 1 - i];
+    buf[n] = '\0';
+    return emit_str(E, buf, n, out);
+}
+
+static int fn_replace(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "REPLACE") != 0) return -1;
+    if (require_str(E, &vs[1], "REPLACE") != 0) return -1;
+    if (require_str(E, &vs[2], "REPLACE") != 0) return -1;
+    const char *s = vs[0].str; size_t sn  = vs[0].str_n;
+    const char *f = vs[1].str; size_t fln = vs[1].str_n;
+    const char *r = vs[2].str; size_t rn  = vs[2].str_n;
+
+    /* Empty pattern: SSIS returns the source unchanged. */
+    if (fln == 0) {
+        char *buf = malloc(sn + 1);
+        if (!buf) return eval_err(E, "out of memory");
+        if (sn > 0) memcpy(buf, s, sn);
+        buf[sn] = '\0';
+        return emit_str(E, buf, sn, out);
+    }
+
+    size_t cap = sn + 16, n = 0;
+    char *buf = malloc(cap + 1);
+    if (!buf) return eval_err(E, "out of memory");
+    size_t i = 0;
+    while (i < sn) {
+        if (i + fln <= sn && memcmp(s + i, f, fln) == 0) {
+            if (n + rn > cap) {
+                while (n + rn > cap) cap *= 2;
+                char *nb = realloc(buf, cap + 1);
+                if (!nb) { free(buf); return eval_err(E, "out of memory"); }
+                buf = nb;
+            }
+            if (rn > 0) memcpy(buf + n, r, rn);
+            n += rn;
+            i += fln;
+        } else {
+            if (n + 1 > cap) {
+                cap *= 2;
+                char *nb = realloc(buf, cap + 1);
+                if (!nb) { free(buf); return eval_err(E, "out of memory"); }
+                buf = nb;
+            }
+            buf[n++] = s[i++];
+        }
+    }
+    buf[n] = '\0';
+    return emit_str(E, buf, n, out);
+}
+
+static int fn_findstring(Eval *E, Value *vs, Value *out) {
+    if (require_str(E, &vs[0], "FINDSTRING") != 0) return -1;
+    if (require_str(E, &vs[1], "FINDSTRING") != 0) return -1;
+    if (require_int(E, &vs[2], "FINDSTRING") != 0) return -1;
+    const char *s = vs[0].str; size_t sn  = vs[0].str_n;
+    const char *f = vs[1].str; size_t fln = vs[1].str_n;
+    int64_t occ = vs[2].i64;
+    if (occ < 1) return eval_err(E, "FINDSTRING: occurrence must be >= 1");
+    out->kind = VK_INT64; out->i64 = 0;
+    if (fln == 0) return 0;
+    int64_t found = 0;
+    size_t i = 0;
+    while (i + fln <= sn) {
+        if (memcmp(s + i, f, fln) == 0) {
+            if (++found == occ) { out->i64 = (int64_t)(i + 1); return 0; }
+            i += fln;            /* non-overlapping */
+        } else {
+            ++i;
+        }
+    }
+    return 0;
+}
+
+/* Numeric — ABS preserves the input's numeric kind; the rest return float. */
+static double as_double(const Value *v) {
+    return v->kind == VK_INT64 ? (double)v->i64 : v->f64;
+}
+
+static int fn_abs(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "ABS") != 0) return -1;
+    if (vs[0].kind == VK_INT64) {
+        out->kind = VK_INT64;
+        out->i64 = vs[0].i64 < 0 ? -vs[0].i64 : vs[0].i64;
+    } else {
+        out->kind = VK_FLOAT64; out->f64 = fabs(vs[0].f64);
+    }
+    return 0;
+}
+
+static int fn_power(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "POWER") != 0) return -1;
+    if (require_num(E, &vs[1], "POWER") != 0) return -1;
+    out->kind = VK_FLOAT64;
+    out->f64 = pow(as_double(&vs[0]), as_double(&vs[1]));
+    return 0;
+}
+
+static int fn_square(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "SQUARE") != 0) return -1;
+    double d = as_double(&vs[0]);
+    out->kind = VK_FLOAT64; out->f64 = d * d;
+    return 0;
+}
+
+static int fn_sqrt(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "SQRT") != 0) return -1;
+    out->kind = VK_FLOAT64; out->f64 = sqrt(as_double(&vs[0]));
+    return 0;
+}
+
+static int fn_round(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "ROUND") != 0) return -1;
+    if (require_int(E, &vs[1], "ROUND") != 0) return -1;
+    int64_t d = vs[1].i64;
+    if (d < 0 || d > 15) return eval_err(E, "ROUND: decimals must be in [0,15]");
+    double m = pow(10.0, (double)d);
+    out->kind = VK_FLOAT64;
+    out->f64 = round(as_double(&vs[0]) * m) / m;
+    return 0;
+}
+
+static int fn_ceiling(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "CEILING") != 0) return -1;
+    out->kind = VK_FLOAT64; out->f64 = ceil(as_double(&vs[0]));
+    return 0;
+}
+
+static int fn_floor(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "FLOOR") != 0) return -1;
+    out->kind = VK_FLOAT64; out->f64 = floor(as_double(&vs[0]));
+    return 0;
+}
+
+static int fn_sign(Eval *E, Value *vs, Value *out) {
+    if (require_num(E, &vs[0], "SIGN") != 0) return -1;
+    out->kind = VK_INT64;
+    if (vs[0].kind == VK_INT64) {
+        out->i64 = (vs[0].i64 > 0) - (vs[0].i64 < 0);
+    } else {
+        out->i64 = (vs[0].f64 > 0.0) - (vs[0].f64 < 0.0);
+    }
+    return 0;
+}
+
+/* Dispatch. ISNULL/REPLACENULL must observe NULL on their first arg
+ * rather than propagating; every other function propagates NULL when
+ * any arg is NULL. */
+static int eval_call(Eval *E, Par *P, const Node *n, Value *out) {
+    FnId   fn   = n->call.fn;
+    Node **args = n->call.args;
+    size_t na   = n->call.n_args;
+    memset(out, 0, sizeof *out);
+
+    if (fn == FN_ISNULL) {
+        Value a;
+        if (eval_node(E, P, args[0], &a) != 0) return -1;
+        out->kind = VK_BOOL; out->b = a.is_null ? 1 : 0;
+        return 0;
+    }
+    if (fn == FN_REPLACENULL) {
+        Value a;
+        if (eval_node(E, P, args[0], &a) != 0) return -1;
+        if (!a.is_null) { *out = a; return 0; }
+        return eval_node(E, P, args[1], out);
+    }
+
+    /* All other functions: evaluate args, propagate NULL. The explicit
+     * zero-init is for clang-analyzer's benefit — eval_node already zeros
+     * each output, but the analyzer can't follow that across the array. */
+    Value vs[8] = {0};     /* matches MAX_ARGS in p_call_args */
+    for (size_t i = 0; i < na; ++i) {
+        if (eval_node(E, P, args[i], &vs[i]) != 0) return -1;
+    }
+    for (size_t i = 0; i < na; ++i) {
+        if (vs[i].is_null) { out->is_null = 1; return 0; }
+    }
+
+    switch (fn) {
+        case FN_LEN:        return fn_len       (E, vs, out);
+        case FN_SUBSTRING:  return fn_substring (E, vs, out);
+        case FN_LEFT:       return fn_left      (E, vs, out);
+        case FN_RIGHT:      return fn_right     (E, vs, out);
+        case FN_TRIM:       return fn_trim      (E, vs, out);
+        case FN_LTRIM:      return fn_ltrim     (E, vs, out);
+        case FN_RTRIM:      return fn_rtrim     (E, vs, out);
+        case FN_LOWER:      return fn_lower     (E, vs, out);
+        case FN_UPPER:      return fn_upper     (E, vs, out);
+        case FN_REPLACE:    return fn_replace   (E, vs, out);
+        case FN_FINDSTRING: return fn_findstring(E, vs, out);
+        case FN_REVERSE:    return fn_reverse   (E, vs, out);
+        case FN_ABS:        return fn_abs       (E, vs, out);
+        case FN_POWER:      return fn_power     (E, vs, out);
+        case FN_SQUARE:     return fn_square    (E, vs, out);
+        case FN_SQRT:       return fn_sqrt      (E, vs, out);
+        case FN_ROUND:      return fn_round     (E, vs, out);
+        case FN_CEILING:    return fn_ceiling   (E, vs, out);
+        case FN_FLOOR:      return fn_floor     (E, vs, out);
+        case FN_SIGN:       return fn_sign      (E, vs, out);
+        case FN_ISNULL:
+        case FN_REPLACENULL: /* handled above */ break;
+    }
+    return eval_err(E, "internal: unhandled function id");
+}
+
+
 static int eval_node(Eval *E, Par *P, const Node *n, Value *out) {
     memset(out, 0, sizeof *out);
     switch (n->kind) {
@@ -1241,6 +1699,8 @@ static int eval_node(Eval *E, Par *P, const Node *n, Value *out) {
             if (eval_node(E, P, n->cast.a, &a) != 0) return -1;
             return do_cast(E, n->cast.dt, n->cast.has_len, n->cast.len, &a, out);
         }
+        case N_CALL:
+            return eval_call(E, P, n, out);
     }
     return eval_err(E, "internal: unknown node");
 }
