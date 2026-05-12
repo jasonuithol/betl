@@ -132,6 +132,7 @@ add_library(betl_core STATIC
     src/runtime/transform_split.c
     src/runtime/transform_unpivot.c
     src/runtime/transform_pivot.c
+    src/runtime/transform_multicast.c
     src/yaml/yaml_load.c
 )
 target_include_directories(betl_core PUBLIC

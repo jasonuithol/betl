@@ -121,6 +121,7 @@ int betl_tx_register_limit    (BetlRegistry *r);
 int betl_tx_register_split    (BetlRegistry *r);
 int betl_tx_register_unpivot  (BetlRegistry *r);
 int betl_tx_register_pivot    (BetlRegistry *r);
+int betl_tx_register_multicast(BetlRegistry *r);
 
 #ifdef __cplusplus
 }

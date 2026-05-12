@@ -355,6 +355,15 @@ set_tests_properties(pivot_unpivot PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: pivot/unpivot tests passed"
 )
 
+# --- multicast transform ----------------------------------------------------
+# Fan-one-to-N: each tap downstream sees the same row count. No Lua needed.
+add_executable(test_multicast test_multicast.c)
+target_link_libraries(test_multicast PRIVATE betl_core)
+add_test(NAME multicast COMMAND test_multicast)
+set_tests_properties(multicast PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: multicast end-to-end test passed"
+)
+
 # --- csv.write end-to-end ---------------------------------------------------
 # No Lua dependency: the test pipelines are gen_int64 / gen_strings → csv.write,
 # and the assertions compare exact file bytes after the pipeline runs.
