@@ -535,6 +535,80 @@ public static class Converter
                     Mappers.ScriptComponent.Emit(w, pkg, c, fromId);
                     break;
 
+                /* New in 0.2.x: the rest of the SSIS default transform
+                 * set. Some are real translations (Audit, CharacterMap,
+                 * CopyColumn, Merge); the rest emit a passthrough +
+                 * TODO so downstream wiring still validates. */
+                case "Microsoft.RowCount":
+                    Mappers.RowCount.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.Audit":
+                    Mappers.Audit.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.CharacterMap":
+                    Mappers.CharacterMap.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.CopyMap":
+                case "Microsoft.CopyColumn":
+                    Mappers.CopyColumn.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.OLEDBCommand":
+                    Mappers.OledbCommand.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.Merge":
+                    Mappers.Merge.Emit(w, pkg, c, preds);
+                    break;
+                case "Microsoft.SCD":
+                case "Microsoft.SlowlyChangingDimension":
+                    Mappers.Scd.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.PercentSampling":
+                case "Microsoft.PercentageSampling":
+                    Mappers.Sampling.Emit(w, pkg, c, fromId, isPercentage: true);
+                    break;
+                case "Microsoft.RowSampling":
+                    Mappers.Sampling.Emit(w, pkg, c, fromId, isPercentage: false);
+                    break;
+                case "Microsoft.FuzzyLookup":
+                    Mappers.RareStub.FuzzyLookup(w, c, fromId);
+                    break;
+                case "Microsoft.FuzzyGrouping":
+                    Mappers.RareStub.FuzzyGrouping(w, c, fromId);
+                    break;
+                case "Microsoft.TermLookup":
+                    Mappers.RareStub.TermLookup(w, c, fromId);
+                    break;
+                case "Microsoft.TermExtraction":
+                    Mappers.RareStub.TermExtraction(w, c, fromId);
+                    break;
+                case "Microsoft.Cache":
+                case "Microsoft.CacheTransform":
+                    Mappers.RareStub.CacheTransform(w, c, fromId);
+                    break;
+                case "Microsoft.ExportColumn":
+                    Mappers.RareStub.ExportColumn(w, c, fromId);
+                    break;
+                case "Microsoft.ImportColumn":
+                    Mappers.RareStub.ImportColumn(w, c, fromId);
+                    break;
+                case "Microsoft.CDCSplitter":
+                    Mappers.RareStub.CdcSplitter(w, c, fromId);
+                    break;
+                case "Microsoft.CDCSource":
+                    Mappers.RareStub.CdcSource(w, c);
+                    break;
+                case "Microsoft.BalancedDataDistributor":
+                    Mappers.RareStub.BalancedDataDistributor(w, c, fromId);
+                    break;
+                case "Microsoft.DQSCleansing":
+                case "Microsoft.DataCorrectionComponent":
+                    Mappers.RareStub.DqsCleansing(w, c, fromId);
+                    break;
+                case "Microsoft.DataMiningQuery":
+                case "Microsoft.DataMiningModelTraining":
+                    Mappers.RareStub.DataMiningQuery(w, c, fromId);
+                    break;
+
                 default:
                     w.Line($"- id: {YamlWriter.Id(c.Name)}");
                     w.Indent(2);

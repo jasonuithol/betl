@@ -367,6 +367,124 @@ int main(void) {
 
     free(yaml);
 
+    /* --- transforms2.dtsx: the rest of the SSIS default transform set ---- */
+    const char *t2_out = "/tmp/betl_dtsx2yaml_transforms2.yml";
+    rc = run_convert(BETL_DTSX2YAML_TRANSFORMS2_FIXTURE, t2_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for transforms2 fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(t2_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read transforms2 YAML\n");
+        return 1;
+    }
+
+    /* Row Count → passthrough map + TODO naming the variable target. */
+    CHECK_CONTAINS(yaml, "id: counter");
+    CHECK_CONTAINS(yaml, "type: map");
+    CHECK_CONTAINS(yaml, "from: src");
+    CHECK_CONTAINS(yaml, "no mid-pipeline variable assignment");
+    CHECK_CONTAINS(yaml, "Original SSIS target variable: User::RowsProcessed");
+
+    /* Audit → map with 4 add: entries, one per audit metadata column. */
+    CHECK_CONTAINS(yaml, "id: tag");
+    CHECK_CONTAINS(yaml, "pkg_name:");
+    CHECK_CONTAINS(yaml, "= PackageName");
+    CHECK_CONTAINS(yaml, "machine:");
+    CHECK_CONTAINS(yaml, "= MachineName");
+    CHECK_CONTAINS(yaml, "start_at:");
+    CHECK_CONTAINS(yaml, "= ExecutionStartTime");
+    CHECK_CONTAINS(yaml, "who:");
+    CHECK_CONTAINS(yaml, "= UserName");
+
+    /* CharacterMap → UPPER([label]) / LOWER([label]) for the case ops,
+     * TODO header for Katakana. */
+    CHECK_CONTAINS(yaml, "id: charmap");
+    CHECK_CONTAINS(yaml, "label_up:");
+    CHECK_CONTAINS(yaml, "expr: 'UPPER([label])'");
+    CHECK_CONTAINS(yaml, "label_dn:");
+    CHECK_CONTAINS(yaml, "expr: 'LOWER([label])'");
+    CHECK_CONTAINS(yaml, "label_kana:");
+    CHECK_CONTAINS(yaml, "not expressible in ssisexpr");
+    CHECK_CONTAINS(yaml, "Katakana");
+
+    /* Copy Column → map with `add: id_copy: expr [id]`. */
+    CHECK_CONTAINS(yaml, "id: dup");
+    CHECK_CONTAINS(yaml, "id_copy:");
+    CHECK_CONTAINS(yaml, "expr: '[id]'");
+
+    /* OLE DB Command → passthrough map + TODO preserving SqlCommand. */
+    CHECK_CONTAINS(yaml, "id: touch");
+    CHECK_CONTAINS(yaml, "per-row SQL primitive");
+    CHECK_CONTAINS(yaml, "UPDATE dbo.Things SET seen_at = GETUTCDATE() WHERE id = ?");
+
+    /* Merge → union with two from: refs + sort-order caveat. */
+    CHECK_CONTAINS(yaml, "id: mrg");
+    CHECK_CONTAINS(yaml, "type: union");
+    CHECK_CONTAINS(yaml, "from: [src, src2]");
+    CHECK_CONTAINS(yaml, "SSIS Merge preserves sort order");
+
+    /* SCD → passthrough + TODO mentioning MERGE rewrite + dim table. */
+    CHECK_CONTAINS(yaml, "id: dimupdate");
+    CHECK_CONTAINS(yaml, "Slowly Changing Dimension has no betl equivalent");
+    CHECK_CONTAINS(yaml, "MERGEs the staged rows");
+    CHECK_CONTAINS(yaml, "Dimension table: [dbo].[DimThing]");
+    CHECK_CONTAINS(yaml, "SELECT dim_id, label FROM dbo.DimThing");
+
+    /* Percentage / Row Sampling — both passthrough + TODO + preserved values. */
+    CHECK_CONTAINS(yaml, "id: pctsamp");
+    CHECK_CONTAINS(yaml, "Percentage Sampling");
+    CHECK_CONTAINS(yaml, "Original sample size: 10");
+    CHECK_CONTAINS(yaml, "Original seed: 42");
+    CHECK_CONTAINS(yaml, "id: rowsamp");
+    CHECK_CONTAINS(yaml, "Row Sampling");
+    CHECK_CONTAINS(yaml, "Original sample size: 1000");
+
+    /* Fuzzy Lookup / Grouping — passthrough + TODO. */
+    CHECK_CONTAINS(yaml, "id: fzlk");
+    CHECK_CONTAINS(yaml, "Fuzzy Lookup has no betl equivalent");
+    CHECK_CONTAINS(yaml, "id: fzgp");
+    CHECK_CONTAINS(yaml, "Fuzzy Grouping has no betl equivalent");
+
+    /* Term Lookup / Extraction. */
+    CHECK_CONTAINS(yaml, "id: tmlk");
+    CHECK_CONTAINS(yaml, "Term Lookup has no betl equivalent");
+    CHECK_CONTAINS(yaml, "id: tmex");
+    CHECK_CONTAINS(yaml, "Term Extraction has no betl equivalent");
+
+    /* Cache Transform — passthrough + TODO. */
+    CHECK_CONTAINS(yaml, "id: cachet");
+    CHECK_CONTAINS(yaml, "Cache Transform has no betl equivalent");
+
+    /* Export / Import Column. */
+    CHECK_CONTAINS(yaml, "id: expcol");
+    CHECK_CONTAINS(yaml, "Export Column has no betl equivalent");
+    CHECK_CONTAINS(yaml, "id: impcol");
+    CHECK_CONTAINS(yaml, "Import Column has no betl equivalent");
+
+    /* CDC Splitter (passthrough) + CDC Source (mssql.read scaffold). */
+    CHECK_CONTAINS(yaml, "id: cdcsp");
+    CHECK_CONTAINS(yaml, "CDC Splitter has no betl equivalent");
+    CHECK_CONTAINS(yaml, "id: cdcsrc");
+    CHECK_CONTAINS(yaml, "type: mssql.read");
+    CHECK_CONTAINS(yaml, "CDC Source has no direct betl equivalent");
+    CHECK_CONTAINS(yaml, "cdc.fn_cdc_get_all_changes_CAPTURE");
+
+    /* Balanced Data Distributor. */
+    CHECK_CONTAINS(yaml, "id: bdd");
+    CHECK_CONTAINS(yaml, "Balanced Data Distributor has no betl equivalent");
+
+    /* DQS Cleansing. */
+    CHECK_CONTAINS(yaml, "id: dqs");
+    CHECK_CONTAINS(yaml, "DQS Cleansing has no betl equivalent");
+
+    /* Data Mining Query. */
+    CHECK_CONTAINS(yaml, "id: dmq");
+    CHECK_CONTAINS(yaml, "Data Mining Query has no betl equivalent");
+
+    free(yaml);
+
     if (failures > 0) {
         fprintf(stderr, "FAIL: %d substring check(s) missed\n", failures);
         return 1;

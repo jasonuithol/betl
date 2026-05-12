@@ -1,0 +1,426 @@
+<?xml version="1.0"?>
+<!--
+  Second transform-coverage fixture for betl-dtsx2yaml. Exercises the
+  remaining default SSIS transforms not covered by transforms.dtsx:
+
+    Translated to real betl primitives:
+      RowCount       - passthrough + TODO (no variable target in betl)
+      Audit          - map with `add:` (one entry per audit metadata column)
+      CharacterMap   - map with UPPER / LOWER / TODO for locale ops
+      CopyColumn     - map with `add: { new: { expr: [src] } }`
+      Merge          - union (with sort-order caveat)
+
+    Stub-only:
+      OLEDB Command, SCD, PercentageSampling, RowSampling,
+      Fuzzy Lookup, Fuzzy Grouping, Term Lookup, Term Extraction,
+      Cache Transform, Export Column, Import Column,
+      CDC Splitter, CDC Source, Balanced Data Distributor,
+      DQS Cleansing, Data Mining Query.
+
+  Layout: one OLEDB Source named "Src" fans rows out to every
+  transform (each transform's input is wired directly off Src) so each
+  emission can be asserted independently. Cache Transform and CDC
+  Source have no input (they're cache/source endpoints in SSIS).
+
+  Merge has two real upstreams (Src and Src2).
+-->
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:ObjectName="TransformsTail"
+    DTS:ExecutableType="Microsoft.Package">
+
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+        DTS:ObjectName="Warehouse"
+        DTS:DTSID="{a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1}"
+        DTS:CreationName="OLEDB">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+            DTS:ConnectionString="Data Source=db.example.com;Initial Catalog=Sales;Integrated Security=SSPI;Provider=MSOLEDBSQL;"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <DTS:Executables>
+    <DTS:Executable
+        DTS:ObjectName="TailFlow"
+        DTS:ExecutableType="Microsoft.Pipeline">
+      <DTS:ObjectData>
+        <pipeline>
+          <components>
+
+            <!-- Two source rows so Merge has two real upstreams -->
+            <component
+                refId="Package\TailFlow\Src"
+                name="Src"
+                componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="AccessMode">2</property>
+                <property name="SqlCommand">SELECT id, label, txt FROM dbo.Things ORDER BY id</property>
+              </properties>
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[Warehouse]"/>
+              </connections>
+              <outputs>
+                <output name="OLE DB Source Output"/>
+              </outputs>
+            </component>
+            <component
+                refId="Package\TailFlow\Src2"
+                name="Src2"
+                componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="AccessMode">2</property>
+                <property name="SqlCommand">SELECT id, label FROM dbo.MoreThings ORDER BY id</property>
+              </properties>
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[Warehouse]"/>
+              </connections>
+              <outputs>
+                <output name="OLE DB Source Output"/>
+              </outputs>
+            </component>
+
+            <!-- 1. Row Count -->
+            <component
+                refId="Package\TailFlow\Counter"
+                name="Counter"
+                componentClassID="Microsoft.RowCount">
+              <properties>
+                <property name="VariableName">User::RowsProcessed</property>
+              </properties>
+              <outputs>
+                <output name="Row Count Output"/>
+              </outputs>
+            </component>
+
+            <!-- 2. Audit — picks 4 audit metadata fields -->
+            <component
+                refId="Package\TailFlow\Tag"
+                name="Tag"
+                componentClassID="Microsoft.Audit">
+              <outputs>
+                <output name="Audit Output">
+                  <outputColumns>
+                    <outputColumn name="pkg_name" dataType="wstr">
+                      <properties>
+                        <property name="AuditType">2</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="machine" dataType="wstr">
+                      <properties>
+                        <property name="AuditType">5</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="start_at" dataType="wstr">
+                      <properties>
+                        <property name="AuditType">4</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="who" dataType="wstr">
+                      <properties>
+                        <property name="AuditType">6</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- 3. Character Map: upper, lower, plus a Katakana TODO case -->
+            <component
+                refId="Package\TailFlow\CharMap"
+                name="CharMap"
+                componentClassID="Microsoft.CharacterMap">
+              <outputs>
+                <output name="Character Map Output">
+                  <outputColumns>
+                    <outputColumn name="label_up" dataType="wstr">
+                      <properties>
+                        <property name="MapFlags">1</property>
+                        <property name="InputColumnLineageID">label</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="label_dn" dataType="wstr">
+                      <properties>
+                        <property name="MapFlags">2</property>
+                        <property name="InputColumnLineageID">label</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="label_kana" dataType="wstr">
+                      <properties>
+                        <property name="MapFlags">16</property>
+                        <property name="InputColumnLineageID">label</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- 4. Copy Column: id → id_copy -->
+            <component
+                refId="Package\TailFlow\Dup"
+                name="Dup"
+                componentClassID="Microsoft.CopyMap">
+              <outputs>
+                <output name="Copy Column Output">
+                  <outputColumns>
+                    <outputColumn name="id_copy" dataType="i4" cachedName="id">
+                      <properties>
+                        <property name="CopyColumnInputColumnLineageID">id</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- 5. OLE DB Command -->
+            <component
+                refId="Package\TailFlow\Touch"
+                name="Touch"
+                componentClassID="Microsoft.OLEDBCommand">
+              <properties>
+                <property name="SqlCommand">UPDATE dbo.Things SET seen_at = GETUTCDATE() WHERE id = ?</property>
+              </properties>
+              <outputs>
+                <output name="OLE DB Command Output"/>
+              </outputs>
+            </component>
+
+            <!-- 6. Merge: takes two sorted inputs (Src + Src2) -->
+            <component
+                refId="Package\TailFlow\Mrg"
+                name="Mrg"
+                componentClassID="Microsoft.Merge">
+              <outputs>
+                <output name="Merge Output"/>
+              </outputs>
+            </component>
+
+            <!-- 7. SCD (Slowly Changing Dimension) -->
+            <component
+                refId="Package\TailFlow\DimUpdate"
+                name="DimUpdate"
+                componentClassID="Microsoft.SCD">
+              <properties>
+                <property name="TableOrViewName">[dbo].[DimThing]</property>
+                <property name="SqlCommand">SELECT dim_id, label FROM dbo.DimThing WHERE current_ind = 1</property>
+                <property name="UpdateChangingAttributeHistory">true</property>
+              </properties>
+              <outputs>
+                <output name="SCD Output"/>
+              </outputs>
+            </component>
+
+            <!-- 8. Percentage Sampling -->
+            <component
+                refId="Package\TailFlow\PctSamp"
+                name="PctSamp"
+                componentClassID="Microsoft.PercentSampling">
+              <properties>
+                <property name="SamplingValue">10</property>
+                <property name="SamplingSeed">42</property>
+              </properties>
+              <outputs>
+                <output name="Sampling Selected Output"/>
+                <output name="Sampling Unselected Output"/>
+              </outputs>
+            </component>
+
+            <!-- 9. Row Sampling -->
+            <component
+                refId="Package\TailFlow\RowSamp"
+                name="RowSamp"
+                componentClassID="Microsoft.RowSampling">
+              <properties>
+                <property name="SampleSize">1000</property>
+                <property name="SamplingSeed">7</property>
+              </properties>
+              <outputs>
+                <output name="Sampling Selected Output"/>
+                <output name="Sampling Unselected Output"/>
+              </outputs>
+            </component>
+
+            <!-- 10. Fuzzy Lookup -->
+            <component
+                refId="Package\TailFlow\FzLk"
+                name="FzLk"
+                componentClassID="Microsoft.FuzzyLookup">
+              <outputs>
+                <output name="Fuzzy Lookup Output"/>
+              </outputs>
+            </component>
+
+            <!-- 11. Fuzzy Grouping -->
+            <component
+                refId="Package\TailFlow\FzGp"
+                name="FzGp"
+                componentClassID="Microsoft.FuzzyGrouping">
+              <outputs>
+                <output name="Fuzzy Grouping Output"/>
+              </outputs>
+            </component>
+
+            <!-- 12. Term Lookup -->
+            <component
+                refId="Package\TailFlow\TmLk"
+                name="TmLk"
+                componentClassID="Microsoft.TermLookup">
+              <outputs>
+                <output name="Term Lookup Output"/>
+              </outputs>
+            </component>
+
+            <!-- 13. Term Extraction -->
+            <component
+                refId="Package\TailFlow\TmEx"
+                name="TmEx"
+                componentClassID="Microsoft.TermExtraction">
+              <outputs>
+                <output name="Term Extraction Output"/>
+              </outputs>
+            </component>
+
+            <!-- 14. Cache Transform (no input — caches a feeder for Lookup) -->
+            <component
+                refId="Package\TailFlow\CacheT"
+                name="CacheT"
+                componentClassID="Microsoft.Cache">
+              <outputs>
+                <output name="Cache Transform Output"/>
+              </outputs>
+            </component>
+
+            <!-- 15. Export Column -->
+            <component
+                refId="Package\TailFlow\ExpCol"
+                name="ExpCol"
+                componentClassID="Microsoft.ExportColumn">
+              <outputs>
+                <output name="Export Column Output"/>
+              </outputs>
+            </component>
+
+            <!-- 16. Import Column -->
+            <component
+                refId="Package\TailFlow\ImpCol"
+                name="ImpCol"
+                componentClassID="Microsoft.ImportColumn">
+              <outputs>
+                <output name="Import Column Output"/>
+              </outputs>
+            </component>
+
+            <!-- 17. CDC Splitter -->
+            <component
+                refId="Package\TailFlow\CdcSp"
+                name="CdcSp"
+                componentClassID="Microsoft.CDCSplitter">
+              <outputs>
+                <output name="InsertOutput"/>
+                <output name="UpdateOutput"/>
+                <output name="DeleteOutput"/>
+              </outputs>
+            </component>
+
+            <!-- 18. CDC Source (no input) -->
+            <component
+                refId="Package\TailFlow\CdcSrc"
+                name="CdcSrc"
+                componentClassID="Microsoft.CDCSource">
+              <outputs>
+                <output name="CDC Source Output"/>
+              </outputs>
+            </component>
+
+            <!-- 19. Balanced Data Distributor -->
+            <component
+                refId="Package\TailFlow\Bdd"
+                name="Bdd"
+                componentClassID="Microsoft.BalancedDataDistributor">
+              <outputs>
+                <output name="BDD Output 1"/>
+                <output name="BDD Output 2"/>
+              </outputs>
+            </component>
+
+            <!-- 20. DQS Cleansing -->
+            <component
+                refId="Package\TailFlow\Dqs"
+                name="Dqs"
+                componentClassID="Microsoft.DQSCleansing">
+              <outputs>
+                <output name="DQS Output"/>
+              </outputs>
+            </component>
+
+            <!-- 21. Data Mining Query -->
+            <component
+                refId="Package\TailFlow\Dmq"
+                name="Dmq"
+                componentClassID="Microsoft.DataMiningQuery">
+              <outputs>
+                <output name="DM Output"/>
+              </outputs>
+            </component>
+
+          </components>
+
+          <paths>
+            <!-- Every input-bearing transform reads directly from Src
+                 so each emission is independent. Merge gets Src + Src2.
+                 Cache Transform and CDC Source have no input. -->
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Counter.Inputs[Row Count Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Tag.Inputs[Audit Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\CharMap.Inputs[Character Map Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Dup.Inputs[Copy Column Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Touch.Inputs[OLE DB Command Input]"/>
+
+            <!-- Merge: Src (left) + Src2 (right) -->
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Mrg.Inputs[Merge Input 1]"/>
+            <path startId="Package\TailFlow\Src2.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Mrg.Inputs[Merge Input 2]"/>
+
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\DimUpdate.Inputs[SCD Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\PctSamp.Inputs[Sampling Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\RowSamp.Inputs[Sampling Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\FzLk.Inputs[Fuzzy Lookup Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\FzGp.Inputs[Fuzzy Grouping Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\TmLk.Inputs[Term Lookup Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\TmEx.Inputs[Term Extraction Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\ExpCol.Inputs[Export Column Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\ImpCol.Inputs[Import Column Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\CacheT.Inputs[Cache Transform Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\CdcSp.Inputs[CDC Splitter Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Bdd.Inputs[BDD Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Dqs.Inputs[DQS Input]"/>
+            <path startId="Package\TailFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\TailFlow\Dmq.Inputs[DM Input]"/>
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+</DTS:Executable>
