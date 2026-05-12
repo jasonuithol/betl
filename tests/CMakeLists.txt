@@ -237,8 +237,24 @@ if(BETL_LUA_FOUND)
         set_tests_properties(dotnet_task PROPERTIES
             SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "ok: dotnet.task hello-world test passed"
-            # AOT compile can be slow on a cold NuGet cache; budget 3 min.
             TIMEOUT 180
+        )
+
+        # End-to-end: dotnet.script async transform.
+        add_executable(test_dotnet_script test_dotnet_script.c)
+        target_link_libraries(test_dotnet_script PRIVATE betl_core)
+        set_target_properties(test_dotnet_script PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_dotnet_script PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_DOTNET_TARGET}>"
+        )
+        add_dependencies(test_dotnet_script ${BETL_DOTNET_TARGET})
+        add_test(NAME dotnet_script
+            COMMAND test_dotnet_script $<TARGET_FILE:${BETL_DOTNET_TARGET}>
+        )
+        set_tests_properties(dotnet_script PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: dotnet.script test passed"
+            TIMEOUT 300
         )
     endif()
 

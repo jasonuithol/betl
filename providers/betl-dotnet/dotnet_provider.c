@@ -248,14 +248,14 @@ static void fnv1a_64(const char *data, size_t n, uint64_t *state) {
     *state = h;
 }
 
-/* Hash every file in the shim dir, sorted by filename, into the
- * cache key seed. Without this a developer-side shim edit silently
- * hits the old cache and dlopens a stale .so — observed during phase
- * 1 development. */
-static int hash_shim_dir(const char *shim_dir, uint64_t *h) {
-    DIR *d = opendir(shim_dir);
+/* Hash every file in the shim dir (recursing one level into kind-
+ * specific subdirs), sorted by filename, into the cache key seed.
+ * Without this a developer-side shim edit silently hits the old
+ * cache and dlopens a stale .so — observed during phase 1
+ * development. */
+static int hash_one_dir(const char *dir, const char *prefix, uint64_t *h) {
+    DIR *d = opendir(dir);
     if (!d) return -1;
-    /* Collect filenames, sort for determinism. */
     char *names[64] = {0};
     size_t n = 0;
     struct dirent *e;
@@ -264,7 +264,6 @@ static int hash_shim_dir(const char *shim_dir, uint64_t *h) {
         names[n++] = strdup(e->d_name);
     }
     closedir(d);
-    /* Simple insertion sort — n is tiny. */
     for (size_t i = 1; i < n; ++i) {
         for (size_t j = i; j > 0 && strcmp(names[j - 1], names[j]) > 0; --j) {
             char *tmp = names[j]; names[j] = names[j - 1]; names[j - 1] = tmp;
@@ -272,21 +271,37 @@ static int hash_shim_dir(const char *shim_dir, uint64_t *h) {
     }
     for (size_t i = 0; i < n; ++i) {
         char path[512];
-        snprintf(path, sizeof path, "%s/%s", shim_dir, names[i]);
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            for (size_t k = i; k < n; ++k) free(names[k]);
+            return -1;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            char sub_prefix[256];
+            snprintf(sub_prefix, sizeof sub_prefix, "%s%s/", prefix, names[i]);
+            int rc = hash_one_dir(path, sub_prefix, h);
+            free(names[i]);
+            if (rc != 0) { for (size_t k = i + 1; k < n; ++k) free(names[k]); return -1; }
+            continue;
+        }
         FILE *f = fopen(path, "rb");
-        if (!f) { for (size_t k = 0; k < n; ++k) free(names[k]); return -1; }
+        if (!f) { for (size_t k = i; k < n; ++k) free(names[k]); return -1; }
+        fnv1a_64(prefix, strlen(prefix), h);
         fnv1a_64(names[i], strlen(names[i]), h);
         fnv1a_64("|", 1, h);
         char buf[4096];
         size_t r;
-        while ((r = fread(buf, 1, sizeof buf, f)) > 0) {
-            fnv1a_64(buf, r, h);
-        }
+        while ((r = fread(buf, 1, sizeof buf, f)) > 0) fnv1a_64(buf, r, h);
         fclose(f);
         fnv1a_64("\0", 1, h);
         free(names[i]);
     }
     return 0;
+}
+
+static int hash_shim_dir(const char *shim_dir, uint64_t *h) {
+    return hash_one_dir(shim_dir, "", h);
 }
 
 static int compute_cache_key(const char *source, const char *lang,
@@ -421,6 +436,12 @@ static int copy_dir_flat(const char *src_dir, const char *dst_dir) {
         asprintf(&sp, "%s/%s", src_dir, e->d_name);
         asprintf(&dp, "%s/%s", dst_dir, e->d_name);
         if (!sp || !dp) { free(sp); free(dp); closedir(d); return -1; }
+        /* Skip subdirectories — callers select which subdirs to merge
+         * in via the compile_request_t.shim_subdir field. */
+        struct stat st;
+        if (stat(sp, &st) == 0 && S_ISDIR(st.st_mode)) {
+            free(sp); free(dp); continue;
+        }
         int rc = copy_file(sp, dp);
         free(sp); free(dp);
         if (rc != 0) { closedir(d); return -1; }
@@ -429,14 +450,41 @@ static int copy_dir_flat(const char *src_dir, const char *dst_dir) {
     return 0;
 }
 
-/* Compile `source` (lang = "csharp" or "vbnet", kind = "task" or
- * "script") into a cached .so. On success *out_path holds the cache
- * path (caller frees). */
+/* Extra source files the caller wants in the build dir on top of the
+ * shim. Used by dotnet.script to inject a Generated.cs containing
+ * schema-typed InputRow / OutputRow definitions + per-cell extraction
+ * and emit code. */
+typedef struct {
+    const char *filename;     /* basename only — written into build_dir */
+    const char *content;
+    size_t      content_len;
+} extra_file_t;
+
+typedef struct {
+    const char         *user_source;
+    const char         *lang;          /* "csharp" only for now */
+    const char         *kind;          /* "task" or "script" */
+    const extra_file_t *extra_files;   /* NULL when n_extra is 0 */
+    size_t              n_extra;
+    /* Extra shim subdir to merge into the build (e.g. "script" for
+     * dotnet.script). The plugin's shim/ ships task-shared files at
+     * the top level and kind-specific files under shim/<kind>/. */
+    const char         *shim_subdir;   /* NULL or e.g. "script" */
+    /* Additional bytes mixed into the cache key. Used by dotnet.script
+     * to invalidate the cache when the input/output schema changes. */
+    const char         *extra_hash_in;
+    size_t              extra_hash_len;
+} compile_request_t;
+
+/* Compile per `req` into a cached .so. On success *out_path holds the
+ * cache path (caller frees). */
 static int compile_to_cache(BetlContext *ctx,
-                            const char *source, const char *lang,
-                            const char *kind,
+                            const compile_request_t *req,
                             char **out_path,
                             char *err, size_t err_cap) {
+    const char *source = req->user_source;
+    const char *lang   = req->lang;
+    const char *kind   = req->kind;
     char *cache = cache_dir();
     if (!cache || mkdir_p(cache) != 0) {
         snprintf(err, err_cap, "cache_dir: %s", strerror(errno));
@@ -456,6 +504,17 @@ static int compile_to_cache(BetlContext *ctx,
     if (compute_cache_key(source, lang, kind, shim_dir, key) != 0) {
         snprintf(err, err_cap, "cache key hash failed (shim_dir unreadable?)");
         free(cache); free(shim_dir); return -1;
+    }
+    /* Re-hash the user source + extra inputs back into the key when
+     * extra_hash_in is set. We do this by recomputing the hex string
+     * with extra bytes appended via fnv1a chaining on the existing
+     * value — simpler than re-engineering compute_cache_key. */
+    if (req->extra_hash_in && req->extra_hash_len) {
+        uint64_t h;
+        sscanf(key, "%" SCNx64, &h);
+        fnv1a_64("|", 1, &h);
+        fnv1a_64(req->extra_hash_in, req->extra_hash_len, &h);
+        snprintf(key, sizeof key, "%016" PRIx64, h);
     }
 
     char *cached = NULL;
@@ -488,6 +547,22 @@ static int compile_to_cache(BetlContext *ctx,
         snprintf(err, err_cap, "copy shim files");
         goto fail;
     }
+    if (req->shim_subdir) {
+        char *sub_src = NULL, *sub_dst = NULL;
+        asprintf(&sub_src, "%s/%s", shim_dir, req->shim_subdir);
+        asprintf(&sub_dst, "%s/%s", build_dir, req->shim_subdir);
+        if (!sub_src || !sub_dst) {
+            free(sub_src); free(sub_dst);
+            snprintf(err, err_cap, "OOM building subdir paths");
+            goto fail;
+        }
+        if (mkdir_p(sub_dst) != 0 || copy_dir_flat(sub_src, sub_dst) != 0) {
+            free(sub_src); free(sub_dst);
+            snprintf(err, err_cap, "copy shim/%s files", req->shim_subdir);
+            goto fail;
+        }
+        free(sub_src); free(sub_dst);
+    }
     /* Write user source. C# only for phase 1; VB.NET wires in later. */
     char *src_path = NULL;
     asprintf(&src_path, "%s/UserScript.cs", build_dir);
@@ -506,8 +581,30 @@ static int compile_to_cache(BetlContext *ctx,
     close(sfd);
     free(src_path);
 
+    /* Drop any extra files the caller wants (Generated.cs for
+     * dotnet.script). Same dir, same .csproj globbing — they get
+     * compiled together. */
+    for (size_t i = 0; i < req->n_extra; ++i) {
+        char *ep = NULL;
+        asprintf(&ep, "%s/%s", build_dir, req->extra_files[i].filename);
+        if (!ep) { snprintf(err, err_cap, "OOM"); goto fail; }
+        int efd = open(ep, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (efd < 0) {
+            snprintf(err, err_cap, "open %s: %s", ep, strerror(errno));
+            free(ep); goto fail;
+        }
+        if (write(efd, req->extra_files[i].content,
+                  req->extra_files[i].content_len)
+            != (ssize_t)req->extra_files[i].content_len) {
+            close(efd); free(ep);
+            snprintf(err, err_cap, "write %s", req->extra_files[i].filename);
+            goto fail;
+        }
+        close(efd); free(ep);
+    }
+
     betl_log(ctx, BETL_LOG_INFO,
-        "dotnet.task: AOT-compiling user script (cache key %s)", key);
+        "dotnet.%s: AOT-compiling user script (cache key %s)", kind, key);
 
     /* Run `dotnet publish`. Output goes to build_dir/out/. */
     char *out_arg = NULL;
@@ -661,8 +758,13 @@ static int dotnet_task_init(BetlContext *ctx, const char *cfg, void **state) {
         return BETL_ERR_UNSUPPORTED;
     }
 
-    if (compile_to_cache(ctx, t->source, t->lang, "task",
-                         &t->so_path, t->err, sizeof t->err) != 0) {
+    compile_request_t creq = {
+        .user_source = t->source,
+        .lang        = t->lang,
+        .kind        = "task",
+        .shim_subdir = "task",
+    };
+    if (compile_to_cache(ctx, &creq, &t->so_path, t->err, sizeof t->err) != 0) {
         betl_set_error(ctx, "dotnet.task: compile failed: %s", t->err);
         free(t->source); free(t->lang); free(t);
         return BETL_ERR_INVALID;
@@ -721,6 +823,869 @@ static int dotnet_task_run(void *state) {
 
 
 /* ============================================================== *
+ *  dotnet.script — async transform                                 *
+ *                                                                  *
+ *  Compile model differs from dotnet.task in two ways:              *
+ *    - Schema-typed Row classes generated from input + output_schema*
+ *      at init time, alongside the user source.                     *
+ *    - Compile happens lazily at first get_next (input schema isn't *
+ *      known until then), not at component init.                    *
+ * ============================================================== */
+
+typedef enum {
+    DS_INT64 = 1,
+    DS_FLOAT64,
+    DS_BOOL,
+    DS_UTF8,
+} DsType;
+
+typedef struct {
+    char  *name;
+    DsType type;
+    char   arrow_fmt;     /* 'l' / 'g' / 'b' / 'u' */
+} DsCol;
+
+/* Per-output-column growable staging — populated by Emit setter
+ * callbacks from C#, flushed to an Arrow leaf at end of each batch. */
+typedef struct {
+    DsType   type;
+    size_t   cap;
+    size_t   n;             /* set rows (= committed row count) */
+    uint8_t *nulls;
+    int64_t *i64_vals;
+    double  *f64_vals;
+    uint8_t *b_vals;        /* packed at finalize */
+    int32_t *u8_offsets;
+    char    *u8_data;
+    size_t   u8_len;
+    size_t   u8_cap;
+    /* The cell-set flag tracks which cells of the in-flight row have
+     * been written this commit cycle. Used to fall back to NULL for
+     * any column the script forgot to set. */
+    uint8_t  pending_null[1];   /* placeholder; really one bool per col */
+} DsOutCol;
+
+typedef int (*ds_init_fn)(BetlContext *ctx,
+                          void (*log)(BetlContext *, int, const char *),
+                          const char *(*get_param)(BetlContext *, const char *),
+                          const char *(*get_connection)(BetlContext *, const char *));
+typedef int (*ds_script_init_fn)(void);
+typedef int (*ds_register_emit_fn)(
+    void (*set_int64)  (void *, int, int64_t),
+    void (*set_float64)(void *, int, double),
+    void (*set_bool)   (void *, int, uint8_t),
+    void (*set_utf8)   (void *, int, const uint8_t *, int),
+    void (*set_null)   (void *, int),
+    void (*commit_row) (void *));
+typedef int (*ds_process_batch_fn)(struct ArrowArray *batch, void *emit_ctx);
+typedef int (*ds_on_eof_fn)(void *emit_ctx);
+
+typedef struct {
+    BetlContext             *ctx;
+    char                    *source;
+    char                    *lang;
+    /* output_schema parsed from YAML */
+    DsCol                   *out_cols;
+    size_t                   n_out;
+    /* input_schema cached from upstream on first get_next */
+    DsCol                   *in_cols;
+    size_t                   n_in;
+
+    /* dlopen / function pointers */
+    char                    *so_path;
+    void                    *handle;
+    ds_init_fn               init_fn;
+    ds_script_init_fn        script_init_fn;
+    ds_register_emit_fn      register_emit_fn;
+    ds_process_batch_fn      process_batch_fn;
+    ds_on_eof_fn             on_eof_fn;
+
+    struct ArrowArrayStream  input;
+    int                      have_input;
+    int                      compiled;
+    int                      eof_seen;
+
+    DsOutCol                *out_staging;
+    int                     *pending_set;   /* per-col flag, reset on commit */
+    char                     last_err[1024];
+} DotnetScript;
+
+static void ds_set_err(DotnetScript *s, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(s->last_err, sizeof s->last_err, fmt, ap); va_end(ap);
+    betl_set_error(s->ctx, "%s", s->last_err);
+}
+
+/* --- YAML output_schema parsing ------------------------------- */
+
+/* Minimal array walker for output_schema. JSON shape:
+ *   [{"name":"...","type":"l"},{"name":"...","type":"g"},...] */
+static int parse_output_schema(DotnetScript *s, const char *cfg) {
+    const char *p = json_value_after(cfg, "output_schema");
+    if (!p || *p != '[') {
+        ds_set_err(s, "dotnet.script: 'output_schema' is required (array)");
+        return -1;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    if (*p == ']') { ds_set_err(s, "dotnet.script: 'output_schema' is empty"); return -1; }
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+        if (*p != '{') { ds_set_err(s, "dotnet.script: output_schema entry must be an object"); return -1; }
+        /* find the matching } — track depth + skip strings */
+        const char *start = p;
+        int depth = 0;
+        for (; *p; ++p) {
+            if (*p == '"') {
+                ++p;
+                while (*p && *p != '"') { if (*p == '\\' && p[1]) ++p; ++p; }
+                if (!*p) { ds_set_err(s, "dotnet.script: malformed output_schema"); return -1; }
+                continue;
+            }
+            if (*p == '{') ++depth;
+            else if (*p == '}') { --depth; if (depth == 0) { ++p; break; } }
+        }
+        size_t len = (size_t)(p - start);
+        char *buf = malloc(len + 1);
+        if (!buf) return -1;
+        memcpy(buf, start, len); buf[len] = '\0';
+
+        char *name = NULL, *type = NULL;
+        json_get_string(buf, "name", &name);
+        json_get_string(buf, "type", &type);
+        free(buf);
+        if (!name || !type) {
+            ds_set_err(s, "dotnet.script: output column needs name + type");
+            free(name); free(type); return -1;
+        }
+        DsType t;
+        if      (!strcmp(type, "l")) t = DS_INT64;
+        else if (!strcmp(type, "g")) t = DS_FLOAT64;
+        else if (!strcmp(type, "b")) t = DS_BOOL;
+        else if (!strcmp(type, "u")) t = DS_UTF8;
+        else {
+            ds_set_err(s, "dotnet.script: output column '%s' type '%s' "
+                          "not yet supported (v0.2: l, g, b, u)", name, type);
+            free(name); free(type); return -1;
+        }
+        free(type);
+        DsCol *grow = realloc(s->out_cols, (s->n_out + 1) * sizeof *grow);
+        if (!grow) { free(name); return -1; }
+        s->out_cols = grow;
+        s->out_cols[s->n_out].name = name;
+        s->out_cols[s->n_out].type = t;
+        s->out_cols[s->n_out].arrow_fmt =
+            (t == DS_INT64 ? 'l' : t == DS_FLOAT64 ? 'g' :
+             t == DS_BOOL  ? 'b' : 'u');
+        ++s->n_out;
+
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+        if (*p == ',') { ++p; continue; }
+        if (*p == ']') return 0;
+        ds_set_err(s, "dotnet.script: malformed output_schema array");
+        return -1;
+    }
+}
+
+/* --- input schema caching --------------------------------------- */
+
+static int cache_input_schema(DotnetScript *s) {
+    if (s->in_cols) return 0;
+    struct ArrowSchema up = {0};
+    if (s->input.get_schema(&s->input, &up) != 0) {
+        ds_set_err(s, "dotnet.script: upstream get_schema failed");
+        return -1;
+    }
+    int rc = -1;
+    if (!up.format || strcmp(up.format, "+s") != 0 || up.n_children <= 0) {
+        ds_set_err(s, "dotnet.script: input must be a struct"); goto done;
+    }
+    size_t n = (size_t)up.n_children;
+    DsCol *cols = calloc(n, sizeof *cols);
+    if (!cols) { ds_set_err(s, "dotnet.script: OOM"); goto done; }
+    for (size_t i = 0; i < n; ++i) {
+        struct ArrowSchema *c = up.children[i];
+        const char *fmt = c && c->format ? c->format : "";
+        DsType t;
+        if      (!strcmp(fmt, "l")) t = DS_INT64;
+        else if (!strcmp(fmt, "g")) t = DS_FLOAT64;
+        else if (!strcmp(fmt, "b")) t = DS_BOOL;
+        else if (!strcmp(fmt, "u")) t = DS_UTF8;
+        else {
+            ds_set_err(s, "dotnet.script: input column '%s' has unsupported "
+                          "Arrow format '%s' (v0.2: l, g, b, u)",
+                       c && c->name ? c->name : "?", fmt);
+            for (size_t k = 0; k < i; ++k) free(cols[k].name);
+            free(cols); goto done;
+        }
+        cols[i].name = strdup(c && c->name ? c->name : "");
+        cols[i].type = t;
+        cols[i].arrow_fmt = fmt[0];
+        if (!cols[i].name) {
+            for (size_t k = 0; k < i; ++k) free(cols[k].name);
+            free(cols); goto done;
+        }
+    }
+    s->in_cols = cols;
+    s->n_in = n;
+    rc = 0;
+done:
+    if (up.release) up.release(&up);
+    return rc;
+}
+
+/* --- Generated.cs codegen -------------------------------------- */
+
+/* A growable string buffer for assembling generated C# source. */
+typedef struct { char *p; size_t len, cap; } Sbuf;
+static int sb_append(Sbuf *s, const char *str) {
+    size_t n = strlen(str);
+    if (s->len + n + 1 > s->cap) {
+        size_t nc = s->cap ? s->cap : 1024;
+        while (nc < s->len + n + 1) nc *= 2;
+        char *p = realloc(s->p, nc);
+        if (!p) return -1;
+        s->p = p; s->cap = nc;
+    }
+    memcpy(s->p + s->len, str, n);
+    s->len += n;
+    s->p[s->len] = '\0';
+    return 0;
+}
+static int sb_appendf(Sbuf *s, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sizeof buf) return -1;
+    return sb_append(s, buf);
+}
+
+/* C# property type for a DsType (already nullable for value types,
+ * naturally nullable for reference types). */
+static const char *ds_cs_type(DsType t) {
+    switch (t) {
+        case DS_INT64:   return "long?";
+        case DS_FLOAT64: return "double?";
+        case DS_BOOL:    return "bool?";
+        case DS_UTF8:    return "string?";
+    }
+    return "object?";
+}
+
+/* Emit the per-column extraction for one input cell into a generated
+ * if-null/else-read pattern. */
+static int gen_input_extract(Sbuf *out, const DsCol *c, size_t idx) {
+    sb_appendf(out,
+        "    {\n"
+        "      var c = batch->Children[%zu];\n"
+        "      long rowOff = c->Offset + row;\n"
+        "      bool isNull = c->NullCount > 0 && c->Buffers[0] != null && "
+        "        ((((byte*)c->Buffers[0])[rowOff/8] >> (int)(rowOff&7)) & 1u) == 0;\n",
+        idx);
+    switch (c->type) {
+        case DS_INT64:
+            sb_appendf(out,
+                "      r.%s = isNull ? (long?)null : ((long*)c->Buffers[1])[rowOff];\n",
+                c->name);
+            break;
+        case DS_FLOAT64:
+            sb_appendf(out,
+                "      r.%s = isNull ? (double?)null : ((double*)c->Buffers[1])[rowOff];\n",
+                c->name);
+            break;
+        case DS_BOOL:
+            sb_appendf(out,
+                "      if (isNull) r.%s = null;\n"
+                "      else { byte b = ((byte*)c->Buffers[1])[rowOff/8];\n"
+                "             r.%s = ((b >> (int)(rowOff&7)) & 1) != 0; }\n",
+                c->name, c->name);
+            break;
+        case DS_UTF8:
+            sb_appendf(out,
+                "      if (isNull) r.%s = null;\n"
+                "      else { int *offs = (int*)c->Buffers[1];\n"
+                "             byte *data = (byte*)c->Buffers[2];\n"
+                "             int s = offs[rowOff], e = offs[rowOff+1];\n"
+                "             r.%s = System.Text.Encoding.UTF8.GetString(data + s, e - s); }\n",
+                c->name, c->name);
+            break;
+    }
+    sb_append(out, "    }\n");
+    return 0;
+}
+
+/* Emit the per-column output write for one cell. */
+static int gen_output_write(Sbuf *out, const DsCol *c, size_t idx) {
+    switch (c->type) {
+        case DS_INT64:
+            sb_appendf(out,
+                "    if (row.%s.HasValue) SetInt64Fn(emitCtx, %zu, row.%s.Value);\n"
+                "    else SetNullFn(emitCtx, %zu);\n",
+                c->name, idx, c->name, idx);
+            break;
+        case DS_FLOAT64:
+            sb_appendf(out,
+                "    if (row.%s.HasValue) SetFloat64Fn(emitCtx, %zu, row.%s.Value);\n"
+                "    else SetNullFn(emitCtx, %zu);\n",
+                c->name, idx, c->name, idx);
+            break;
+        case DS_BOOL:
+            sb_appendf(out,
+                "    if (row.%s.HasValue) SetBoolFn(emitCtx, %zu, (byte)(row.%s.Value ? 1 : 0));\n"
+                "    else SetNullFn(emitCtx, %zu);\n",
+                c->name, idx, c->name, idx);
+            break;
+        case DS_UTF8:
+            sb_appendf(out,
+                "    if (row.%s != null) { var b = System.Text.Encoding.UTF8.GetBytes(row.%s);\n"
+                "                          fixed (byte *p = b) SetUtf8Fn(emitCtx, %zu, p, b.Length); }\n"
+                "    else SetNullFn(emitCtx, %zu);\n",
+                c->name, c->name, idx, idx);
+            break;
+    }
+    return 0;
+}
+
+static int generate_cs(DotnetScript *s, Sbuf *out) {
+    sb_append(out,
+        "// AUTO-GENERATED by betl-dotnet. Do not edit.\n"
+        "using System;\n"
+        "namespace Betl;\n\n");
+    /* InputRow */
+    sb_append(out, "public partial class InputRow {\n");
+    for (size_t i = 0; i < s->n_in; ++i) {
+        sb_appendf(out, "  public %s %s { get; set; }\n",
+                   ds_cs_type(s->in_cols[i].type), s->in_cols[i].name);
+    }
+    sb_append(out, "}\n\n");
+    /* OutputRow */
+    sb_append(out, "public partial class OutputRow {\n");
+    for (size_t i = 0; i < s->n_out; ++i) {
+        sb_appendf(out, "  public %s %s { get; set; }\n",
+                   ds_cs_type(s->out_cols[i].type), s->out_cols[i].name);
+    }
+    sb_append(out, "}\n\n");
+    /* Dispatch partial methods */
+    sb_append(out, "internal static unsafe partial class Dispatch {\n");
+    sb_append(out,
+        "  internal static partial InputRow ExtractInputRow(ArrowArray* batch, long row) {\n"
+        "    var r = new InputRow();\n");
+    for (size_t i = 0; i < s->n_in; ++i) gen_input_extract(out, &s->in_cols[i], i);
+    sb_append(out, "    return r;\n  }\n\n");
+
+    sb_append(out,
+        "  internal static partial void WriteOutputRow(IntPtr emitCtx, OutputRow row) {\n");
+    for (size_t i = 0; i < s->n_out; ++i) gen_output_write(out, &s->out_cols[i], i);
+    sb_append(out, "    CommitRowFn(emitCtx);\n  }\n");
+    sb_append(out, "}\n");
+    return 0;
+}
+
+/* --- output staging ------------------------------------------- */
+
+static int ds_out_reserve(DsOutCol *c, size_t want) {
+    if (want <= c->cap) return 0;
+    size_t nc = c->cap ? c->cap : 64;
+    while (nc < want) nc *= 2;
+    uint8_t *nn = realloc(c->nulls, nc);
+    if (!nn) return -1;
+    c->nulls = nn;
+    memset(c->nulls + c->cap, 0, nc - c->cap);
+    switch (c->type) {
+        case DS_INT64: {
+            int64_t *p = realloc(c->i64_vals, nc * sizeof *p);
+            if (!p) return -1;
+            c->i64_vals = p;
+            break;
+        }
+        case DS_FLOAT64: {
+            double *p = realloc(c->f64_vals, nc * sizeof *p);
+            if (!p) return -1;
+            c->f64_vals = p;
+            break;
+        }
+        case DS_BOOL: {
+            uint8_t *p = realloc(c->b_vals, nc);
+            if (!p) return -1;
+            c->b_vals = p;
+            break;
+        }
+        case DS_UTF8: {
+            int32_t *po = realloc(c->u8_offsets, (nc + 1) * sizeof *po);
+            if (!po) return -1;
+            c->u8_offsets = po;
+            if (c->cap == 0) c->u8_offsets[0] = 0;
+            if (c->u8_cap == 0) {
+                c->u8_cap = 128;
+                c->u8_data = malloc(c->u8_cap);
+                if (!c->u8_data) return -1;
+            }
+            break;
+        }
+    }
+    c->cap = nc;
+    return 0;
+}
+
+static void ds_out_free(DsOutCol *c) {
+    free(c->nulls); free(c->i64_vals); free(c->f64_vals);
+    free(c->b_vals); free(c->u8_offsets); free(c->u8_data);
+    memset(c, 0, sizeof *c);
+}
+
+/* --- Per-cell setter callbacks (called from C#) ---------------- */
+
+static void emit_set_int64(void *ctx, int idx, int64_t v) {
+    DotnetScript *s = ctx;
+    DsOutCol *c = &s->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->i64_vals[c->n] = v;
+    s->pending_set[idx] = 1;
+}
+static void emit_set_float64(void *ctx, int idx, double v) {
+    DotnetScript *s = ctx;
+    DsOutCol *c = &s->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->f64_vals[c->n] = v;
+    s->pending_set[idx] = 1;
+}
+static void emit_set_bool(void *ctx, int idx, uint8_t v) {
+    DotnetScript *s = ctx;
+    DsOutCol *c = &s->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->b_vals[c->n] = v ? 1 : 0;
+    s->pending_set[idx] = 1;
+}
+static void emit_set_utf8(void *ctx, int idx, const uint8_t *str, int len) {
+    DotnetScript *s = ctx;
+    DsOutCol *c = &s->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    size_t need = c->u8_len + (size_t)len;
+    if (need > c->u8_cap) {
+        size_t nc = c->u8_cap;
+        while (nc < need) nc *= 2;
+        char *nd = realloc(c->u8_data, nc);
+        if (!nd) return;
+        c->u8_data = nd; c->u8_cap = nc;
+    }
+    if (len > 0) memcpy(c->u8_data + c->u8_len, str, (size_t)len);
+    c->u8_len += (size_t)len;
+    c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
+    s->pending_set[idx] = 1;
+}
+static void emit_set_null(void *ctx, int idx) {
+    DotnetScript *s = ctx;
+    DsOutCol *c = &s->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->nulls[c->n] = 1;
+    /* For utf8 we still need to advance the offset entry across NULL
+     * rows so finalize doesn't end up with a discontinuity. */
+    if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
+    s->pending_set[idx] = 1;
+}
+static void emit_commit_row(void *ctx) {
+    DotnetScript *s = ctx;
+    /* Any column the script didn't set falls back to NULL. */
+    for (size_t i = 0; i < s->n_out; ++i) {
+        if (!s->pending_set[i]) {
+            DsOutCol *c = &s->out_staging[i];
+            if (ds_out_reserve(c, c->n + 1) != 0) continue;
+            c->nulls[c->n] = 1;
+            if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
+        }
+        s->pending_set[i] = 0;
+        ++s->out_staging[i].n;
+    }
+}
+
+/* --- finalize output batch ------------------------------------ */
+
+static void ds_release_leaf2(struct ArrowArray *a) {
+    if (a->n_buffers >= 2 && a->buffers) {
+        free((void *)a->buffers[0]); free((void *)a->buffers[1]);
+    }
+    free(a->buffers); a->release = NULL;
+}
+static void ds_release_leaf3(struct ArrowArray *a) {
+    if (a->n_buffers >= 3 && a->buffers) {
+        free((void *)a->buffers[0]); free((void *)a->buffers[1]); free((void *)a->buffers[2]);
+    }
+    free(a->buffers); a->release = NULL;
+}
+static void ds_release_struct(struct ArrowArray *a) {
+    for (int64_t i = 0; i < a->n_children; ++i) {
+        if (a->children[i]) {
+            if (a->children[i]->release) a->children[i]->release(a->children[i]);
+            free(a->children[i]);
+        }
+    }
+    free(a->children); free(a->buffers); a->release = NULL;
+}
+
+static int ds_finalize_col(DsOutCol *c, struct ArrowArray *out) {
+    size_t n = c->n;
+    int64_t null_count = 0;
+    uint8_t *vmap = NULL;
+    for (size_t i = 0; i < n; ++i) if (c->nulls[i]) ++null_count;
+    if (null_count > 0) {
+        size_t bytes = (n + 7) / 8;
+        vmap = malloc(bytes ? bytes : 1);
+        if (!vmap) return -1;
+        memset(vmap, 0xFF, bytes ? bytes : 1);
+        for (size_t i = 0; i < n; ++i) {
+            if (c->nulls[i]) vmap[i / 8] &= (uint8_t)~(1u << (i % 8));
+        }
+    }
+    free(c->nulls); c->nulls = NULL;
+    if (c->type == DS_INT64 || c->type == DS_FLOAT64) {
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); return -1; }
+        bufs[0] = vmap;
+        bufs[1] = (c->type == DS_INT64) ? (void *)c->i64_vals : (void *)c->f64_vals;
+        c->i64_vals = NULL; c->f64_vals = NULL;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
+        return 0;
+    }
+    if (c->type == DS_BOOL) {
+        size_t bytes = (n + 7) / 8;
+        uint8_t *bm = calloc(bytes ? bytes : 1, 1);
+        if (!bm) { free(vmap); return -1; }
+        for (size_t i = 0; i < n; ++i) {
+            if (c->b_vals[i]) bm[i / 8] |= (uint8_t)(1u << (i % 8));
+        }
+        free(c->b_vals); c->b_vals = NULL;
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(bm); return -1; }
+        bufs[0] = vmap; bufs[1] = bm;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
+        return 0;
+    }
+    /* UTF8: smooth offsets across nulls (the setter sets offset even
+     * for nulls, but if a row was forgotten by commit_row's fallback
+     * we may have gaps). */
+    int32_t last = 0;
+    for (size_t i = 1; i <= n; ++i) {
+        if (c->u8_offsets[i] < last) c->u8_offsets[i] = last;
+        else last = c->u8_offsets[i];
+    }
+    int32_t *offs = c->u8_offsets; c->u8_offsets = NULL;
+    char *data = c->u8_data; c->u8_data = NULL;
+    if (!data) { data = malloc(1); if (!data) { free(vmap); free(offs); return -1; } }
+    const void **bufs = malloc(3 * sizeof *bufs);
+    if (!bufs) { free(vmap); free(offs); free(data); return -1; }
+    bufs[0] = vmap; bufs[1] = offs; bufs[2] = data;
+    out->length = (int64_t)n; out->null_count = null_count;
+    out->n_buffers = 3; out->buffers = bufs; out->release = ds_release_leaf3;
+    return 0;
+}
+
+/* --- compile + load ------------------------------------------ */
+
+/* Build the cache-key hash input from the (input + output) schema —
+ * NULs separating fields keep collisions unlikely. */
+static char *build_schema_hash_input(DotnetScript *s, size_t *out_len) {
+    Sbuf sb = {0};
+    for (size_t i = 0; i < s->n_in; ++i)
+        sb_appendf(&sb, "in:%s:%c\n", s->in_cols[i].name, s->in_cols[i].arrow_fmt);
+    for (size_t i = 0; i < s->n_out; ++i)
+        sb_appendf(&sb, "out:%s:%c\n", s->out_cols[i].name, s->out_cols[i].arrow_fmt);
+    *out_len = sb.len;
+    return sb.p;
+}
+
+static int compile_and_load(DotnetScript *s) {
+    if (s->compiled) return 0;
+    Sbuf gen = {0};
+    if (generate_cs(s, &gen) != 0) {
+        ds_set_err(s, "dotnet.script: codegen failed");
+        free(gen.p); return -1;
+    }
+    size_t hash_len = 0;
+    char *hash_in = build_schema_hash_input(s, &hash_len);
+
+    extra_file_t ef = { "Generated.cs", gen.p, gen.len };
+    compile_request_t creq = {
+        .user_source    = s->source,
+        .lang           = s->lang,
+        .kind           = "script",
+        .extra_files    = &ef,
+        .n_extra        = 1,
+        .shim_subdir    = "script",
+        .extra_hash_in  = hash_in,
+        .extra_hash_len = hash_len,
+    };
+    char err[8192] = {0};
+    if (compile_to_cache(s->ctx, &creq, &s->so_path, err, sizeof err) != 0) {
+        ds_set_err(s, "dotnet.script: compile failed: %s", err);
+        free(gen.p); free(hash_in);
+        return -1;
+    }
+    free(gen.p); free(hash_in);
+
+    s->handle = dlopen(s->so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!s->handle) {
+        ds_set_err(s, "dotnet.script: dlopen(%s) failed: %s",
+                   s->so_path, dlerror());
+        return -1;
+    }
+    *(void **)&s->init_fn           = dlsym(s->handle, "betl_dotnet_init");
+    *(void **)&s->script_init_fn    = dlsym(s->handle, "betl_dotnet_script_init");
+    *(void **)&s->register_emit_fn  = dlsym(s->handle, "betl_dotnet_script_register_emit");
+    *(void **)&s->process_batch_fn  = dlsym(s->handle, "betl_dotnet_script_process_batch");
+    *(void **)&s->on_eof_fn         = dlsym(s->handle, "betl_dotnet_script_on_eof");
+    if (!s->init_fn || !s->script_init_fn || !s->register_emit_fn
+        || !s->process_batch_fn || !s->on_eof_fn) {
+        ds_set_err(s, "dotnet.script: AOT'd .so is missing required entry points");
+        return -1;
+    }
+    if (s->init_fn(s->ctx, host_log_wrapper, host_get_param_wrapper,
+                   host_get_connection_wrapper) != 0) {
+        ds_set_err(s, "dotnet.script: managed init returned non-zero");
+        return -1;
+    }
+    if (s->register_emit_fn(emit_set_int64, emit_set_float64, emit_set_bool,
+                            emit_set_utf8, emit_set_null, emit_commit_row) != 0) {
+        ds_set_err(s, "dotnet.script: register_emit returned non-zero");
+        return -1;
+    }
+    if (s->script_init_fn() != 0) {
+        ds_set_err(s, "dotnet.script: UserScript constructor threw");
+        return -1;
+    }
+
+    /* Allocate output staging now we know n_out is final. */
+    s->out_staging = calloc(s->n_out, sizeof *s->out_staging);
+    s->pending_set = calloc(s->n_out, sizeof *s->pending_set);
+    if (!s->out_staging || !s->pending_set) {
+        ds_set_err(s, "dotnet.script: OOM");
+        return -1;
+    }
+    for (size_t i = 0; i < s->n_out; ++i)
+        s->out_staging[i].type = s->out_cols[i].type;
+
+    s->compiled = 1;
+    return 0;
+}
+
+/* --- Arrow stream callbacks ----------------------------------- */
+
+static void ds_release_schema_named(struct ArrowSchema *sch) {
+    free((void *)sch->name); sch->name = NULL; sch->release = NULL;
+}
+static void ds_release_schema_struct(struct ArrowSchema *sch) {
+    for (int64_t i = 0; i < sch->n_children; ++i) {
+        if (sch->children[i]) {
+            if (sch->children[i]->release) sch->children[i]->release(sch->children[i]);
+            free(sch->children[i]);
+        }
+    }
+    free(sch->children); sch->release = NULL;
+}
+
+static int ds_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
+    DotnetScript *s = st->private_data;
+    memset(out, 0, sizeof *out);
+    struct ArrowSchema **kids = calloc(s->n_out, sizeof *kids);
+    if (!kids) return ENOMEM;
+    for (size_t i = 0; i < s->n_out; ++i) {
+        struct ArrowSchema *c = calloc(1, sizeof *c);
+        char *nm = strdup(s->out_cols[i].name);
+        if (!c || !nm) {
+            free(c); free(nm);
+            for (size_t k = 0; k < i; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids); return ENOMEM;
+        }
+        c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
+        switch (s->out_cols[i].type) {
+            case DS_INT64:   c->format = "l"; break;
+            case DS_FLOAT64: c->format = "g"; break;
+            case DS_BOOL:    c->format = "b"; break;
+            case DS_UTF8:    c->format = "u"; break;
+        }
+        c->release = ds_release_schema_named;
+        kids[i] = c;
+    }
+    out->format = "+s"; out->n_children = (int64_t)s->n_out;
+    out->children = kids; out->release = ds_release_schema_struct;
+    return 0;
+}
+
+static int ds_flush_batch(DotnetScript *s, struct ArrowArray *out) {
+    size_t n = s->out_staging[0].n;
+    /* Sanity check: all output cols should have the same row count. */
+    for (size_t i = 1; i < s->n_out; ++i) {
+        if (s->out_staging[i].n != n) {
+            ds_set_err(s, "dotnet.script: output column row count mismatch "
+                          "(col 0 = %zu, col %zu = %zu)",
+                       n, i, s->out_staging[i].n);
+            return -1;
+        }
+    }
+    struct ArrowArray **kids = calloc(s->n_out, sizeof *kids);
+    if (!kids) return -1;
+    for (size_t i = 0; i < s->n_out; ++i) {
+        kids[i] = calloc(1, sizeof **kids);
+        if (!kids[i] || ds_finalize_col(&s->out_staging[i], kids[i]) != 0) {
+            for (size_t k = 0; k <= i; ++k) {
+                if (kids[k]) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+            }
+            free(kids); return -1;
+        }
+    }
+    const void **outer = malloc(sizeof *outer);
+    if (!outer) {
+        for (size_t i = 0; i < s->n_out; ++i) {
+            if (kids[i]->release) kids[i]->release(kids[i]);
+            free(kids[i]);
+        }
+        free(kids); return -1;
+    }
+    outer[0] = NULL;
+    out->length = (int64_t)n; out->null_count = 0;
+    out->n_buffers = 1; out->n_children = (int64_t)s->n_out;
+    out->buffers = outer; out->children = kids;
+    out->release = ds_release_struct;
+    /* Reset for next batch. */
+    for (size_t i = 0; i < s->n_out; ++i) {
+        ds_out_free(&s->out_staging[i]);
+        s->out_staging[i].type = s->out_cols[i].type;
+    }
+    return 0;
+}
+
+static int ds_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
+    DotnetScript *s = st->private_data;
+    memset(out, 0, sizeof *out);
+    if (cache_input_schema(s) != 0) return EIO;
+    if (compile_and_load(s) != 0)   return EIO;
+
+    /* Pull batches until at least one output row is buffered, or EOF
+     * (then run on_eof and emit whatever it produces). */
+    while (s->out_staging[0].n == 0) {
+        if (s->eof_seen) return 0;
+        struct ArrowArray in_arr = {0};
+        if (s->input.get_next(&s->input, &in_arr) != 0) {
+            ds_set_err(s, "dotnet.script: upstream get_next failed");
+            return EIO;
+        }
+        if (!in_arr.release) {
+            s->eof_seen = 1;
+            if (s->on_eof_fn(s) != 0) {
+                ds_set_err(s, "dotnet.script: on_eof returned non-zero "
+                              "(see [ERROR] log above)");
+                return EIO;
+            }
+            if (s->out_staging[0].n == 0) return 0;
+            break;
+        }
+        if (s->process_batch_fn(&in_arr, s) != 0) {
+            in_arr.release(&in_arr);
+            ds_set_err(s, "dotnet.script: process_batch returned non-zero");
+            return EIO;
+        }
+        in_arr.release(&in_arr);
+    }
+    if (ds_flush_batch(s, out) != 0) {
+        ds_set_err(s, "dotnet.script: flush failed");
+        return EIO;
+    }
+    return 0;
+}
+
+static const char *ds_get_last_error(struct ArrowArrayStream *st) {
+    DotnetScript *s = st->private_data;
+    return (s && s->last_err[0]) ? s->last_err : NULL;
+}
+static void ds_release(struct ArrowArrayStream *st) {
+    st->private_data = NULL; st->release = NULL;
+}
+
+static int dotnet_script_init(BetlContext *ctx, const char *cfg, void **state) {
+    DotnetScript *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx = ctx;
+    if (json_get_string(cfg, "source", &s->source) != 0 || !s->source) {
+        betl_set_error(ctx, "dotnet.script: 'source' is required");
+        free(s); return BETL_ERR_INVALID;
+    }
+    if (json_get_string(cfg, "lang", &s->lang) != 0 || !s->lang) {
+        s->lang = strdup("csharp");
+    }
+    if (strcmp(s->lang, "csharp") != 0) {
+        betl_set_error(ctx,
+            "dotnet.script: lang '%s' is not supported; "
+            "VB.NET is handled by the DTSX converter (VB → C#)", s->lang);
+        free(s->source); free(s->lang); free(s);
+        return BETL_ERR_UNSUPPORTED;
+    }
+    if (parse_output_schema(s, cfg) != 0) {
+        for (size_t i = 0; i < s->n_out; ++i) free(s->out_cols[i].name);
+        free(s->out_cols); free(s->source); free(s->lang); free(s);
+        return BETL_ERR_INVALID;
+    }
+    *state = s;
+    return BETL_OK;
+}
+
+static int dotnet_script_attach_input(void *state, int port,
+                                      struct ArrowArrayStream *in) {
+    (void)port;
+    DotnetScript *s = state;
+    s->input = *in;
+    s->have_input = 1;
+    memset(in, 0, sizeof *in);
+    return BETL_OK;
+}
+
+static int dotnet_script_attach_output(void *state, int port,
+                                       struct ArrowArrayStream *out) {
+    (void)port;
+    DotnetScript *s = state;
+    out->get_schema     = ds_get_schema;
+    out->get_next       = ds_get_next;
+    out->get_last_error = ds_get_last_error;
+    out->release        = ds_release;
+    out->private_data   = s;
+    return BETL_OK;
+}
+
+static void dotnet_script_destroy(void *state) {
+    if (!state) return;
+    DotnetScript *s = state;
+    if (s->have_input && s->input.release) s->input.release(&s->input);
+    /* See dotnet_task_destroy for the dlclose-leak rationale. */
+    free(s->so_path);
+    free(s->source); free(s->lang);
+    for (size_t i = 0; i < s->n_out; ++i) free(s->out_cols[i].name);
+    free(s->out_cols);
+    for (size_t i = 0; i < s->n_in; ++i) free(s->in_cols[i].name);
+    free(s->in_cols);
+    if (s->out_staging) {
+        for (size_t i = 0; i < s->n_out; ++i) ds_out_free(&s->out_staging[i]);
+        free(s->out_staging);
+    }
+    free(s->pending_set);
+    free(s);
+}
+
+static const BetlPortDef ds_inputs[]  = {
+    { .name = "in",  .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "rows to process" },
+};
+static const BetlPortDef ds_outputs[] = {
+    { .name = "out", .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "rows emitted by the script" },
+};
+
+
+/* ============================================================== *
  *  Provider entry                                                  *
  * ============================================================== */
 
@@ -737,6 +1702,19 @@ static const BetlComponentDef components[] = {
       .init               = dotnet_task_init,
       .destroy            = dotnet_task_destroy,
       .task_run           = dotnet_task_run },
+
+    { .name               = "dotnet.script",
+      .kind               = BETL_KIND_TRANSFORM,
+      .config_schema_json = "{}",
+      .flags              = 0,
+      .inputs             = ds_inputs,
+      .input_count        = 1,
+      .outputs            = ds_outputs,
+      .output_count       = 1,
+      .init               = dotnet_script_init,
+      .destroy            = dotnet_script_destroy,
+      .attach_input       = dotnet_script_attach_input,
+      .attach_output      = dotnet_script_attach_output },
 };
 
 static const BetlProvider dotnet_provider = {
