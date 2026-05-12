@@ -1,0 +1,131 @@
+<?xml version="1.0"?>
+<!--
+  betl-dtsx2yaml fixture: covers SSIS Script Task and Script Component.
+  Both Microsoft.ScriptTask (executable-level) and
+  Microsoft.ScriptComponentHost (data-flow component) appear here, and
+  both carry user C# source in a <ScriptProject> sub-tree with a
+  <ProjectItem Name="ScriptMain.cs"> (or "main.cs") CDATA section.
+
+  Also includes a VB.NET Script Task to assert that the lang
+  detection (Language="VisualBasic") routes to `lang: vbnet` + the
+  hand-translation TODO block — the runtime can't compile it directly
+  (Roslyn rejects [UnmanagedCallersOnly] on VB members).
+-->
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:ObjectName="Scripts"
+    DTS:ExecutableType="Microsoft.Package">
+
+  <DTS:Executables>
+
+    <!-- 1. C# Script Task -->
+    <DTS:Executable
+        DTS:ObjectName="LogStart"
+        DTS:ExecutableType="Microsoft.ScriptTask">
+      <DTS:ObjectData>
+        <ScriptProject Name="ST_LogStart" Language="CSharp">
+          <ProjectItem Name="ScriptMain.cs"><![CDATA[using System;
+
+public class ScriptMain : VSTARTScriptObjectModelBase
+{
+    public void Main()
+    {
+        var batchTag = (string)Dts.Variables["User::BatchTag"].Value;
+        Dts.Events.FireInformation(0, "Start", "batch=" + batchTag, "", 0, ref _);
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+}
+]]></ProjectItem>
+          <ProjectItem Name="Properties/AssemblyInfo.cs"><![CDATA[
+// assembly metadata — ignore
+]]></ProjectItem>
+        </ScriptProject>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- 2. VB.NET Script Task — exercises the vbnet routing -->
+    <DTS:Executable
+        DTS:ObjectName="LogEndVB"
+        DTS:ExecutableType="Microsoft.ScriptTask">
+      <DTS:ObjectData>
+        <ScriptProject Name="ST_LogEndVB" Language="VisualBasic">
+          <ProjectItem Name="ScriptMain.vb"><![CDATA[Imports System
+
+Public Class ScriptMain
+    Inherits VSTARTScriptObjectModelBase
+    Public Sub Main()
+        Dts.Events.FireInformation(0, "End", "done", "", 0, _refire)
+        Dts.TaskResult = CType(ScriptResults.Success, Integer)
+    End Sub
+End Class
+]]></ProjectItem>
+        </ScriptProject>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- 3. Pipeline containing a Script Component transform -->
+    <DTS:Executable
+        DTS:ObjectName="EnrichFlow"
+        DTS:ExecutableType="Microsoft.Pipeline">
+      <DTS:ObjectData>
+        <pipeline>
+          <components>
+
+            <component
+                refId="Package\EnrichFlow\Src"
+                name="Src"
+                componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="AccessMode">2</property>
+                <property name="SqlCommand">SELECT id, raw FROM dbo.Inbox</property>
+              </properties>
+              <outputs>
+                <output name="OLE DB Source Output"/>
+              </outputs>
+            </component>
+
+            <component
+                refId="Package\EnrichFlow\Enrich"
+                name="Enrich"
+                componentClassID="Microsoft.ScriptComponentHost">
+              <properties>
+                <property name="ScriptComponentType">1</property>
+                <property name="UserComponentTypeName">ScriptMain</property>
+              </properties>
+              <outputs>
+                <output name="Output 0">
+                  <outputColumns>
+                    <outputColumn name="id" dataType="i8"/>
+                    <outputColumn name="cleaned" dataType="wstr"/>
+                  </outputColumns>
+                </output>
+              </outputs>
+              <ObjectData>
+                <ScriptProject Name="SC_Enrich" Language="CSharp">
+                  <ProjectItem Name="main.cs"><![CDATA[using System;
+
+public class ScriptMain : UserComponent
+{
+    public override void Input0_ProcessInputRow(Input0Buffer Row)
+    {
+        Output0Buffer.AddRow();
+        Output0Buffer.id      = Row.id;
+        Output0Buffer.cleaned = (Row.raw ?? "").Trim().ToLowerInvariant();
+    }
+}
+]]></ProjectItem>
+                </ScriptProject>
+              </ObjectData>
+            </component>
+
+          </components>
+          <paths>
+            <path
+                startId="Package\EnrichFlow\Src.Outputs[OLE DB Source Output]"
+                endId="Package\EnrichFlow\Enrich.Inputs[Input 0]"/>
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+</DTS:Executable>

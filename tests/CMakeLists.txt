@@ -347,6 +347,27 @@ set_tests_properties(csv_read PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: csv.read v2 end-to-end test passed"
 )
 
+# --- DTSX → YAML converter end-to-end ---------------------------------------
+# The converter is a framework-dependent .NET console app built under
+# tools/betl-dtsx2yaml. Skips (rc=77) when the SDK isn't installed.
+if(BETL_DTSX2YAML_FOUND)
+    add_executable(test_dtsx2yaml test_dtsx2yaml.c)
+    target_compile_definitions(test_dtsx2yaml PRIVATE
+        BETL_DTSX2YAML_DOTNET="${BETL_DTSX2YAML_DOTNET}"
+        BETL_DTSX2YAML_DLL="${BETL_DTSX2YAML_DLL}"
+        BETL_DTSX2YAML_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/simple-oledb.dtsx"
+        BETL_DTSX2YAML_TRANSFORMS_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/transforms.dtsx"
+        BETL_DTSX2YAML_SCRIPTS_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/scripts.dtsx"
+    )
+    add_dependencies(test_dtsx2yaml dtsx2yaml)
+    add_test(NAME dtsx2yaml COMMAND test_dtsx2yaml)
+    set_tests_properties(dtsx2yaml PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: dtsx2yaml end-to-end test passed"
+        TIMEOUT 120
+    )
+endif()
+
 # --- pivot / unpivot transforms ---------------------------------------------
 add_executable(test_pivot_unpivot test_pivot_unpivot.c)
 target_link_libraries(test_pivot_unpivot PRIVATE betl_core)

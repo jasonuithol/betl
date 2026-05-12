@@ -1,0 +1,269 @@
+/* betl-dtsx2yaml end-to-end test.
+ *
+ * Runs the .NET converter against a hand-crafted DTSX fixture
+ * (tools/betl-dtsx2yaml/fixtures/simple-oledb.dtsx) and asserts that
+ * the resulting YAML contains the expected pieces:
+ *
+ *   - betl discriminator and package name
+ *   - mssql connection with a translated ODBC DSN
+ *   - parameter for the User-scope variable
+ *   - Execute SQL Task → mssql.sql
+ *   - dataflow with OLEDB Source → Flat File Destination
+ *   - csv.write `from:` wired to the OLEDB Source's id
+ *
+ * Skips with rc=77 when the .NET SDK isn't installed (the
+ * cmake-time gate already skips the converter build, but we
+ * defend against running with a stale build dir).
+ *
+ * Paths to the dotnet binary, the publish dll, and the fixture
+ * are baked in by CMake via -D defines. */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+static int failures = 0;
+
+#define CHECK_CONTAINS(haystack, needle) do {                       \
+    if (strstr((haystack), (needle)) == NULL) {                     \
+        fprintf(stderr, "FAIL %s:%d: expected substring not found:" \
+                " %s\n", __FILE__, __LINE__, (needle));             \
+        failures++;                                                 \
+    }                                                               \
+} while (0)
+
+static char *slurp_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return NULL; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
+    fclose(f);
+    return buf;
+}
+
+/* Run the converter against `fixture` writing to `out_path`. Returns
+ * the converter binary's exit status (0 on success). */
+static int run_convert(const char *fixture, const char *out_path) {
+    char cmd[8192];
+    int n = snprintf(cmd, sizeof cmd,
+                     "'%s' '%s' '%s' -o '%s'",
+                     BETL_DTSX2YAML_DOTNET,
+                     BETL_DTSX2YAML_DLL,
+                     fixture, out_path);
+    if (n < 0 || (size_t)n >= sizeof cmd) return -1;
+    return system(cmd);
+}
+
+int main(void) {
+    /* SDK presence guard — match the test_dotnet_* convention. */
+    struct stat st;
+    if (stat(BETL_DTSX2YAML_DOTNET, &st) != 0) {
+        fprintf(stderr, "SKIP: dotnet not at %s\n", BETL_DTSX2YAML_DOTNET);
+        return 77;
+    }
+    if (stat(BETL_DTSX2YAML_DLL, &st) != 0) {
+        fprintf(stderr, "SKIP: dtsx2yaml dll not at %s\n", BETL_DTSX2YAML_DLL);
+        return 77;
+    }
+
+    /* --- simple-oledb.dtsx: end-to-end source/dest + ExecSQL ----------- */
+    const char *out_path = "/tmp/betl_dtsx2yaml_test.yml";
+    int rc = run_convert(BETL_DTSX2YAML_FIXTURE, out_path);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for simple-oledb fixture\n", rc);
+        return 1;
+    }
+
+    char *yaml = slurp_file(out_path);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read converter output %s\n", out_path);
+        return 1;
+    }
+
+    /* Top-level shape. */
+    CHECK_CONTAINS(yaml, "betl: 1");
+    CHECK_CONTAINS(yaml, "name: simpleoledb");
+
+    /* Connections — OLEDB → mssql DSN, flat-file inlined as comment. */
+    CHECK_CONTAINS(yaml, "connections:");
+    CHECK_CONTAINS(yaml, "warehouse:");
+    CHECK_CONTAINS(yaml, "type: mssql");
+    CHECK_CONTAINS(yaml, "Driver={ODBC Driver 18 for SQL Server}");
+    CHECK_CONTAINS(yaml, "Server=db.example.com");
+    CHECK_CONTAINS(yaml, "Database=Sales");
+    CHECK_CONTAINS(yaml, "Trusted_Connection=yes");
+    /* Flat-file should NOT emit its own connections entry. */
+    CHECK_CONTAINS(yaml, "flat-file connection 'OrdersCsv'");
+
+    /* Parameters — User::BatchTag → string default 'nightly'. */
+    CHECK_CONTAINS(yaml, "parameters:");
+    CHECK_CONTAINS(yaml, "batchtag:");
+    CHECK_CONTAINS(yaml, "type: string");
+    CHECK_CONTAINS(yaml, "default: 'nightly'");
+
+    /* Pipeline shape. */
+    CHECK_CONTAINS(yaml, "pipeline:");
+    CHECK_CONTAINS(yaml, "id: truncate_stage");
+    CHECK_CONTAINS(yaml, "type: mssql.sql");
+    CHECK_CONTAINS(yaml, "TRUNCATE TABLE stage.Orders");
+
+    CHECK_CONTAINS(yaml, "id: extract_orders");
+    CHECK_CONTAINS(yaml, "type: dataflow");
+
+    /* Source: mssql.read with the AccessMode=2 SqlCommand passed through. */
+    CHECK_CONTAINS(yaml, "id: oledb_source");
+    CHECK_CONTAINS(yaml, "type: mssql.read");
+    CHECK_CONTAINS(yaml, "connection: warehouse");
+    CHECK_CONTAINS(yaml, "SELECT * FROM dbo.Orders");
+
+    /* Destination: csv.write wired to the source by id. */
+    CHECK_CONTAINS(yaml, "id: flat_file_destination");
+    CHECK_CONTAINS(yaml, "type: csv.write");
+    CHECK_CONTAINS(yaml, "from: oledb_source");
+    CHECK_CONTAINS(yaml, "path: '/tmp/orders.csv'");
+
+    free(yaml);
+
+    /* --- transforms.dtsx: every transform mapper ----------------------- */
+    const char *tf_out = "/tmp/betl_dtsx2yaml_transforms.yml";
+    rc = run_convert(BETL_DTSX2YAML_TRANSFORMS_FIXTURE, tf_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for transforms fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(tf_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read transforms YAML\n");
+        return 1;
+    }
+
+    /* Derived Column → map+add with ssisexpr. */
+    CHECK_CONTAINS(yaml, "id: derive");
+    CHECK_CONTAINS(yaml, "type: map");
+    CHECK_CONTAINS(yaml, "lang: ssisexpr");
+    CHECK_CONTAINS(yaml, "[id] + \"-derived\"");
+
+    /* Data Conversion → map+add with (DT_*) cast. */
+    CHECK_CONTAINS(yaml, "id: convert");
+    CHECK_CONTAINS(yaml, "'(DT_I4)[SOURCE]'");
+
+    /* Conditional Split — cases in eval-order, default labeled. */
+    CHECK_CONTAINS(yaml, "id: split");
+    CHECK_CONTAINS(yaml, "type: conditional_split");
+    CHECK_CONTAINS(yaml, "name: hot_path");
+    CHECK_CONTAINS(yaml, "name: cold_path");
+    CHECK_CONTAINS(yaml, "default: default");
+
+    /* Sort — by precedence + direction sign. */
+    CHECK_CONTAINS(yaml, "id: sortstep");
+    CHECK_CONTAINS(yaml, "type: sort");
+    CHECK_CONTAINS(yaml, "{ col: id, dir: asc }");
+    CHECK_CONTAINS(yaml, "{ col: price_i4, dir: desc }");
+    /* sortstep's input came from Split's hot_path output. */
+    CHECK_CONTAINS(yaml, "from: split:hot_path");
+
+    /* Aggregate — group_by + compute map. */
+    CHECK_CONTAINS(yaml, "id: agg");
+    CHECK_CONTAINS(yaml, "type: aggregate");
+    CHECK_CONTAINS(yaml, "group_by: [priority]");
+    CHECK_CONTAINS(yaml, "cnt: { agg: count }");
+    CHECK_CONTAINS(yaml, "total: { agg: sum, over: TODO }");
+
+    /* Multicast — taps list + downstream port-aware from-ref. */
+    CHECK_CONTAINS(yaml, "id: fanout");
+    CHECK_CONTAINS(yaml, "type: multicast");
+    CHECK_CONTAINS(yaml, "taps: [tapa, tapb]");
+    CHECK_CONTAINS(yaml, "from: fanout:tapa");
+    CHECK_CONTAINS(yaml, "from: fanout:tapb");
+
+    /* Lookup — mssql.lookup with query. */
+    CHECK_CONTAINS(yaml, "id: lk");
+    CHECK_CONTAINS(yaml, "type: mssql.lookup");
+    CHECK_CONTAINS(yaml, "SELECT id, color FROM dim_color");
+
+    /* Union All — from: [<cold>, <default>] in path order. */
+    CHECK_CONTAINS(yaml, "id: unite");
+    CHECK_CONTAINS(yaml, "type: union");
+    CHECK_CONTAINS(yaml, "from: [split:cold_path, split:default]");
+
+    /* Merge Join — kind: left (JoinType=1), from: [left, right]. */
+    CHECK_CONTAINS(yaml, "id: mj");
+    CHECK_CONTAINS(yaml, "type: join");
+    CHECK_CONTAINS(yaml, "kind: left");
+    CHECK_CONTAINS(yaml, "from: [sortstep, convert]");
+
+    /* Pivot — id_cols / name_col / value_col / pivot_keys. */
+    CHECK_CONTAINS(yaml, "id: pvt");
+    CHECK_CONTAINS(yaml, "type: pivot");
+    CHECK_CONTAINS(yaml, "id_cols: [region]");
+    CHECK_CONTAINS(yaml, "name_col: month");
+    CHECK_CONTAINS(yaml, "value_col: amount");
+    CHECK_CONTAINS(yaml, "pivot_keys: [jan, feb]");
+
+    free(yaml);
+
+    /* --- scripts.dtsx: ScriptTask + ScriptComponent + VB.NET -------- */
+    const char *sc_out = "/tmp/betl_dtsx2yaml_scripts.yml";
+    rc = run_convert(BETL_DTSX2YAML_SCRIPTS_FIXTURE, sc_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for scripts fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(sc_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read scripts YAML\n");
+        return 1;
+    }
+
+    /* C# Script Task: dotnet.task + lang csharp + translation header. */
+    CHECK_CONTAINS(yaml, "id: logstart");
+    CHECK_CONTAINS(yaml, "type: dotnet.task");
+    CHECK_CONTAINS(yaml, "lang: csharp");
+    CHECK_CONTAINS(yaml, "translation checklist");
+    CHECK_CONTAINS(yaml, "Rename `class ScriptMain` to `class UserTask`");
+    CHECK_CONTAINS(yaml, "Change the base class to `Betl.BetlTask`");
+    CHECK_CONTAINS(yaml, "Rename `public void Main()` to `public override void Run()`");
+    /* Original C# source is inlined verbatim. */
+    CHECK_CONTAINS(yaml, "public class ScriptMain : VSTARTScriptObjectModelBase");
+    CHECK_CONTAINS(yaml, "Dts.Variables[\"User::BatchTag\"].Value");
+
+    /* VB.NET Script Task: auto-translated to C# by CodeConverter.
+     * The post-conversion source must be C# (no `Inherits`, no
+     * `End Sub`) and lang must be `csharp`. */
+    CHECK_CONTAINS(yaml, "id: logendvb");
+    CHECK_CONTAINS(yaml, "Original SSIS source was VB.NET; auto-translated to C#");
+    /* `Imports System` survives as `using System;` (we strip the VB
+     * Imports clause and re-prepend the C# equivalent). */
+    CHECK_CONTAINS(yaml, "using System;");
+    /* The body comes through as C# — `Public Sub Main()` becomes
+     * `public void Main()`, `CType(x, Integer)` becomes `(int)x`. */
+    CHECK_CONTAINS(yaml, "public void Main()");
+    CHECK_CONTAINS(yaml, "(int)ScriptResults.Success");
+
+    /* C# Script Component: dotnet.script + output_schema + checklist. */
+    CHECK_CONTAINS(yaml, "id: enrich");
+    CHECK_CONTAINS(yaml, "type: dotnet.script");
+    CHECK_CONTAINS(yaml, "from: src");
+    CHECK_CONTAINS(yaml, "- { name: id, type: l }");
+    CHECK_CONTAINS(yaml, "- { name: cleaned, type: u }");
+    CHECK_CONTAINS(yaml, "Rename `class ScriptMain` to `class UserScript`");
+    CHECK_CONTAINS(yaml, "Change the base class to `Betl.BetlScript`");
+    CHECK_CONTAINS(yaml, "Replace SSIS' Input0_ProcessInputRow");
+    CHECK_CONTAINS(yaml, "public class ScriptMain : UserComponent");
+
+    free(yaml);
+
+    if (failures > 0) {
+        fprintf(stderr, "FAIL: %d substring check(s) missed\n", failures);
+        return 1;
+    }
+    printf("ok: dtsx2yaml end-to-end test passed\n");
+    return 0;
+}

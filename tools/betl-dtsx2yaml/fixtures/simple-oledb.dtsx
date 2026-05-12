@@ -1,0 +1,105 @@
+<?xml version="1.0"?>
+<!--
+  Minimal hand-crafted DTSX fixture for betl-dtsx2yaml regression
+  tests. Covers the smallest interesting combination:
+
+    Connections:   1 OLEDB (SQL Server), 1 Flat File destination
+    Variables:     1 User variable (string)
+    Executables:
+      - 1 Execute SQL Task     ("Truncate Stage")
+      - 1 Data Flow            ("Extract Orders")
+          OLEDB Source         → Flat File Destination
+
+  Schema is the subset of attribute names betl-dtsx2yaml actually
+  reads. Real SSIS packages carry far more boilerplate; the parser
+  ignores everything it doesn't understand.
+-->
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:ObjectName="SimpleOledb"
+    DTS:ExecutableType="Microsoft.Package">
+
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+        DTS:ObjectName="Warehouse"
+        DTS:DTSID="{11111111-1111-1111-1111-111111111111}"
+        DTS:CreationName="OLEDB">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+            DTS:ConnectionString="Data Source=db.example.com;Initial Catalog=Sales;Integrated Security=SSPI;Provider=MSOLEDBSQL;"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+
+    <DTS:ConnectionManager
+        DTS:ObjectName="OrdersCsv"
+        DTS:DTSID="{22222222-2222-2222-2222-222222222222}"
+        DTS:CreationName="FLATFILE">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+            DTS:ConnectionString="/tmp/orders.csv"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <DTS:Variables>
+    <DTS:Variable
+        DTS:ObjectName="BatchTag"
+        DTS:Namespace="User">
+      <DTS:VariableValue DTS:DataType="18">nightly</DTS:VariableValue>
+    </DTS:Variable>
+  </DTS:Variables>
+
+  <DTS:Executables>
+
+    <DTS:Executable
+        DTS:ObjectName="Truncate Stage"
+        DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+            xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+            SQLTask:Connection="{11111111-1111-1111-1111-111111111111}"
+            SQLTask:SqlStatementSource="TRUNCATE TABLE stage.Orders;"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable
+        DTS:ObjectName="Extract Orders"
+        DTS:ExecutableType="Microsoft.Pipeline">
+      <DTS:ObjectData>
+        <pipeline>
+          <components>
+            <component
+                refId="Package\Extract Orders\OLEDB Source"
+                name="OLEDB Source"
+                componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="AccessMode">2</property>
+                <property name="SqlCommand">SELECT * FROM dbo.Orders</property>
+              </properties>
+              <connections>
+                <connection
+                    connectionManagerRefId="Package.ConnectionManagers[Warehouse]"/>
+              </connections>
+            </component>
+
+            <component
+                refId="Package\Extract Orders\Flat File Destination"
+                name="Flat File Destination"
+                componentClassID="Microsoft.FlatFileDestination">
+              <connections>
+                <connection
+                    connectionManagerRefId="Package.ConnectionManagers[OrdersCsv]"/>
+              </connections>
+            </component>
+          </components>
+          <paths>
+            <path
+                startId="Package\Extract Orders\OLEDB Source.Outputs[OLE DB Source Output]"
+                endId="Package\Extract Orders\Flat File Destination.Inputs[Flat File Destination Input]"/>
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+  </DTS:Executables>
+</DTS:Executable>

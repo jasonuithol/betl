@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    DTSX → betl YAML converter.
+
+    Standalone .NET console app. Unlike the betl-dotnet shim, this is
+    NOT NativeAOT — it runs only at conversion time on a developer
+    machine, so a regular framework-dependent publish is fine. Keeps
+    deploy size small and lets us pull in Roslyn/CodeAnalysis-style
+    libraries later (e.g. for VB.NET → C# translation).
+
+    Built via the CMake custom target `dtsx2yaml`; the resulting
+    binary lives at tools/betl-dtsx2yaml/out/Betl.Dtsx2Yaml.dll and
+    runs via `dotnet tools/betl-dtsx2yaml/out/Betl.Dtsx2Yaml.dll <args>`.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Betl.Dtsx2Yaml</RootNamespace>
+    <AssemblyName>Betl.Dtsx2Yaml</AssemblyName>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!--
+    VB.NET → C# translation. Conversion-time only; the produced C# is
+    inlined into a dotnet.task / dotnet.script step and compiled by
+    the betl-dotnet runtime. License audited as MIT (and all transitive
+    deps MIT) — see docs/THIRD_PARTY_LICENSES.md, audit 2026-05-12.
+
+    Version pinned at 9.2.7.792 (last 9.x release). The 10.x line
+    switched `System.Linq.Async` → `System.Linq.AsyncEnumerable`
+    (a .NET-10-era polyfill that pulls in Microsoft.Bcl.AsyncInterfaces
+    10.0.0); that combination doesn't load under net8.0 — Roslyn
+    throws FileNotFoundException on the polyfill's assembly. Once
+    betl ships against .NET 10+, we can bump.
+  -->
+  <ItemGroup>
+    <PackageReference Include="ICSharpCode.CodeConverter" Version="9.2.7.792" />
+    <!--
+      Pin Roslyn at 4.8.0 — the version that shipped with .NET 8.
+      CodeConverter declares `>= 4.1.0`, so without these pins NuGet
+      floats Roslyn up to whatever the latest is at restore time
+      (currently 4.14.x, which has hard refs to System.Collections.Immutable
+      9.0 and System.Reflection.Metadata 9.0 — neither shipped in the
+      .NET 8 BCL, so the publish output is missing them and the loader
+      throws at converter startup).  4.8.0 sticks to 8.x BCL versions
+      that the .NET 8 runtime provides natively.
+    -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features"
+                      Version="4.8.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces"
+                      Version="4.8.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic.Workspaces"
+                      Version="4.8.0" />
+  </ItemGroup>
+
+</Project>

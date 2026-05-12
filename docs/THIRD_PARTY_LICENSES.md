@@ -19,6 +19,7 @@ versions listed.
 | .NET 8 SDK Linux x64 tarball | 8.0.404 | n/a | **MIT** | ✓ Redistributable |
 | NativeAOT compiler (`Microsoft.DotNet.ILCompiler`) | 8.0.11 | MIT | MIT (NuGet) | ✓ Redistributable |
 | NativeAOT output binaries | n/a | n/a | MIT (statically linked) | ✓ Redistributable |
+| `ICSharpCode.CodeConverter` (NuGet) | 9.2.7.792 | MIT | MIT (NuGet) | ✓ Redistributable (conversion-time only) |
 
 **Net**: every artifact betl needs to ship or that flows downstream
 into end-user pipelines is permissively licensed (MIT, with some
@@ -195,8 +196,90 @@ checklist:
       version. Confirm `<license type="expression">MIT</license>`.
 - [ ] Update this document with the new version pins.
 
+## ICSharpCode.CodeConverter (VB.NET → C# translator)
+
+Used at **conversion time** by `betl-dtsx2yaml` to rewrite SSIS
+Script Task / Script Component VB.NET source into C# the dotnet.task
+/ dotnet.script runtime can compile. The library is a NuGet
+dependency of `tools/betl-dtsx2yaml`, published with the converter
+binary via `dotnet publish` (framework-dependent, so the DLLs ship
+alongside `Betl.Dtsx2Yaml.dll`).
+
+**Not a runtime dependency.** End-user pipelines never load this code
+— it runs once at DTSX→YAML conversion time on the operator's
+machine. Generated YAML and downstream NativeAOT artifacts have no
+trace of it.
+
+### Versions and licenses (audited 2026-05-12)
+
+`ICSharpCode.CodeConverter 9.2.7.792` (last 9.x; pinned for net8
+compatibility — the 10.x line replaced `System.Linq.Async` with
+`System.Linq.AsyncEnumerable`, which pulls a .NET-10-only assembly):
+
+| Source | License | Verified via |
+|---|---|---|
+| GitHub `icsharpcode/CodeConverter` LICENSE | MIT | Verbatim MIT text, "Copyright (c) 2017-2020 AlphaSierraPapa for the CodeConverter team" |
+| NuGet package | MIT (`licenses.nuget.org/MIT`) | NuGet flat-container nuspec |
+
+### Transitive dependencies (declared in 9.2.7.792 .nuspec, .NETStandard2.0)
+
+All MIT-licensed; verified individually on nuget.org:
+
+- `Microsoft.CSharp` 4.7.0 — MIT (.NET runtime)
+- `Microsoft.CodeAnalysis.CSharp.Features` 4.1.0 — MIT (Roslyn)
+- `Microsoft.CodeAnalysis.CSharp.Workspaces` 4.1.0 — MIT (Roslyn)
+- `Microsoft.CodeAnalysis.VisualBasic.Workspaces` 4.1.0 — MIT (Roslyn)
+- `Microsoft.VisualBasic` 10.3.0 — MIT (.NET runtime)
+- `Microsoft.VisualStudio.Composition` 16.9.20 — MIT (MEFv3, Microsoft)
+- `Microsoft.VisualStudio.Threading` 16.10.56 — MIT (Microsoft)
+- `System.Data.DataSetExtensions` 4.5.0 — MIT (.NET runtime)
+- `System.Globalization.Extensions` 4.3.0 — MIT (.NET runtime)
+- `System.IO.Abstractions` 13.2.33 — MIT (TestableIO)
+- `System.Linq.Async` 4.0.0 — MIT (.NET Foundation / Reactive.NET team)
+- `System.Text.Encodings.Web` 8.0.0 — MIT (.NET runtime)
+- `System.Threading.Tasks.Dataflow` 5.0.0 — MIT (.NET runtime)
+
+The only **non-Microsoft, non-.NET-runtime** packages in the closure
+are `ICSharpCode.CodeConverter` itself (AlphaSierraPapa / SharpDevelop),
+`System.IO.Abstractions` (TestableIO), and `System.Linq.Async`
+(Reactive Extensions / .NET Foundation). All MIT.
+
+### Explicit Roslyn pin in `Betl.Dtsx2Yaml.csproj`
+
+CodeConverter 9.2.7.792 declares `>= 4.1.0` on the Roslyn packages.
+NuGet's default resolution floats this up to the highest version at
+restore time (currently 4.14.x), which has hard refs to BCL
+assemblies (`System.Collections.Immutable 9.0.0`,
+`System.Reflection.Metadata 9.0.0`) that aren't in the .NET 8 BCL —
+the publish output ends up missing them and Roslyn throws
+`FileNotFoundException` at converter startup. The csproj pins
+Roslyn at `4.8.0` (the version that shipped with .NET 8) to stay
+within the .NET 8 BCL world:
+
+- `Microsoft.CodeAnalysis.CSharp.Features` 4.8.0 — MIT
+- `Microsoft.CodeAnalysis.CSharp.Workspaces` 4.8.0 — MIT
+- `Microsoft.CodeAnalysis.VisualBasic.Workspaces` 4.8.0 — MIT
+
+Same MIT license; the version pin only affects which point release
+ships, not the license terms.
+
+### Attribution requirement
+
+MIT requires the copyright notice + permission text to travel with
+binary copies. When publishing the dtsx2yaml tool, the relevant
+LICENSE files must appear in the published `out/` directory. The
+NuGet restore stage already populates a `runtimes/.../licenses` /
+`/legal` directory alongside each DLL; we just ensure those aren't
+stripped at packaging time.
+
+When we add a `NOTICE` file to the betl distribution (v0.2 deliverable),
+it should reference:
+- `ICSharpCode.CodeConverter` © 2017-2020 AlphaSierraPapa for the CodeConverter team
+- `System.IO.Abstractions` © Tatham Oddie / TestableIO
+
 ## Audit log
 
 | Date | Auditor | Versions pinned | Result |
 |---|---|---|---|
 | 2026-05-12 | Initial v0.2 audit | .NET 8.0.404 SDK / 8.0.11 runtime / 8.0.11 ILCompiler | ✓ Clear to redistribute on Linux |
+| 2026-05-12 | v0.2 VB.NET converter audit | `ICSharpCode.CodeConverter 10.0.1.923` + transitive deps | ✓ Clear (all MIT, conversion-time use) |

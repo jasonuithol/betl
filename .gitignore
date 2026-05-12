@@ -20,6 +20,12 @@ compile_commands.json
 *.dll
 *.a
 
+# .NET build artifacts (left under tools/<proj>/ by `dotnet build` /
+# restore). The actual betl-dtsx2yaml publish output lands under
+# build/tools/.../out/, which the build/ rule above already covers.
+bin/
+obj/
+
 # Local config / secrets
 .env
 .env.local

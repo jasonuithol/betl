@@ -186,6 +186,13 @@ add_subdirectory(providers/betl-lua)
 add_subdirectory(providers/betl-ssisexpr)
 add_subdirectory(providers/betl-dotnet)
 
+# --- Tools -----------------------------------------------------------------
+# Conversion-time / developer tooling. Currently only the DTSX → YAML
+# converter (v0.2 — drop-in SSIS replacement milestone). The subdirectory
+# sets BETL_DTSX2YAML_FOUND / _DOTNET / _DLL in parent scope so tests
+# below can gate on availability.
+add_subdirectory(tools/betl-dtsx2yaml)
+
 # --- Tests -----------------------------------------------------------------
 enable_testing()
 add_subdirectory(tests)

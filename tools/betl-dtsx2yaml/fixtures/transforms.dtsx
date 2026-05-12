@@ -1,0 +1,377 @@
+<?xml version="1.0"?>
+<!--
+  Transform-coverage DTSX fixture for betl-dtsx2yaml. One Data Flow
+  exercising the transforms supported in v0.2:
+    OLEDB Source → Derived Column → Data Conversion → Conditional Split
+                                                       (Hot Path, Cold Path, Default)
+                  Hot Path → Sort → Aggregate → Multicast (TapA, TapB)
+                                                  TapA → Lookup → OLEDB Destination
+                                                  TapB → Flat File Destination
+                  Cold Path → Union All ←─── Default → Union All → Flat File Destination
+
+  This is intentionally minimal — the converter emits a skeleton with
+  TODO markers; the test asserts the *shape* (type: <component>, the
+  right `from:` wiring, correct `taps:` / `cases:` lists). It does
+  not pretend to be a runnable real package.
+-->
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:ObjectName="TransformsAll"
+    DTS:ExecutableType="Microsoft.Package">
+
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+        DTS:ObjectName="Warehouse"
+        DTS:DTSID="{11111111-1111-1111-1111-111111111111}"
+        DTS:CreationName="OLEDB">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+            DTS:ConnectionString="Data Source=db.example.com;Initial Catalog=Sales;Integrated Security=SSPI;Provider=MSOLEDBSQL;"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+
+    <DTS:ConnectionManager
+        DTS:ObjectName="HotCsv"
+        DTS:DTSID="{22222222-2222-2222-2222-222222222222}"
+        DTS:CreationName="FLATFILE">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager DTS:ConnectionString="/tmp/hot.csv"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+
+    <DTS:ConnectionManager
+        DTS:ObjectName="RestCsv"
+        DTS:DTSID="{33333333-3333-3333-3333-333333333333}"
+        DTS:CreationName="FLATFILE">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager DTS:ConnectionString="/tmp/rest.csv"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <DTS:Executables>
+    <DTS:Executable
+        DTS:ObjectName="MainFlow"
+        DTS:ExecutableType="Microsoft.Pipeline">
+      <DTS:ObjectData>
+        <pipeline>
+          <components>
+
+            <!-- 1. OLEDB Source -->
+            <component
+                refId="Package\MainFlow\Src"
+                name="Src"
+                componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="AccessMode">2</property>
+                <property name="SqlCommand">SELECT id, priority, raw_price FROM dbo.Orders</property>
+              </properties>
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[Warehouse]"/>
+              </connections>
+              <outputs>
+                <output name="OLE DB Source Output"/>
+              </outputs>
+            </component>
+
+            <!-- 2. Derived Column -->
+            <component
+                refId="Package\MainFlow\Derive"
+                name="Derive"
+                componentClassID="Microsoft.DerivedColumn">
+              <outputs>
+                <output name="Derived Column Output">
+                  <outputColumns>
+                    <outputColumn name="full_id" dataType="wstr">
+                      <properties>
+                        <property name="Expression">[id] + "-derived"</property>
+                        <property name="FriendlyExpression">[id] + "-derived"</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- 3. Data Conversion -->
+            <component
+                refId="Package\MainFlow\Convert"
+                name="Convert"
+                componentClassID="Microsoft.DataConvert">
+              <outputs>
+                <output name="Data Conversion Output">
+                  <outputColumns>
+                    <outputColumn name="price_i4" dataType="i4">
+                      <properties>
+                        <property name="SourceInputColumnLineageID">#1234</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- 4. Conditional Split -->
+            <component
+                refId="Package\MainFlow\Split"
+                name="Split"
+                componentClassID="Microsoft.ConditionalSplit">
+              <outputs>
+                <output name="Hot Path">
+                  <properties>
+                    <property name="FriendlyExpression">[priority] == "hot"</property>
+                    <property name="EvaluationOrder">0</property>
+                  </properties>
+                </output>
+                <output name="Cold Path">
+                  <properties>
+                    <property name="FriendlyExpression">[priority] == "cold"</property>
+                    <property name="EvaluationOrder">1</property>
+                  </properties>
+                </output>
+                <output name="Default" isErrorOut="false"/>
+              </outputs>
+            </component>
+
+            <!-- 5. Sort -->
+            <component
+                refId="Package\MainFlow\SortStep"
+                name="SortStep"
+                componentClassID="Microsoft.Sort">
+              <inputs>
+                <input name="Sort Input">
+                  <inputColumns>
+                    <inputColumn cachedName="id" name="id">
+                      <properties>
+                        <property name="NewSortKeyPosition">1</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="price_i4" name="price_i4">
+                      <properties>
+                        <property name="NewSortKeyPosition">-2</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="full_id" name="full_id">
+                      <properties>
+                        <property name="NewSortKeyPosition">0</property>
+                      </properties>
+                    </inputColumn>
+                  </inputColumns>
+                </input>
+              </inputs>
+              <outputs>
+                <output name="Sort Output"/>
+              </outputs>
+            </component>
+
+            <!-- 6. Aggregate -->
+            <component
+                refId="Package\MainFlow\Agg"
+                name="Agg"
+                componentClassID="Microsoft.Aggregate">
+              <outputs>
+                <output name="Aggregate Output 1">
+                  <outputColumns>
+                    <outputColumn name="priority">
+                      <properties>
+                        <property name="AggregationType">0</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="cnt">
+                      <properties>
+                        <property name="AggregationType">1</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="total">
+                      <properties>
+                        <property name="AggregationType">3</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- 7. Multicast -->
+            <component
+                refId="Package\MainFlow\Fanout"
+                name="Fanout"
+                componentClassID="Microsoft.Multicast">
+              <outputs>
+                <output name="TapA"/>
+                <output name="TapB"/>
+              </outputs>
+            </component>
+
+            <!-- 8. Lookup -->
+            <component
+                refId="Package\MainFlow\Lk"
+                name="Lk"
+                componentClassID="Microsoft.Lookup">
+              <properties>
+                <property name="SqlCommand">SELECT id, color FROM dim_color</property>
+                <property name="CacheType">1</property>
+              </properties>
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[Warehouse]"/>
+              </connections>
+              <outputs>
+                <output name="Lookup Match Output"/>
+              </outputs>
+            </component>
+
+            <!-- 9. OLEDB Destination -->
+            <component
+                refId="Package\MainFlow\DbSink"
+                name="DbSink"
+                componentClassID="Microsoft.OLEDBDestination">
+              <properties>
+                <property name="OpenRowset">dbo.OrdersStage</property>
+              </properties>
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[Warehouse]"/>
+              </connections>
+            </component>
+
+            <!-- 10. Flat File Destination — Tap B sink -->
+            <component
+                refId="Package\MainFlow\CsvSinkHot"
+                name="CsvSinkHot"
+                componentClassID="Microsoft.FlatFileDestination">
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[HotCsv]"/>
+              </connections>
+            </component>
+
+            <!-- 11. Union All — joins Cold + Default lanes -->
+            <component
+                refId="Package\MainFlow\Unite"
+                name="Unite"
+                componentClassID="Microsoft.UnionAll">
+              <outputs>
+                <output name="Union All Output 1"/>
+              </outputs>
+            </component>
+
+            <!-- 12. Flat File Destination — Rest sink -->
+            <component
+                refId="Package\MainFlow\CsvSinkRest"
+                name="CsvSinkRest"
+                componentClassID="Microsoft.FlatFileDestination">
+              <connections>
+                <connection connectionManagerRefId="Package.ConnectionManagers[RestCsv]"/>
+              </connections>
+            </component>
+
+            <!-- 13. Merge Join — added downstream of Split's Hot Path so we
+                 also test the 2-input case. We feed Hot Path twice
+                 through a second pseudo-source. -->
+            <component
+                refId="Package\MainFlow\MJ"
+                name="MJ"
+                componentClassID="Microsoft.MergeJoin">
+              <properties>
+                <property name="JoinType">1</property>
+              </properties>
+              <outputs>
+                <output name="Merge Join Output"/>
+              </outputs>
+            </component>
+
+            <!-- 14. Pivot -->
+            <component
+                refId="Package\MainFlow\Pvt"
+                name="Pvt"
+                componentClassID="Microsoft.Pivot">
+              <inputs>
+                <input name="Pivot Input">
+                  <inputColumns>
+                    <inputColumn cachedName="region">
+                      <properties>
+                        <property name="PivotUsage">1</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="month">
+                      <properties>
+                        <property name="PivotUsage">2</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="amount">
+                      <properties>
+                        <property name="PivotUsage">3</property>
+                      </properties>
+                    </inputColumn>
+                  </inputColumns>
+                </input>
+              </inputs>
+              <outputs>
+                <output name="Pivot Default Output">
+                  <outputColumns>
+                    <outputColumn name="jan">
+                      <properties>
+                        <property name="PivotKeyValue">jan</property>
+                      </properties>
+                    </outputColumn>
+                    <outputColumn name="feb">
+                      <properties>
+                        <property name="PivotKeyValue">feb</property>
+                      </properties>
+                    </outputColumn>
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+          </components>
+
+          <paths>
+            <!-- Linear: Src → Derive → Convert → Split -->
+            <path startId="Package\MainFlow\Src.Outputs[OLE DB Source Output]"
+                  endId="Package\MainFlow\Derive.Inputs[Derived Column Input]"/>
+            <path startId="Package\MainFlow\Derive.Outputs[Derived Column Output]"
+                  endId="Package\MainFlow\Convert.Inputs[Data Conversion Input]"/>
+            <path startId="Package\MainFlow\Convert.Outputs[Data Conversion Output]"
+                  endId="Package\MainFlow\Split.Inputs[Input]"/>
+
+            <!-- Hot lane: Split → Sort → Agg → Fanout -->
+            <path startId="Package\MainFlow\Split.Outputs[Hot Path]"
+                  endId="Package\MainFlow\SortStep.Inputs[Sort Input]"/>
+            <path startId="Package\MainFlow\SortStep.Outputs[Sort Output]"
+                  endId="Package\MainFlow\Agg.Inputs[Aggregate Input 1]"/>
+            <path startId="Package\MainFlow\Agg.Outputs[Aggregate Output 1]"
+                  endId="Package\MainFlow\Fanout.Inputs[Multicast Input 1]"/>
+
+            <!-- Fanout TapA → Lookup → DbSink -->
+            <path startId="Package\MainFlow\Fanout.Outputs[TapA]"
+                  endId="Package\MainFlow\Lk.Inputs[Lookup Input]"/>
+            <path startId="Package\MainFlow\Lk.Outputs[Lookup Match Output]"
+                  endId="Package\MainFlow\DbSink.Inputs[OLE DB Destination Input]"/>
+
+            <!-- Fanout TapB → CsvSinkHot -->
+            <path startId="Package\MainFlow\Fanout.Outputs[TapB]"
+                  endId="Package\MainFlow\CsvSinkHot.Inputs[Flat File Destination Input]"/>
+
+            <!-- Cold + Default → Unite → CsvSinkRest -->
+            <path startId="Package\MainFlow\Split.Outputs[Cold Path]"
+                  endId="Package\MainFlow\Unite.Inputs[Union All Input 1]"/>
+            <path startId="Package\MainFlow\Split.Outputs[Default]"
+                  endId="Package\MainFlow\Unite.Inputs[Union All Input 2]"/>
+            <path startId="Package\MainFlow\Unite.Outputs[Union All Output 1]"
+                  endId="Package\MainFlow\CsvSinkRest.Inputs[Flat File Destination Input]"/>
+
+            <!-- Merge Join: two inputs from Sort (left) + Convert (right) -->
+            <path startId="Package\MainFlow\SortStep.Outputs[Sort Output]"
+                  endId="Package\MainFlow\MJ.Inputs[Merge Join Left Input]"/>
+            <path startId="Package\MainFlow\Convert.Outputs[Data Conversion Output]"
+                  endId="Package\MainFlow\MJ.Inputs[Merge Join Right Input]"/>
+
+            <!-- Pivot: gets its input from Agg too (artificial but tests the
+                 emit shape) -->
+            <path startId="Package\MainFlow\Agg.Outputs[Aggregate Output 1]"
+                  endId="Package\MainFlow\Pvt.Inputs[Pivot Input]"/>
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+</DTS:Executable>
