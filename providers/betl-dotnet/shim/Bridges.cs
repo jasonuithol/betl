@@ -28,4 +28,10 @@ internal static unsafe class Bridges
     /* const char *betl_get_param(BetlContext*, const char *name).
      * Returned pointer is host-owned (no free on our side). */
     internal static delegate* unmanaged<IntPtr, byte*, byte*> GetParamFn;
+
+    /* const char *betl_get_connection(BetlContext*, const char *name).
+     * Returned pointer is host-owned. The value is the connection's
+     * JSON blob (whatever the YAML declared under connections.<name>);
+     * parsing is the script's responsibility. */
+    internal static delegate* unmanaged<IntPtr, byte*, byte*> GetConnectionFn;
 }

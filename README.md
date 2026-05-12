@@ -121,6 +121,10 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 
 - No `dotnet.task` / `dotnet.script` and no DTSX→YAML converter —
   slated for **v0.2**, the "drop-in SSIS replacement" milestone.
+  Runtime language is C# only via NativeAOT; the DTSX converter
+  translates VB.NET → C# at conversion time (the VB.NET compiler
+  rejects `[UnmanagedCallersOnly]` so it can't host a NativeAOT
+  shared library directly).
 - No `parquet.*` — slated for **v0.3**.
 - No `kafka.*`, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you

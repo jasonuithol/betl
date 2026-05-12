@@ -25,11 +25,13 @@ public static unsafe class Entry
     public static int Init(
         IntPtr ctx,
         delegate* unmanaged<IntPtr, int, byte*, void> logFn,
-        delegate* unmanaged<IntPtr, byte*, byte*> getParamFn)
+        delegate* unmanaged<IntPtr, byte*, byte*> getParamFn,
+        delegate* unmanaged<IntPtr, byte*, byte*> getConnectionFn)
     {
-        Bridges.Ctx        = ctx;
-        Bridges.LogFn      = logFn;
-        Bridges.GetParamFn = getParamFn;
+        Bridges.Ctx             = ctx;
+        Bridges.LogFn           = logFn;
+        Bridges.GetParamFn      = getParamFn;
+        Bridges.GetConnectionFn = getConnectionFn;
         return 0;
     }
 

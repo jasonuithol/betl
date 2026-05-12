@@ -597,6 +597,10 @@ static const char *host_get_param_wrapper(BetlContext *ctx, const char *name) {
     return betl_get_param(ctx, name);
 }
 
+static const char *host_get_connection_wrapper(BetlContext *ctx, const char *name) {
+    return betl_get_connection(ctx, name);
+}
+
 
 /* ============================================================== *
  *  dotnet.task                                                     *
@@ -604,7 +608,8 @@ static const char *host_get_param_wrapper(BetlContext *ctx, const char *name) {
 
 typedef int  (*dotnet_init_fn)(BetlContext *ctx,
                                void (*log)(BetlContext *, int, const char *),
-                               const char *(*get_param)(BetlContext *, const char *));
+                               const char *(*get_param)(BetlContext *, const char *),
+                               const char *(*get_connection)(BetlContext *, const char *));
 typedef int  (*dotnet_task_run_fn)(void);
 
 typedef struct {
@@ -638,8 +643,20 @@ static int dotnet_task_init(BetlContext *ctx, const char *cfg, void **state) {
         return BETL_ERR_INVALID;
     }
     if (strcmp(t->lang, "vbnet") == 0) {
-        betl_set_error(ctx, "dotnet.task: lang=vbnet not yet implemented "
-                            "(v0.2 phase 2)");
+        /* Hard architectural call: VB.NET Roslyn explicitly rejects
+         * [UnmanagedCallersOnly] (error BC37316), so a VB.NET source
+         * can't host our entry points directly. Rather than emulate
+         * with a C# shim + project-reference dance (which fights the
+         * NativeAOT trim+reflection model), betl translates VB.NET to
+         * C# at DTSX-conversion time and the runtime sees only C#.
+         *
+         * If you have hand-written VB.NET pipeline source, run it
+         * through the DTSX converter's --translate-vb flag (or any
+         * Roslyn-based VB→C# tool) and submit the C# output. */
+        betl_set_error(ctx,
+            "dotnet.task: lang=vbnet is not a runtime language; "
+            "translate to C# via the DTSX converter (or any VB→C# tool) "
+            "and submit lang=csharp");
         free(t->source); free(t->lang); free(t);
         return BETL_ERR_UNSUPPORTED;
     }
@@ -671,7 +688,8 @@ static int dotnet_task_init(BetlContext *ctx, const char *cfg, void **state) {
         return BETL_ERR_INVALID;
     }
 
-    if (t->init_fn(ctx, host_log_wrapper, host_get_param_wrapper) != 0) {
+    if (t->init_fn(ctx, host_log_wrapper, host_get_param_wrapper,
+                   host_get_connection_wrapper) != 0) {
         betl_set_error(ctx, "dotnet.task: managed init returned non-zero");
         /* Do not dlclose — see dotnet_task_destroy. */
         free(t->so_path); free(t->source); free(t->lang); free(t);

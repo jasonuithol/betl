@@ -28,6 +28,8 @@
 #include "runtime/builtins.h"
 #include "runtime/context.h"
 #include "runtime/exec.h"
+#include "runtime/connections.h"
+#include "runtime/parameters.h"
 
 #define SKIP_RC 77
 
@@ -145,6 +147,23 @@ static int run_yaml(const char *plugin_path,
         if (err) snprintf(err, err_cap, "%s", betl_registry_last_error(reg));
         goto cleanup;
     }
+    /* Resolve YAML-declared parameter defaults + connections onto the
+     * context. The `betl run` CLI does this; for a self-contained test
+     * we do it inline so YAML `parameters:` / `connections:` actually
+     * land in betl_get_param / betl_get_connection at run time. */
+    {
+        char perr[256] = {0};
+        rc = betl_apply_parameters(ctx, p, NULL, 0, perr, sizeof perr);
+        if (rc != BETL_OK) {
+            if (err) snprintf(err, err_cap, "apply_parameters: %s", perr);
+            goto cleanup;
+        }
+        rc = betl_apply_connections(ctx, p, perr, sizeof perr);
+        if (rc != BETL_OK) {
+            if (err) snprintf(err, err_cap, "apply_connections: %s", perr);
+            goto cleanup;
+        }
+    }
     rc = betl_run(ctx, reg, p);
     if (err) snprintf(err, err_cap, "%s", betl_context_last_error(ctx));
 
@@ -187,6 +206,51 @@ static const char PL_HELLO_CSHARP[] =
     "      public class UserTask : Betl.BetlTask {\n"
     "        public override void Run() {\n"
     "          Betl.Log.Info(\"hello from C# (dotnet.task v0.2)\");\n"
+    "        }\n"
+    "      }\n";
+
+static const char PL_PARAMS_BRIDGE[] =
+    "betl: 1\n"
+    "name: dotnet-task-params\n"
+    "parameters:\n"
+    "  greeting:\n"
+    "    type: string\n"
+    "    default: \"g'day from C#\"\n"
+    "  missing:\n"
+    "    type: string\n"
+    "    default: \"\"\n"
+    "pipeline:\n"
+    "  - id: hi\n"
+    "    type: dotnet.task\n"
+    "    lang: csharp\n"
+    "    source: |\n"
+    "      public class UserTask : Betl.BetlTask {\n"
+    "        public override void Run() {\n"
+    "          var s = Betl.Params.Get(\"greeting\");\n"
+    "          Betl.Log.Info(\"greeting=\" + (s ?? \"<null>\"));\n"
+    "          var u = Betl.Params.Get(\"nonexistent_param\");\n"
+    "          Betl.Log.Info(\"unknown=\" + (u ?? \"<null>\"));\n"
+    "        }\n"
+    "      }\n";
+
+static const char PL_CONNECTION_BRIDGE[] =
+    "betl: 1\n"
+    "name: dotnet-task-connection\n"
+    "connections:\n"
+    "  warehouse:\n"
+    "    type: postgres\n"
+    "    dsn: postgresql://localhost/test\n"
+    "pipeline:\n"
+    "  - id: hi\n"
+    "    type: dotnet.task\n"
+    "    lang: csharp\n"
+    "    source: |\n"
+    "      public class UserTask : Betl.BetlTask {\n"
+    "        public override void Run() {\n"
+    "          var j = Betl.Connection.Get(\"warehouse\");\n"
+    "          Betl.Log.Info(\"conn=\" + (j ?? \"<null>\"));\n"
+    "          var m = Betl.Connection.Get(\"nope\");\n"
+    "          Betl.Log.Info(\"missing=\" + (m ?? \"<null>\"));\n"
     "        }\n"
     "      }\n";
 
@@ -255,11 +319,41 @@ int main(int argc, char **argv) {
     CHECK((c1 - c0) < (t1 - t0));     /* cache hit must beat fresh compile */
     CHECK((c1 - c0) < 1000.0);        /* and be under a second */
 
-    /* --- 3. VB.NET is rejected with a clear "phase 2" error. ------ */
+    /* --- 3. Params bridge: declared default reaches the script,
+     * unknown name returns null. ------------------------------------ */
+    char logp[64];
+    snprintf(logp, sizeof logp, "/tmp/betl-dotnet-params-%d.txt", (int)getpid());
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_PARAMS_BRIDGE, logp, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "params: %s\n", err);
+    CHECK(rc == BETL_OK);
+    CHECK(file_contains(logp, "greeting=g'day from C#"));
+    CHECK(file_contains(logp, "unknown=<null>"));
+    unlink(logp);
+
+    /* --- 4. Connection bridge: YAML connections.warehouse.* is
+     * available as a JSON blob to the script; unknown name → null. -- */
+    char logc[64];
+    snprintf(logc, sizeof logc, "/tmp/betl-dotnet-conn-%d.txt", (int)getpid());
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_CONNECTION_BRIDGE, logc, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "connection: %s\n", err);
+    CHECK(rc == BETL_OK);
+    CHECK(file_contains(logc, "conn={"));
+    CHECK(file_contains(logc, "\"type\":\"postgres\""));
+    CHECK(file_contains(logc, "\"dsn\":\"postgresql://localhost/test\""));
+    CHECK(file_contains(logc, "missing=<null>"));
+    unlink(logc);
+
+    /* --- 5. VB.NET source is permanently rejected at the runtime:
+     * the VB.NET compiler doesn't support [UnmanagedCallersOnly], so
+     * we make the DTSX converter responsible for VB→C# translation
+     * rather than embed a parallel toolchain in the runtime. ------ */
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_VBNET_REJECTED, NULL, err, sizeof err);
     CHECK(rc != BETL_OK);
-    CHECK(strstr(err, "vbnet") != NULL || strstr(err, "phase 2") != NULL);
+    CHECK(strstr(err, "vbnet") != NULL);
+    CHECK(strstr(err, "translate to C#") != NULL);
 
     unlink(log1); unlink(log2);
 
