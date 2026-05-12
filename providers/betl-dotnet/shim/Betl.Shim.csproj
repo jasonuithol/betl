@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NativeAOT shim for the betl-dotnet provider.
+
+    At "betl validate" time the C plugin copies these shim files plus
+    the user's script into a temp dir and invokes `dotnet publish` to
+    produce a self-contained .so. The plugin then dlopens that .so and
+    calls into the [UnmanagedCallersOnly] entry points to drive the
+    user's task / script.
+
+    InvariantGlobalization is on to avoid a libicu runtime dependency
+    in the AOT-compiled output — keeps deploy footprint small and
+    matches the SDK's own invariant-mode default for build-time use.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Betl</RootNamespace>
+    <AssemblyName>Betl.Shim</AssemblyName>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Trimmer warnings are noise for a tiny library. -->
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <!-- Stripped binary, no PDB beside the .so. -->
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+</Project>

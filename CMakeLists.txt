@@ -183,6 +183,7 @@ set_target_properties(betl PROPERTIES ENABLE_EXPORTS ON)
 # in the parent scope so tests can gate on availability.
 add_subdirectory(providers/betl-lua)
 add_subdirectory(providers/betl-ssisexpr)
+add_subdirectory(providers/betl-dotnet)
 
 # --- Tests -----------------------------------------------------------------
 enable_testing()

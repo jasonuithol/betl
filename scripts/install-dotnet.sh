@@ -90,6 +90,36 @@ for f in LICENSE.txt ThirdPartyNotices.txt; do
     fi
 done
 
+# Check NativeAOT host-toolchain prereqs. NativeAOT uses clang as the
+# linker driver and links against zlib at static-link time, so a host
+# missing either of them produces a confusing "cannot find -lz" or
+# "clang not found" failure deep inside `dotnet publish`. We don't
+# install these from this script (they're host-pkg-manager territory
+# alongside gcc itself) — just flag the gap clearly.
+echo
+echo "--- NativeAOT host prerequisites ---"
+missing=0
+if ! command -v clang >/dev/null 2>&1; then
+    echo "  ✗ clang not on PATH"
+    echo "    Install with: sudo apt-get install -y clang"
+    missing=1
+else
+    echo "  ✓ clang ($(clang --version | head -1))"
+fi
+if ! ldconfig -p 2>/dev/null | grep -q "libz\.so"; then
+    echo "  ✗ libz not on link path"
+    echo "    Install with: sudo apt-get install -y zlib1g-dev"
+    missing=1
+else
+    echo "  ✓ libz on link path"
+fi
+if [[ $missing -ne 0 ]]; then
+    echo
+    echo "Install the missing packages above before running dotnet.task /"
+    echo "dotnet.script. AOT compilation will fail at link time without them."
+    echo
+fi
+
 # Verify the dotnet CLI actually runs. Globalization-invariant mode
 # avoids a hard libicu dependency at build time — the AOT compiler
 # itself doesn't need locale-aware string handling. Production-time

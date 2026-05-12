@@ -219,6 +219,29 @@ if(BETL_LUA_FOUND)
         COMMAND test_lua_map $<TARGET_FILE:${BETL_LUA_TARGET}>
     )
 
+    # End-to-end: dotnet.task hello-world (v0.2 — first slice of the
+    # SSIS Script Component replacement). SKIPs (rc=77) when the .NET
+    # SDK isn't installed in deps/dotnet/ — run scripts/install-dotnet.sh
+    # to enable.
+    if(BETL_DOTNET_FOUND)
+        add_executable(test_dotnet_task test_dotnet_task.c)
+        target_link_libraries(test_dotnet_task PRIVATE betl_core)
+        set_target_properties(test_dotnet_task PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_dotnet_task PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_DOTNET_TARGET}>"
+        )
+        add_dependencies(test_dotnet_task ${BETL_DOTNET_TARGET})
+        add_test(NAME dotnet_task
+            COMMAND test_dotnet_task $<TARGET_FILE:${BETL_DOTNET_TARGET}>
+        )
+        set_tests_properties(dotnet_task PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: dotnet.task hello-world test passed"
+            # AOT compile can be slow on a cold NuGet cache; budget 3 min.
+            TIMEOUT 180
+        )
+    endif()
+
     # End-to-end: lua.script — the SSIS async script component analogue.
     add_executable(test_lua_script test_lua_script.c)
     target_link_libraries(test_lua_script PRIVATE betl_core)
