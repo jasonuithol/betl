@@ -1,0 +1,175 @@
+<?xml version="1.0"?>
+<!--
+  betl-dtsx2yaml fixture: control-flow constructs.
+
+  Layout:
+
+    Init (ExecuteSqlTask)
+       │ Success
+       ▼
+    Sequence "Stage 1"
+        ├─ Truncate (ExecuteSqlTask)
+        │     │ Success
+        │     ▼
+        └─ Load (ExecuteSqlTask)
+       │
+       │ (Sequence completion → next top-level task)
+       ▼
+    Cleanup (ExecuteSqlTask)
+       │ Failure
+       ▼
+    Notify (ExecuteSqlTask)           — runs only when Cleanup fails
+       │ Completion
+       ▼
+    Done (ExecuteSqlTask)              — runs regardless
+
+    ForEach "Per File"
+        └─ ProcessFile (ExecuteSqlTask)
+
+  Asserts:
+   - Sequence's children flatten in-place (no "stage_1" step exists)
+   - `truncate.after = []`, `load.after = [truncate]`,
+     `cleanup.after = [load]` (Sequence exit lowered to Cleanup)
+   - `notify.after = [cleanup]` + `on_failure: continue` + Failure TODO
+   - `done.after = [notify]`   + `on_failure: continue` + Completion note
+   - ForEach Loop header comment exists; ProcessFile body present
+-->
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:ObjectName="ControlFlow"
+    DTS:refId="Package"
+    DTS:ExecutableType="Microsoft.Package">
+
+  <DTS:Executables>
+
+    <DTS:Executable DTS:refId="Package\Init"
+        DTS:ObjectName="Init"
+        DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+            xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+            SQLTask:SqlStatementSource="SELECT 1;"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\Stage 1"
+        DTS:ObjectName="Stage 1"
+        DTS:ExecutableType="Microsoft.Sequence">
+      <DTS:Executables>
+        <DTS:Executable DTS:refId="Package\Stage 1\Truncate"
+            DTS:ObjectName="Truncate"
+            DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+          <DTS:ObjectData>
+            <SQLTask:SqlTaskData
+                xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+                SQLTask:SqlStatementSource="TRUNCATE TABLE staging;"/>
+          </DTS:ObjectData>
+        </DTS:Executable>
+        <DTS:Executable DTS:refId="Package\Stage 1\Load"
+            DTS:ObjectName="Load"
+            DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+          <DTS:ObjectData>
+            <SQLTask:SqlTaskData
+                xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+                SQLTask:SqlStatementSource="INSERT INTO staging SELECT * FROM src;"/>
+          </DTS:ObjectData>
+        </DTS:Executable>
+      </DTS:Executables>
+      <DTS:PrecedenceConstraints>
+        <DTS:PrecedenceConstraint
+            DTS:From="Package\Stage 1\Truncate"
+            DTS:To="Package\Stage 1\Load"
+            DTS:Value="0"
+            DTS:EvalOp="1"/>
+      </DTS:PrecedenceConstraints>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\Cleanup"
+        DTS:ObjectName="Cleanup"
+        DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+            xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+            SQLTask:SqlStatementSource="DELETE FROM staging WHERE bad = 1;"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\Notify"
+        DTS:ObjectName="Notify"
+        DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+            xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+            SQLTask:SqlStatementSource="INSERT INTO log SELECT 'cleanup failed';"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\Done"
+        DTS:ObjectName="Done"
+        DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+            xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+            SQLTask:SqlStatementSource="INSERT INTO log SELECT 'done';"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\Per File"
+        DTS:ObjectName="Per File"
+        DTS:ExecutableType="Microsoft.ForEachLoop">
+      <DTS:ForEachEnumerator>
+        <DTS:ObjectData>
+          <ForEachFileEnumerator
+              Folder="/tmp/inbox"
+              FileSpec="*.csv"
+              Recurse="0"/>
+        </DTS:ObjectData>
+      </DTS:ForEachEnumerator>
+      <DTS:ForEachVariableMappings>
+        <DTS:ForEachVariableMapping DTS:VariableName="User::CurrentFile"/>
+      </DTS:ForEachVariableMappings>
+      <DTS:Executables>
+        <DTS:Executable DTS:refId="Package\Per File\ProcessFile"
+            DTS:ObjectName="ProcessFile"
+            DTS:ExecutableType="Microsoft.ExecuteSQLTask">
+          <DTS:ObjectData>
+            <SQLTask:SqlTaskData
+                xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+                SQLTask:SqlStatementSource="EXEC ProcessFile :file;"/>
+          </DTS:ObjectData>
+        </DTS:Executable>
+      </DTS:Executables>
+    </DTS:Executable>
+
+  </DTS:Executables>
+
+  <DTS:PrecedenceConstraints>
+    <!-- Init →(Success)→ Stage 1 (the container) -->
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\Init"
+        DTS:To="Package\Stage 1"
+        DTS:Value="0" DTS:EvalOp="1"/>
+    <!-- Stage 1 →(Success)→ Cleanup -->
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\Stage 1"
+        DTS:To="Package\Cleanup"
+        DTS:Value="0" DTS:EvalOp="1"/>
+    <!-- Cleanup →(Failure)→ Notify -->
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\Cleanup"
+        DTS:To="Package\Notify"
+        DTS:Value="1" DTS:EvalOp="1"/>
+    <!-- Notify →(Completion)→ Done -->
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\Notify"
+        DTS:To="Package\Done"
+        DTS:Value="2" DTS:EvalOp="1"/>
+    <!-- Done →(Expression-gated Success)→ Per File -->
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\Done"
+        DTS:To="Package\Per File"
+        DTS:Value="0" DTS:EvalOp="3"
+        DTS:Expression="@[User::SkipLoop] == false"/>
+  </DTS:PrecedenceConstraints>
+
+</DTS:Executable>

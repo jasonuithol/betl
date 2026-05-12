@@ -2,6 +2,7 @@
  * about are pulled into the strongly-typed model. */
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Xml.Linq;
@@ -50,13 +51,42 @@ public static class DtsxParser
                 pkg.Variables.Add(ParseVariable(v));
         }
 
+        string pkgRefId = (string?)root.Attribute(DtsNs + "refId") ?? "Package";
         var execs = root.Element(DtsNs + "Executables");
         if (execs != null)
         {
             foreach (var e in execs.Elements(DtsNs + "Executable"))
-                pkg.Executables.Add(ParseExecutable(e));
+                pkg.Executables.Add(ParseExecutable(e, pkgRefId));
         }
+        /* Top-level precedence constraints live as a sibling of
+         * <DTS:Executables> on the package root, the same way they
+         * appear inside containers. */
+        pkg.RootPrecedence.AddRange(ParsePrecedences(root));
         return pkg;
+    }
+
+    static List<DtsxPrecedence> ParsePrecedences(XElement container)
+    {
+        var list = new List<DtsxPrecedence>();
+        var pcs = container.Element(DtsNs + "PrecedenceConstraints");
+        if (pcs == null) return list;
+        foreach (var pc in pcs.Elements(DtsNs + "PrecedenceConstraint"))
+        {
+            int.TryParse((string?)pc.Attribute(DtsNs + "Value")  ?? "0", out int val);
+            int.TryParse((string?)pc.Attribute(DtsNs + "EvalOp") ?? "1", out int evalOp);
+            string logAnd = (string?)pc.Attribute(DtsNs + "LogicalAnd") ?? "True";
+            list.Add(new DtsxPrecedence
+            {
+                FromRefId  = (string?)pc.Attribute(DtsNs + "From")       ?? "",
+                ToRefId    = (string?)pc.Attribute(DtsNs + "To")         ?? "",
+                Value      = val,
+                EvalOp     = evalOp,
+                Expression = (string?)pc.Attribute(DtsNs + "Expression") ?? "",
+                LogicalAnd = !logAnd.Equals("False",
+                                System.StringComparison.OrdinalIgnoreCase),
+            });
+        }
+        return list;
     }
 
     static DtsxConnection ParseConnection(XElement cm)
@@ -97,12 +127,20 @@ public static class DtsxParser
         };
     }
 
-    static DtsxExecutable ParseExecutable(XElement e)
+    static DtsxExecutable ParseExecutable(XElement e, string parentRefId)
     {
+        string name = (string?)e.Attribute(DtsNs + "ObjectName") ?? "";
+        /* DTS:refId is the SSIS-assigned unique path, e.g.
+         *   "Package\Loop Files\Truncate"
+         * Synthesise from parent\name when the source omits it
+         * (older exports occasionally do). */
+        string refId = (string?)e.Attribute(DtsNs + "refId")
+                       ?? (parentRefId + "\\" + name);
         var exe = new DtsxExecutable
         {
-            Kind = (string?)e.Attribute(DtsNs + "ExecutableType") ?? "",
-            Name = (string?)e.Attribute(DtsNs + "ObjectName") ?? "",
+            Kind       = (string?)e.Attribute(DtsNs + "ExecutableType") ?? "",
+            Name       = name,
+            RefId      = refId,
             ObjectData = e.Element(DtsNs + "ObjectData"),
         };
         if (exe.Kind == "Microsoft.Pipeline")
@@ -124,6 +162,60 @@ public static class DtsxParser
                 {
                     foreach (var p in paths.Elements("path"))
                         exe.Paths.Add(ParsePath(p));
+                }
+            }
+        }
+
+        /* Containers (Sequence / ForEachLoop / ForLoop) carry nested
+         * <DTS:Executables> + their own <DTS:PrecedenceConstraints>.
+         * Recurse so the model captures the full tree. */
+        if (exe.IsContainer)
+        {
+            var childExecs = e.Element(DtsNs + "Executables");
+            if (childExecs != null)
+            {
+                foreach (var ce in childExecs.Elements(DtsNs + "Executable"))
+                    exe.Children.Add(ParseExecutable(ce, refId));
+            }
+            exe.Precedence.AddRange(ParsePrecedences(e));
+        }
+
+        /* Foreach Loop has <DTS:ForEachEnumerator> and
+         * <DTS:ForEachVariableMappings> at the executable level. */
+        if (exe.Kind == "Microsoft.ForEachLoop")
+        {
+            var fe = e.Element(DtsNs + "ForEachEnumerator");
+            var feObj = fe?.Element(DtsNs + "ObjectData");
+            var feInner = feObj?.Elements().FirstOrDefault();
+            if (feInner != null)
+            {
+                exe.ForeachEnumeratorType = feInner.Name.LocalName;
+                foreach (var a in feInner.Attributes())
+                    exe.ForeachEnumProps[a.Name.LocalName] = a.Value;
+            }
+            var maps = e.Element(DtsNs + "ForEachVariableMappings");
+            if (maps != null)
+            {
+                foreach (var m in maps.Elements(DtsNs + "ForEachVariableMapping"))
+                {
+                    string vn = (string?)m.Attribute(DtsNs + "VariableName") ?? "";
+                    if (!string.IsNullOrEmpty(vn))
+                        exe.ForeachVarMappings.Add(vn);
+                }
+            }
+        }
+
+        /* For Loop carries init / eval / assign as attributes in a
+         * sibling namespace (DTS:ForLoop). We localName-match. */
+        if (exe.Kind == "Microsoft.ForLoop")
+        {
+            foreach (var a in e.Attributes())
+            {
+                switch (a.Name.LocalName)
+                {
+                    case "InitExpression":   exe.ForLoopInit   = a.Value; break;
+                    case "EvalExpression":   exe.ForLoopEval   = a.Value; break;
+                    case "AssignExpression": exe.ForLoopAssign = a.Value; break;
                 }
             }
         }

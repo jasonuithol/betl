@@ -111,7 +111,7 @@ int main(void) {
     /* Pipeline shape. */
     CHECK_CONTAINS(yaml, "pipeline:");
     CHECK_CONTAINS(yaml, "id: truncate_stage");
-    CHECK_CONTAINS(yaml, "type: mssql.sql");
+    CHECK_CONTAINS(yaml, "type: sql.execute");
     CHECK_CONTAINS(yaml, "TRUNCATE TABLE stage.Orders");
 
     CHECK_CONTAINS(yaml, "id: extract_orders");
@@ -257,6 +257,113 @@ int main(void) {
     CHECK_CONTAINS(yaml, "Change the base class to `Betl.BetlScript`");
     CHECK_CONTAINS(yaml, "Replace SSIS' Input0_ProcessInputRow");
     CHECK_CONTAINS(yaml, "public class ScriptMain : UserComponent");
+
+    free(yaml);
+
+    /* --- controlflow.dtsx: containers + precedence constraints ----- */
+    const char *cf_out = "/tmp/betl_dtsx2yaml_controlflow.yml";
+    rc = run_convert(BETL_DTSX2YAML_CONTROLFLOW_FIXTURE, cf_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for controlflow fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(cf_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read controlflow YAML\n");
+        return 1;
+    }
+
+    /* Sequence flattens — no `id: stage_1` step, only its children. */
+    CHECK_CONTAINS(yaml, "id: init");
+    CHECK_CONTAINS(yaml, "id: truncate");
+    CHECK_CONTAINS(yaml, "id: load");
+    CHECK_CONTAINS(yaml, "id: cleanup");
+    if (strstr(yaml, "id: stage_1") != NULL) {
+        fprintf(stderr, "FAIL: stage_1 emitted as a step "
+                "(Sequence should have flattened)\n");
+        failures++;
+    }
+    /* Sequence header comment. */
+    CHECK_CONTAINS(yaml, "sequence: Stage 1");
+
+    /* Init → Stage 1 (Sequence) lowered to Init → Truncate (entry leaf). */
+    CHECK_CONTAINS(yaml, "after: [init]");
+    /* Internal Sequence constraint Truncate → Load preserved. */
+    CHECK_CONTAINS(yaml, "after: [truncate]");
+    /* Stage 1 → Cleanup lowered to Load → Cleanup (exit leaf). */
+    CHECK_CONTAINS(yaml, "after: [load]");
+
+    /* Cleanup → Notify is a Failure constraint: on_failure: continue +
+     * a TODO calling out the gap. */
+    CHECK_CONTAINS(yaml, "after: [cleanup]");
+    CHECK_CONTAINS(yaml, "on_failure: continue");
+    CHECK_CONTAINS(yaml, "TODO: SSIS Failure precedence");
+
+    /* Notify → Done is a Completion constraint: on_failure: continue +
+     * a softer note. */
+    CHECK_CONTAINS(yaml, "after: [notify]");
+    CHECK_CONTAINS(yaml, "SSIS Completion precedence");
+
+    /* Done → ProcessFile carried an SSIS expression — emitted as TODO
+     * comment + condition: "true" so the YAML still validates. */
+    CHECK_CONTAINS(yaml, "after: [done]");
+    CHECK_CONTAINS(yaml, "TODO: SSIS-expression condition");
+    CHECK_CONTAINS(yaml, "@[User::SkipLoop] == false");
+    CHECK_CONTAINS(yaml, "condition: \"true\"");
+
+    /* ForEach Loop header — preserves enumerator type + props + var. */
+    CHECK_CONTAINS(yaml, "ForEach Loop: Per File");
+    CHECK_CONTAINS(yaml, "Enumerator: ForEachFileEnumerator");
+    CHECK_CONTAINS(yaml, "Folder = /tmp/inbox");
+    CHECK_CONTAINS(yaml, "FileSpec = *.csv");
+    CHECK_CONTAINS(yaml, "User::CurrentFile");
+    CHECK_CONTAINS(yaml, "run ONCE under betl");
+
+    /* ProcessFile body still emitted (the loss is iteration, not the body). */
+    CHECK_CONTAINS(yaml, "id: processfile");
+
+    free(yaml);
+
+    /* --- tasks.dtsx: FileSystem / BulkInsert / ExecuteProcess ----- */
+    const char *tk_out = "/tmp/betl_dtsx2yaml_tasks.yml";
+    rc = run_convert(BETL_DTSX2YAML_TASKS_FIXTURE, tk_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for tasks fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(tk_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read tasks YAML\n");
+        return 1;
+    }
+
+    /* CopyExtract → file.copy with src/dst. */
+    CHECK_CONTAINS(yaml, "id: copyextract");
+    CHECK_CONTAINS(yaml, "type: file.copy");
+    CHECK_CONTAINS(yaml, "src: '/tmp/inbox/data.csv'");
+    CHECK_CONTAINS(yaml, "dst: '/tmp/archive/data.csv'");
+
+    /* DeleteSrc → file.delete with path. */
+    CHECK_CONTAINS(yaml, "id: deletesrc");
+    CHECK_CONTAINS(yaml, "type: file.delete");
+    CHECK_CONTAINS(yaml, "path: '/tmp/inbox/data.csv'");
+
+    /* BulkLoad → sql.execute with BULK INSERT statement. */
+    CHECK_CONTAINS(yaml, "id: bulkload");
+    CHECK_CONTAINS(yaml, "type: sql.execute");
+    CHECK_CONTAINS(yaml, "BULK INSERT dbo.staging_orders");
+    CHECK_CONTAINS(yaml, "FIELDTERMINATOR = ','");
+    CHECK_CONTAINS(yaml, "FIRSTROW = 2");
+
+    /* RunTool → shell with argv + timeout. */
+    CHECK_CONTAINS(yaml, "id: runtool");
+    CHECK_CONTAINS(yaml, "type: shell");
+    CHECK_CONTAINS(yaml, "argv: ['/usr/local/bin/my-tool']");
+    CHECK_CONTAINS(yaml, "timeout: 300s");
+    /* SSIS Arguments string preserved as TODO comment. */
+    CHECK_CONTAINS(yaml, "--input data.csv --output report.csv");
+    /* WorkingDirectory captured as a TODO. */
+    CHECK_CONTAINS(yaml, "TODO: SSIS WorkingDirectory=/var/jobs");
 
     free(yaml);
 

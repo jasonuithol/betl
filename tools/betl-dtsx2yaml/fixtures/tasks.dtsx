@@ -1,0 +1,99 @@
+<?xml version="1.0"?>
+<!--
+  betl-dtsx2yaml fixture: control-flow tasks beyond Execute SQL +
+  Script. Each task here exercises one new mapper:
+
+    CopyExtract  — File System Task / CopyFile
+    DeleteSrc    — File System Task / DeleteFile
+    BulkLoad     — Bulk Insert Task (T-SQL BULK INSERT shape)
+    RunTool      — Execute Process Task (shell argv)
+-->
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:ObjectName="Tasks"
+    DTS:refId="Package"
+    DTS:ExecutableType="Microsoft.Package">
+
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+        DTS:ObjectName="Warehouse"
+        DTS:DTSID="{aaaa1111-aaaa-1111-aaaa-111111111111}"
+        DTS:CreationName="OLEDB">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+            DTS:ConnectionString="Data Source=db.example.com;Initial Catalog=Sales;Integrated Security=SSPI;Provider=MSOLEDBSQL;"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <DTS:Executables>
+
+    <DTS:Executable DTS:refId="Package\CopyExtract"
+        DTS:ObjectName="CopyExtract"
+        DTS:ExecutableType="Microsoft.FileSystemTask">
+      <DTS:ObjectData>
+        <FileSystemData
+            Operation="CopyFile"
+            Source="/tmp/inbox/data.csv"
+            Destination="/tmp/archive/data.csv"
+            OverwriteDestinationFile="True"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\DeleteSrc"
+        DTS:ObjectName="DeleteSrc"
+        DTS:ExecutableType="Microsoft.FileSystemTask">
+      <DTS:ObjectData>
+        <FileSystemData
+            Operation="DeleteFile"
+            Source="/tmp/inbox/data.csv"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\BulkLoad"
+        DTS:ObjectName="BulkLoad"
+        DTS:ExecutableType="Microsoft.BulkInsertTask">
+      <DTS:ObjectData>
+        <BulkInsertTaskData
+            xmlns:SQL="www.microsoft.com/sqlserver/dts/tasks/bulkinserttask"
+            SQL:Connection="{aaaa1111-aaaa-1111-aaaa-111111111111}"
+            SQL:DestinationTableName="dbo.staging_orders"
+            SQL:FieldTerminator=","
+            SQL:RowTerminator="\r\n"
+            SQL:FirstRow="2"
+            SQL:CodePage="RAW"
+            File="/tmp/archive/data.csv"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\RunTool"
+        DTS:ObjectName="RunTool"
+        DTS:ExecutableType="Microsoft.ExecuteProcess">
+      <DTS:ObjectData>
+        <ExecuteProcessData
+            Executable="/usr/local/bin/my-tool"
+            Arguments="--input data.csv --output report.csv"
+            WorkingDirectory="/var/jobs"
+            TimeOut="300"
+            FailTaskIfReturnCodeIsNotSuccessValue="True"/>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+  </DTS:Executables>
+
+  <DTS:PrecedenceConstraints>
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\CopyExtract"
+        DTS:To="Package\DeleteSrc"
+        DTS:Value="0" DTS:EvalOp="1"/>
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\DeleteSrc"
+        DTS:To="Package\BulkLoad"
+        DTS:Value="0" DTS:EvalOp="1"/>
+    <DTS:PrecedenceConstraint
+        DTS:From="Package\BulkLoad"
+        DTS:To="Package\RunTool"
+        DTS:Value="0" DTS:EvalOp="1"/>
+  </DTS:PrecedenceConstraints>
+
+</DTS:Executable>

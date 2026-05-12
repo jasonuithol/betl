@@ -1,6 +1,12 @@
-/* Execute SQL Task → mssql.sql / pg.sql.
+/* Execute SQL Task → betl `sql.execute`.
  *
- * The DTSX shape (simplified) is:
+ * sql.execute is provider-agnostic — it dispatches to the actual SQL
+ * engine based on the referenced connection's `type:` (mssql /
+ * postgres / mysql / ...). So we just emit `type: sql.execute` plus
+ * `connection:` + `sql:`; the connection block (emitted earlier by
+ * OledbConnection / etc.) carries the engine choice.
+ *
+ * The DTSX shape (simplified):
  *   <DTS:ObjectData>
  *     <SQLTask:SqlTaskData
  *         SQLTask:Connection="{...connection-id...}"
@@ -17,10 +23,12 @@ namespace Betl.Dtsx2Yaml.Mappers;
 
 public static class ExecuteSqlTask
 {
-    public static void Emit(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe)
+    public static void Emit(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe,
+                            FlowAttrs? flow)
     {
         w.Line($"- id: {YamlWriter.Id(exe.Name)}");
         w.Indent(2);
+        FlowAttrs.Emit(w, flow);
 
         var sqlTask = exe.ObjectData?.Elements()
                         .FirstOrDefault(e => e.Name.LocalName == "SqlTaskData");
@@ -48,16 +56,12 @@ public static class ExecuteSqlTask
             }
         }
 
-        bool isPg = conn?.Payload?.Contains("Postgres",
-                        System.StringComparison.OrdinalIgnoreCase) == true
-                 || conn?.Payload?.Contains("Npgsql",
-                        System.StringComparison.OrdinalIgnoreCase) == true;
-        w.Line(isPg ? "type: postgres.sql" : "type: mssql.sql");
+        w.Line("type: sql.execute");
         w.Line($"connection: {YamlWriter.Id(conn?.Name ?? "warehouse")}");
         if (!string.IsNullOrEmpty(sql))
         {
             /* Use a YAML block scalar to preserve multi-line SQL. */
-            w.Line("query: |");
+            w.Line("sql: |");
             w.Indent(2);
             foreach (var line in sql.Replace("\r\n", "\n").Split('\n'))
                 w.Line(line);

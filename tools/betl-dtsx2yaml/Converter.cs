@@ -95,41 +95,348 @@ public static class Converter
         };
     }
 
+    /* ============================================================== *
+     *  Pipeline emission                                               *
+     *                                                                  *
+     *  SSIS' control-flow tree contains containers (Sequence, ForEach, *
+     *  ForLoop) with nested executables and precedence constraints     *
+     *  scoped per container. betl's pipeline is a flat list, so we:    *
+     *    1. Walk the tree to assign each leaf a stable betl id and to  *
+     *       compute each container's entry/exit leaf sets.             *
+     *    2. Lower every constraint (which may span container           *
+     *       boundaries) into leaf→leaf edges.                          *
+     *    3. Emit leaves in source-tree order, attaching `after:` /     *
+     *       `on_failure:` / `condition:` derived from incoming         *
+     *       constraints. Containers themselves emit a comment header   *
+     *       so the operator sees the original grouping; Foreach / For  *
+     *       headers also explain the iteration-semantics loss (betl    *
+     *       has no loop construct yet).                                *
+     * ============================================================== */
+
     static void EmitPipeline(YamlWriter w, DtsxPackage pkg, bool verbose)
     {
         if (pkg.Executables.Count == 0) return;
+
+        /* ---- Phase 1: catalogue all leaves and containers. ---- */
+        var refToLeafId = new Dictionary<string, string>();      // exe RefId → betl step id (leaves only)
+        var leavesInOrder = new List<DtsxExecutable>();          // depth-first leaves
+        var idCollisions = new Dictionary<string, int>();        // base id → suffix counter
+
+        void Catalogue(DtsxExecutable exe)
+        {
+            if (exe.IsContainer)
+            {
+                foreach (var child in exe.Children) Catalogue(child);
+                return;
+            }
+            string baseId = YamlWriter.Id(exe.Name);
+            string id = baseId;
+            if (idCollisions.TryGetValue(baseId, out int n))
+            {
+                idCollisions[baseId] = n + 1;
+                id = $"{baseId}_{n + 1}";
+            }
+            else
+            {
+                idCollisions[baseId] = 1;
+            }
+            refToLeafId[exe.RefId] = id;
+            leavesInOrder.Add(exe);
+        }
+        foreach (var exe in pkg.Executables) Catalogue(exe);
+
+        /* ---- Phase 2: compute entry / exit leaf sets per container. ---- *
+         * For a container C, entry leaves = leaves reachable from C with no
+         * incoming constraint *inside* C. Exit leaves = same with no
+         * outgoing constraint inside C. Used to lower a constraint
+         * crossing C's boundary into leaf-to-leaf edges. */
+        var entryLeaves = new Dictionary<string, List<string>>();
+        var exitLeaves  = new Dictionary<string, List<string>>();
+
+        void CollectLeafRefIds(DtsxExecutable exe, List<string> acc)
+        {
+            if (exe.IsContainer)
+                foreach (var c in exe.Children) CollectLeafRefIds(c, acc);
+            else acc.Add(exe.RefId);
+        }
+
+        void ComputeEntryExit(DtsxExecutable container)
+        {
+            var insideLeafRefIds = new List<string>();
+            foreach (var c in container.Children) CollectLeafRefIds(c, insideLeafRefIds);
+
+            var hasIncoming = new HashSet<string>();
+            var hasOutgoing = new HashSet<string>();
+            foreach (var p in container.Precedence)
+            {
+                /* Constraint endpoints may name a child container; expand
+                 * the endpoint via the inner entry/exit maps we computed
+                 * earlier (recursion is bottom-up so inner sets are ready). */
+                foreach (var f in LeafRefsForEndpoint(container, p.FromRefId, exitLeaves))
+                    hasOutgoing.Add(f);
+                foreach (var t in LeafRefsForEndpoint(container, p.ToRefId, entryLeaves))
+                    hasIncoming.Add(t);
+            }
+            var entries = new List<string>();
+            var exits   = new List<string>();
+            foreach (var r in insideLeafRefIds)
+            {
+                if (!hasIncoming.Contains(r)) entries.Add(r);
+                if (!hasOutgoing.Contains(r)) exits.Add(r);
+            }
+            entryLeaves[container.RefId] = entries;
+            exitLeaves[container.RefId]  = exits;
+        }
+
+        void WalkContainersBottomUp(DtsxExecutable exe)
+        {
+            if (!exe.IsContainer) return;
+            foreach (var c in exe.Children) WalkContainersBottomUp(c);
+            ComputeEntryExit(exe);
+        }
+        foreach (var top in pkg.Executables) WalkContainersBottomUp(top);
+
+        /* ---- Phase 3: lower constraints to leaf-to-leaf edges. ---- */
+        var perLeafIncoming = new Dictionary<string, List<DtsxPrecedence>>();
+        void RegisterEdge(string toLeaf, DtsxPrecedence p)
+        {
+            if (!perLeafIncoming.TryGetValue(toLeaf, out var list))
+            {
+                list = new List<DtsxPrecedence>();
+                perLeafIncoming[toLeaf] = list;
+            }
+            list.Add(p);
+        }
+        void LowerConstraints(DtsxExecutable container, List<DtsxPrecedence> edges)
+        {
+            foreach (var p in edges)
+            {
+                var fromLeaves = LeafRefsForEndpoint(container, p.FromRefId, exitLeaves);
+                var toLeaves   = LeafRefsForEndpoint(container, p.ToRefId,   entryLeaves);
+                foreach (var f in fromLeaves)
+                {
+                    foreach (var t in toLeaves)
+                    {
+                        var lowered = new DtsxPrecedence
+                        {
+                            FromRefId  = f,
+                            ToRefId    = t,
+                            Value      = p.Value,
+                            EvalOp     = p.EvalOp,
+                            Expression = p.Expression,
+                            LogicalAnd = p.LogicalAnd,
+                        };
+                        RegisterEdge(t, lowered);
+                    }
+                }
+            }
+            foreach (var c in container.Children)
+            {
+                if (c.IsContainer) LowerConstraints(c, c.Precedence);
+            }
+        }
+        /* Root: synthesise a fake container holding pkg-level edges. */
+        var rootShim = new DtsxExecutable { Kind = "Microsoft.Sequence", RefId = "__root__" };
+        rootShim.Children.AddRange(pkg.Executables);
+        LowerConstraints(rootShim, pkg.RootPrecedence);
+
+        /* ---- Phase 4: emit. ---- */
         w.Line();
         w.Line("pipeline:");
         w.Indent(2);
-        foreach (var exe in pkg.Executables)
-        {
-            switch (exe.Kind)
-            {
-                case "Microsoft.Pipeline":
-                    EmitDataflow(w, pkg, exe, verbose);
-                    break;
-                case "Microsoft.ExecuteSQLTask":
-                    Mappers.ExecuteSqlTask.Emit(w, pkg, exe);
-                    break;
-                case "Microsoft.ScriptTask":
-                    Mappers.ScriptTask.Emit(w, pkg, exe);
-                    break;
-                default:
-                    w.Line($"- id: {YamlWriter.Id(exe.Name)}");
-                    w.Indent(2);
-                    w.Comment($"TODO: executable type '{exe.Kind}' not yet supported "
-                            + "— manual migration required");
-                    w.Indent(-2);
-                    break;
-            }
-        }
+        var emittedIds = new HashSet<string>();
+        foreach (var top in pkg.Executables)
+            EmitExecutable(w, pkg, top, refToLeafId, perLeafIncoming,
+                           emittedIds, verbose, containerDepth: 0);
         w.Indent(-2);
     }
 
-    static void EmitDataflow(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe, bool verbose)
+    /* Resolve an endpoint refId to the set of leaf refIds it represents.
+     * If the endpoint names a leaf inside the container's subtree,
+     * returns just that leaf. If it names a child container, expand to
+     * that container's entry or exit leaves (already computed). */
+    static List<string> LeafRefsForEndpoint(DtsxExecutable container,
+        string endpoint, Dictionary<string, List<string>> innerMap)
+    {
+        var result = new List<string>();
+        DtsxExecutable? Find(DtsxExecutable e)
+        {
+            if (e.RefId == endpoint) return e;
+            if (e.IsContainer)
+                foreach (var c in e.Children) { var r = Find(c); if (r != null) return r; }
+            return null;
+        }
+        foreach (var child in container.Children)
+        {
+            var hit = Find(child);
+            if (hit != null)
+            {
+                if (hit.IsContainer)
+                {
+                    if (innerMap.TryGetValue(hit.RefId, out var leaves))
+                        result.AddRange(leaves);
+                }
+                else
+                {
+                    result.Add(hit.RefId);
+                }
+                break;
+            }
+        }
+        return result;
+    }
+
+    /* Walk a container subtree depth-first; for each leaf, emit it with
+     * a FlowAttrs derived from its incoming lowered constraints. */
+    static void EmitExecutable(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe,
+        Dictionary<string, string> refToLeafId,
+        Dictionary<string, List<DtsxPrecedence>> perLeafIncoming,
+        HashSet<string> emittedIds, bool verbose, int containerDepth)
+    {
+        if (exe.IsContainer)
+        {
+            EmitContainerHeader(w, exe);
+            foreach (var c in exe.Children)
+                EmitExecutable(w, pkg, c, refToLeafId, perLeafIncoming,
+                               emittedIds, verbose, containerDepth + 1);
+            return;
+        }
+
+        /* Build FlowAttrs from incoming constraints. */
+        var attrs = BuildFlowAttrs(exe, refToLeafId, perLeafIncoming, emittedIds);
+
+        switch (exe.Kind)
+        {
+            case "Microsoft.Pipeline":
+                EmitDataflow(w, pkg, exe, attrs, verbose);
+                break;
+            case "Microsoft.ExecuteSQLTask":
+                Mappers.ExecuteSqlTask.Emit(w, pkg, exe, attrs);
+                break;
+            case "Microsoft.ScriptTask":
+                Mappers.ScriptTask.Emit(w, pkg, exe, attrs);
+                break;
+            case "Microsoft.FileSystemTask":
+                Mappers.FileSystemTask.Emit(w, pkg, exe, attrs);
+                break;
+            case "Microsoft.BulkInsertTask":
+                Mappers.BulkInsertTask.Emit(w, pkg, exe, attrs);
+                break;
+            case "Microsoft.ExecuteProcess":
+                Mappers.ExecuteProcessTask.Emit(w, pkg, exe, attrs);
+                break;
+            default:
+                w.Line($"- id: {YamlWriter.Id(exe.Name)}");
+                w.Indent(2);
+                Mappers.FlowAttrs.Emit(w, attrs);
+                w.Comment($"TODO: executable type '{exe.Kind}' not yet supported "
+                        + "— manual migration required");
+                w.Indent(-2);
+                break;
+        }
+        if (refToLeafId.TryGetValue(exe.RefId, out var id)) emittedIds.Add(id);
+    }
+
+    /* Header comments for a container — Sequence is silent, Foreach /
+     * For emit a flag-block explaining the iteration semantics that
+     * doesn't survive the flatten. */
+    static void EmitContainerHeader(YamlWriter w, DtsxExecutable exe)
+    {
+        if (exe.Kind == "Microsoft.Sequence")
+        {
+            w.Comment($"── sequence: {exe.Name} (children flattened) ──");
+            return;
+        }
+        if (exe.Kind == "Microsoft.ForEachLoop")
+        {
+            w.Comment($"── ForEach Loop: {exe.Name} ─────────────────────────────");
+            w.Comment("TODO: SSIS Foreach Loop has no betl equivalent yet.");
+            string en = exe.ForeachEnumeratorType ?? "(unknown enumerator)";
+            w.Comment($"      Enumerator: {en}");
+            foreach (var kv in exe.ForeachEnumProps)
+                w.Comment($"        {kv.Key} = {kv.Value}");
+            if (exe.ForeachVarMappings.Count > 0)
+                w.Comment($"      Variable mapping: {string.Join(", ", exe.ForeachVarMappings)}");
+            w.Comment("      The body below will run ONCE under betl. Either:");
+            w.Comment("        - drive iteration externally (cron/Airflow + --param), or");
+            w.Comment("        - rewrite the body as a SQL set-based query.");
+            return;
+        }
+        if (exe.Kind == "Microsoft.ForLoop")
+        {
+            w.Comment($"── For Loop: {exe.Name} ─────────────────────────────────");
+            w.Comment("TODO: SSIS For Loop has no betl equivalent yet.");
+            if (!string.IsNullOrEmpty(exe.ForLoopInit))
+                w.Comment($"      Init:   {exe.ForLoopInit}");
+            if (!string.IsNullOrEmpty(exe.ForLoopEval))
+                w.Comment($"      While:  {exe.ForLoopEval}");
+            if (!string.IsNullOrEmpty(exe.ForLoopAssign))
+                w.Comment($"      Step:   {exe.ForLoopAssign}");
+            w.Comment("      The body below will run ONCE under betl.");
+            return;
+        }
+    }
+
+    static Mappers.FlowAttrs? BuildFlowAttrs(DtsxExecutable exe,
+        Dictionary<string, string> refToLeafId,
+        Dictionary<string, List<DtsxPrecedence>> perLeafIncoming,
+        HashSet<string> emittedIds)
+    {
+        if (!perLeafIncoming.TryGetValue(exe.RefId, out var incoming)
+            || incoming.Count == 0) return null;
+
+        var attrs = new Mappers.FlowAttrs();
+        bool anyFailure    = false;
+        bool anyCompletion = false;
+        bool anyOr         = false;
+        string? expr       = null;
+
+        foreach (var p in incoming)
+        {
+            if (!refToLeafId.TryGetValue(p.FromRefId, out var fromId)) continue;
+            if (!emittedIds.Contains(fromId))
+            {
+                /* Forward edge (target before source in source order).
+                 * betl tolerates this — `after:` is a reference, not a
+                 * file-order dependency — but flag for the operator. */
+                attrs.Notes.Add($"forward edge: upstream `{fromId}` is "
+                              + "declared later in the pipeline");
+            }
+            if (!attrs.After.Contains(fromId)) attrs.After.Add(fromId);
+            if (p.Value == 1) anyFailure    = true;
+            if (p.Value == 2) anyCompletion = true;
+            if (!p.LogicalAnd) anyOr = true;
+            if (p.EvalOp != 1 && !string.IsNullOrEmpty(p.Expression))
+                expr ??= p.Expression;
+        }
+
+        if (anyFailure)
+        {
+            attrs.OnFailure = "continue";
+            attrs.Notes.Add("TODO: SSIS Failure precedence — betl has no "
+                          + "\"run only on upstream failure\" gate; this "
+                          + "step will run regardless of upstream outcome.");
+        }
+        else if (anyCompletion)
+        {
+            attrs.OnFailure = "continue";
+            attrs.Notes.Add("note: SSIS Completion precedence — runs "
+                          + "regardless of upstream success/failure.");
+        }
+        if (anyOr)
+            attrs.Notes.Add("TODO: SSIS LogicalAnd=False (any-of) "
+                          + "convergence — betl's `after:` is all-of.");
+        if (expr != null) attrs.Condition = expr;
+
+        return attrs;
+    }
+
+    static void EmitDataflow(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe,
+                             Mappers.FlowAttrs? flow, bool verbose)
     {
         w.Line($"- id: {YamlWriter.Id(exe.Name)}");
         w.Indent(2);
+        Mappers.FlowAttrs.Emit(w, flow);
         w.Line("type: dataflow");
         w.Line("steps:");
         w.Indent(2);

@@ -358,6 +358,8 @@ if(BETL_DTSX2YAML_FOUND)
         BETL_DTSX2YAML_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/simple-oledb.dtsx"
         BETL_DTSX2YAML_TRANSFORMS_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/transforms.dtsx"
         BETL_DTSX2YAML_SCRIPTS_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/scripts.dtsx"
+        BETL_DTSX2YAML_CONTROLFLOW_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/controlflow.dtsx"
+        BETL_DTSX2YAML_TASKS_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/tasks.dtsx"
     )
     add_dependencies(test_dtsx2yaml dtsx2yaml)
     add_test(NAME dtsx2yaml COMMAND test_dtsx2yaml)

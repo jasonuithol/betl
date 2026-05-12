@@ -20,10 +20,12 @@ namespace Betl.Dtsx2Yaml.Mappers;
 
 public static class ScriptTask
 {
-    public static void Emit(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe)
+    public static void Emit(YamlWriter w, DtsxPackage pkg, DtsxExecutable exe,
+                            FlowAttrs? flow)
     {
         w.Line($"- id: {YamlWriter.Id(exe.Name)}");
         w.Indent(2);
+        FlowAttrs.Emit(w, flow);
         w.Line("type: dotnet.task");
 
         var scriptProject = exe.ObjectData?.Descendants()
