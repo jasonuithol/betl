@@ -59,30 +59,25 @@ static int sdk_available(void) {
     return 0;
 }
 
-/* NativeAOT's link step shells out to clang and links against zlib;
- * environments missing either can compile IL but bomb at link time
- * with "cannot find -lz" or "clang not found". Detect both up-front
- * and SKIP gracefully rather than producing a confusing failure.
- *
- * Returns 1 if both tools are reachable, 0 otherwise. */
-static int has_aot_link_toolchain(void) {
-    /* clang on PATH. */
-    int have_clang = 0;
+/* NativeAOT's link step prefers clang, falls back to gcc if clang
+ * isn't on PATH, and links against zlib (-lz). SKIP gracefully if
+ * neither linker driver is reachable or libz isn't on the link path. */
+static int prog_on_path(const char *name) {
     const char *path = getenv("PATH");
-    if (path) {
-        char *copy = strdup(path);
-        if (copy) {
-            for (char *tok = strtok(copy, ":"); tok; tok = strtok(NULL, ":")) {
-                char p[1024];
-                snprintf(p, sizeof p, "%s/clang", tok);
-                if (access(p, X_OK) == 0) { have_clang = 1; break; }
-            }
-            free(copy);
-        }
+    if (!path) return 0;
+    char *copy = strdup(path);
+    if (!copy) return 0;
+    int found = 0;
+    for (char *tok = strtok(copy, ":"); tok; tok = strtok(NULL, ":")) {
+        char p[1024];
+        snprintf(p, sizeof p, "%s/%s", tok, name);
+        if (access(p, X_OK) == 0) { found = 1; break; }
     }
-    if (!have_clang) return 0;
-    /* libz on link path — i.e. an `ld -lz` would resolve. We approximate
-     * by looking for the canonical filenames in the standard places. */
+    free(copy);
+    return found;
+}
+static int has_aot_link_toolchain(void) {
+    if (!prog_on_path("clang") && !prog_on_path("gcc")) return 0;
     const char *libz[] = {
         "/usr/lib/x86_64-linux-gnu/libz.so",
         "/usr/lib/x86_64-linux-gnu/libz.a",

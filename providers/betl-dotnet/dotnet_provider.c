@@ -666,14 +666,14 @@ static int dotnet_task_init(BetlContext *ctx, const char *cfg, void **state) {
     if (!t->init_fn || !t->run_fn) {
         betl_set_error(ctx, "dotnet.task: missing entry points in %s "
                             "(rebuild after shim ABI change?)", t->so_path);
-        dlclose(t->handle);
+        /* Do not dlclose — see dotnet_task_destroy for the rationale. */
         free(t->so_path); free(t->source); free(t->lang); free(t);
         return BETL_ERR_INVALID;
     }
 
     if (t->init_fn(ctx, host_log_wrapper, host_get_param_wrapper) != 0) {
         betl_set_error(ctx, "dotnet.task: managed init returned non-zero");
-        dlclose(t->handle);
+        /* Do not dlclose — see dotnet_task_destroy. */
         free(t->so_path); free(t->source); free(t->lang); free(t);
         return BETL_ERR_INVALID;
     }
@@ -685,7 +685,13 @@ static int dotnet_task_init(BetlContext *ctx, const char *cfg, void **state) {
 static void dotnet_task_destroy(void *state) {
     if (!state) return;
     DotnetTask *t = state;
-    if (t->handle) dlclose(t->handle);
+    /* Deliberately do NOT dlclose(t->handle): NativeAOT-compiled
+     * assemblies install a finalizer thread + GC threads at first
+     * managed call, and tearing them down on process-still-alive
+     * dlclose has been observed to SEGV. The handle survives until
+     * process exit, when the loader unmaps the .so as part of normal
+     * teardown and managed threads exit together. This is the same
+     * trade-off CoreCLR's own host APIs make. */
     free(t->so_path); free(t->source); free(t->lang); free(t);
 }
 
