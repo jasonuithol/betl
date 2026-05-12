@@ -119,8 +119,9 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 
 ### Missing on purpose at v0.1
 
-- No `parquet.*`, no `kafka.*`.
-- No window functions.
+- No `parquet.*` — slated for v0.2 (needs an Apache Arrow C++ build
+  inside the plugin; significant enough to be its own milestone).
+- No `kafka.*`, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
 
