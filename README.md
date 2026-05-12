@@ -119,8 +119,9 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 
 ### Missing on purpose at v0.1
 
-- No `parquet.*` — slated for v0.2 (needs an Apache Arrow C++ build
-  inside the plugin; significant enough to be its own milestone).
+- No `dotnet.task` / `dotnet.script` and no DTSX→YAML converter —
+  slated for **v0.2**, the "drop-in SSIS replacement" milestone.
+- No `parquet.*` — slated for **v0.3**.
 - No `kafka.*`, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.

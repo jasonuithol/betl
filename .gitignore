@@ -27,3 +27,7 @@ compile_commands.json
 # Python helpers used during dev (not part of the engine)
 __pycache__/
 *.pyc
+
+# Project-local dependency installs (libpq / libyaml / dotnet SDK /
+# etc.). Populated by scripts/install-*.sh, not under source control.
+deps/
