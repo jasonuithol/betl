@@ -110,7 +110,8 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 | TRANSFORM | `pivot` | ✓ | Long → wide on declared `pivot_keys`; sorted-input contract |
 | TRANSFORM | `postgres.lookup` | ✓ | Cached SELECT + linear probe; on_miss error/null/drop |
 | TRANSFORM | `mssql.lookup` | ✓ | Same model over ODBC |
-| TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return |
+| TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return (synchronous, 1:1) |
+| TRANSFORM | `lua.script` | ✓ | Stateful Lua: `on_row`/`on_eof` + `emit()`; SSIS async script component (1:N, N:1, windowed) |
 | TASK | `lua.task` | ✓ | Standalone Lua script with host bridges |
 | ENGINE | `literal` | ✓ | Constant expressions (built-in) |
 | ENGINE | `lua` | ✓ | Lua 5.4 (provider plugin) |

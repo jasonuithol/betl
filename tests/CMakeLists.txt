@@ -219,6 +219,21 @@ if(BETL_LUA_FOUND)
         COMMAND test_lua_map $<TARGET_FILE:${BETL_LUA_TARGET}>
     )
 
+    # End-to-end: lua.script — the SSIS async script component analogue.
+    add_executable(test_lua_script test_lua_script.c)
+    target_link_libraries(test_lua_script PRIVATE betl_core)
+    set_target_properties(test_lua_script PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_lua_script PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_lua_script ${BETL_LUA_TARGET})
+    add_test(NAME lua_script
+        COMMAND test_lua_script $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+    set_tests_properties(lua_script PROPERTIES
+        PASS_REGULAR_EXPRESSION "ok: lua.script test passed"
+    )
+
     # SPEC §7 expression engine: drive compile + evaluate directly.
     add_executable(test_lua_expr test_lua_expr.c)
     target_link_libraries(test_lua_expr PRIVATE betl_core)

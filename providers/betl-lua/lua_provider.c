@@ -322,6 +322,7 @@ typedef enum {
     LM_T_INT16 = 6, LM_T_UINT16 = 7,
     LM_T_INT32 = 8, LM_T_UINT32 = 9,
     LM_T_UINT64 = 10,
+    LM_T_FLOAT64 = 11,   /* used only by lua.script's output_schema */
 } LmType;
 
 /* Per-column output staging. `nulls[i] != 0` means row i is null;
@@ -682,6 +683,9 @@ static int lm_col_init(LmCol *c, LmType type, size_t length) {
             break;
         case LM_T_BOOL:
             c->b_vals = calloc(n, sizeof *c->b_vals); ok = c->b_vals != NULL; break;
+        case LM_T_FLOAT64:
+            /* lua.map doesn't use float64; lua.script has its own staging. */
+            break;
     }
     if (!ok) { free(c->nulls); c->nulls = NULL; return -1; }
     return 0;
@@ -1345,7 +1349,11 @@ static int lua_expr_evaluate(void *handle,
                 case LM_T_INT64: case LM_T_UINT64:
                     lm_push_int_cell(e->L, e->col_types[c], input_struct->children[c], r); break;
                 case LM_T_UTF8:  lm_push_utf8_cell(e->L, input_struct->children[c], r); break;
-                case LM_T_BOOL:  /* unreachable: not in input */ lua_pushnil(e->L); break;
+                case LM_T_BOOL:
+                case LM_T_FLOAT64:
+                    /* lua-expr's schema cache rejects these formats at
+                     * compile time; defensive nil keeps the switch full. */
+                    lua_pushnil(e->L); break;
             }
             lua_setfield(e->L, -2, e->col_names[c]);
         }
@@ -1439,6 +1447,896 @@ static const BetlExprEngine lua_expr_engine = {
 
 
 /* ============================================================== *
+ *  lua.script — async TRANSFORM                                    *
+ *                                                                  *
+ *  Compared to lua.map (synchronous, 1 input row → 1 output row),  *
+ *  lua.script can fan in / fan out arbitrarily: a stateful script  *
+ *  with explicit emit() calls. The SSIS asynchronous Script        *
+ *  Component equivalent.                                           *
+ *                                                                  *
+ *  YAML:                                                           *
+ *    - id: smooth                                                  *
+ *      type: lua.script                                            *
+ *      from: source                                                *
+ *      output_schema:                                              *
+ *        - { name: id,       type: l }                             *
+ *        - { name: smoothed, type: g }                             *
+ *      script: |                                                   *
+ *        local window = {}                                         *
+ *        function on_row(row)                                      *
+ *          table.insert(window, row.value)                         *
+ *          if #window > 10 then table.remove(window, 1) end        *
+ *          if #window == 10 then                                   *
+ *            local s = 0                                           *
+ *            for _, v in ipairs(window) do s = s + v end           *
+ *            emit({ id = row.id, smoothed = s / 10 })              *
+ *          end                                                     *
+ *        end                                                       *
+ *        function on_eof()  -- optional final flush                *
+ *        end                                                       *
+ *                                                                  *
+ *  Supported `type:` (Arrow format chars): l (int64), g (float64), *
+ *  u (utf8), b (bool). Narrow widths are an add-on for v0.2.       *
+ * ============================================================== */
+
+/* Per-output-column growable staging. Mirrors LmCol but uses a `cap`
+ * field so emit() can append without knowing batch length in advance. */
+typedef struct {
+    LmType   type;
+    uint8_t *nulls;          /* cap bytes */
+    int64_t *i64_vals;       /* cap cells (INT64) */
+    double  *f64_vals;       /* cap cells (FLOAT64) */
+    uint8_t *b_vals;         /* cap cells (BOOL, packed at finalize) */
+    int32_t *u8_offsets;     /* cap+1 cells (UTF8) */
+    char    *u8_data;
+    size_t   u8_len;
+    size_t   u8_cap;
+    size_t   cap;            /* rows reserved */
+} ScCol;
+
+typedef struct {
+    BetlContext             *ctx;
+    char                    *script;
+    lua_State               *L;
+    int                      fn_on_row_ref;
+    int                      fn_on_eof_ref;
+
+    struct ArrowArrayStream  input;
+    int                      have_input;
+
+    /* Declared output schema (parsed from YAML config). */
+    size_t                   n_out;
+    char                   **out_names;
+    LmType                  *out_types;
+
+    /* Per-batch staging — grown geometrically by emit. */
+    ScCol                   *out_cols;
+    size_t                   n_buffered;        /* rows currently in out_cols */
+    int                      emit_failed;       /* one row's emit had a type error */
+    char                     emit_err[256];
+
+    /* Upstream schema cache, populated on first get_next batch. */
+    int                      _in_cached;
+    size_t                   _in_n;
+    char                   **_in_names;
+    LmType                  *_in_types;
+
+    int                      eof_seen;
+    char                     last_err[256];
+} LuaScript;
+
+static void lscript_set_err(LuaScript *s, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(s->last_err, sizeof s->last_err, fmt, ap); va_end(ap);
+    betl_set_error(s->ctx, "%s", s->last_err);
+}
+
+/* --- output_schema parsing -------------------------------------- */
+
+/* Walk a top-level JSON array, calling cb for each element. Each element
+ * substring starts at `value` with `value_len` bytes — same callback shape
+ * as the runtime's tx walker. Adapted for the lua provider's local needs.
+ * Returns 0 on success, -1 on malformed input. */
+typedef int (*sc_arr_visit_fn)(const char *value, size_t value_len, void *user);
+
+static const char *sc_skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    return p;
+}
+
+static const char *sc_skip_value(const char *p) {
+    p = sc_skip_ws(p);
+    if (!*p) return NULL;
+    if (*p == '{' || *p == '[') {
+        char open = *p, close = (open == '{') ? '}' : ']';
+        int depth = 0;
+        for (; *p; ++p) {
+            if (*p == '"') {
+                ++p;
+                while (*p && *p != '"') { if (*p == '\\' && p[1]) ++p; ++p; }
+                if (!*p) return NULL;
+                continue;
+            }
+            if (*p == open)  ++depth;
+            else if (*p == close) {
+                --depth;
+                if (depth == 0) return p + 1;
+            }
+        }
+        return NULL;
+    }
+    if (*p == '"') {
+        ++p;
+        while (*p && *p != '"') { if (*p == '\\' && p[1]) ++p; ++p; }
+        return *p ? p + 1 : NULL;
+    }
+    /* number / true / false / null — read until separator. */
+    while (*p && *p != ',' && *p != ']' && *p != '}'
+           && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') ++p;
+    return p;
+}
+
+static int sc_walk_array(const char *p, sc_arr_visit_fn cb, void *user) {
+    p = sc_skip_ws(p);
+    if (*p != '[') return -1;
+    ++p;
+    p = sc_skip_ws(p);
+    if (*p == ']') return 0;
+    for (;;) {
+        p = sc_skip_ws(p);
+        const char *start = p;
+        const char *end = sc_skip_value(p);
+        if (!end) return -1;
+        if (cb(start, (size_t)(end - start), user) != 0) return -1;
+        p = sc_skip_ws(end);
+        if (*p == ',') { ++p; continue; }
+        if (*p == ']') return 0;
+        return -1;
+    }
+}
+
+typedef struct {
+    LuaScript *s;
+    int        err;
+} OutSchemaCtx;
+
+static int parse_out_col(const char *value, size_t value_len, void *user) {
+    OutSchemaCtx *c = user;
+    LuaScript *s = c->s;
+    if (value_len == 0 || value[0] != '{') { c->err = 1; return -1; }
+    char *vbuf = malloc(value_len + 1);
+    if (!vbuf) { c->err = 1; return -1; }
+    memcpy(vbuf, value, value_len);
+    vbuf[value_len] = '\0';
+
+    char *name = NULL, *type = NULL;
+    json_get_string(vbuf, "name", &name);
+    json_get_string(vbuf, "type", &type);
+    free(vbuf);
+    if (!name || !type) {
+        free(name); free(type);
+        c->err = 1; return -1;
+    }
+
+    LmType lt;
+    if (strcmp(type, "l") == 0)      lt = LM_T_INT64;
+    else if (strcmp(type, "g") == 0) lt = LM_T_FLOAT64;
+    else if (strcmp(type, "u") == 0) lt = LM_T_UTF8;
+    else if (strcmp(type, "b") == 0) lt = LM_T_BOOL;
+    else {
+        lscript_set_err(s,
+            "lua.script: output column '%s' has unsupported type '%s' "
+            "(v1: l, g, u, b)", name, type);
+        free(name); free(type);
+        c->err = 1; return -1;
+    }
+    free(type);
+
+    /* Realloc one at a time, attaching each result to the state before
+     * the next call so a partial-success cleanup path frees the right
+     * pointers (s->out_names is the caller's source of truth). */
+    char **gn = realloc(s->out_names, (s->n_out + 1) * sizeof *gn);
+    if (!gn) { free(name); c->err = 1; return -1; }
+    s->out_names = gn;
+    LmType *gt = realloc(s->out_types, (s->n_out + 1) * sizeof *gt);
+    if (!gt) { free(name); c->err = 1; return -1; }
+    s->out_types = gt;
+    s->out_names[s->n_out] = name;
+    s->out_types[s->n_out] = lt;
+    ++s->n_out;
+    return 0;
+}
+
+/* --- ScCol storage --------------------------------------------- */
+
+static void sc_col_init(ScCol *c, LmType t) {
+    memset(c, 0, sizeof *c);
+    c->type = t;
+}
+
+static void sc_col_free(ScCol *c) {
+    free(c->nulls);
+    free(c->i64_vals);
+    free(c->f64_vals);
+    free(c->b_vals);
+    free(c->u8_offsets);
+    free(c->u8_data);
+    memset(c, 0, sizeof *c);
+}
+
+static int sc_col_reserve(ScCol *c, size_t want) {
+    if (want <= c->cap) return 0;
+    size_t nc = c->cap ? c->cap : 64;
+    while (nc < want) nc *= 2;
+    uint8_t *nn = realloc(c->nulls, nc);
+    if (!nn) return -1;
+    c->nulls = nn;
+    memset(c->nulls + c->cap, 0, nc - c->cap);
+    switch (c->type) {
+        case LM_T_INT64: {
+            int64_t *p = realloc(c->i64_vals, nc * sizeof *p);
+            if (!p) return -1;
+            c->i64_vals = p;
+            break;
+        }
+        case LM_T_FLOAT64: {
+            double *p = realloc(c->f64_vals, nc * sizeof *p);
+            if (!p) return -1;
+            c->f64_vals = p;
+            break;
+        }
+        case LM_T_BOOL: {
+            uint8_t *p = realloc(c->b_vals, nc);
+            if (!p) return -1;
+            c->b_vals = p;
+            break;
+        }
+        case LM_T_UTF8: {
+            int32_t *po = realloc(c->u8_offsets, (nc + 1) * sizeof *po);
+            if (!po) return -1;
+            c->u8_offsets = po;
+            if (c->cap == 0) c->u8_offsets[0] = 0;
+            if (c->u8_cap == 0) {
+                c->u8_cap = 128;
+                c->u8_data = malloc(c->u8_cap);
+                if (!c->u8_data) return -1;
+            }
+            break;
+        }
+        default: return -1;
+    }
+    c->cap = nc;
+    return 0;
+}
+
+/* --- emit() Lua C function ------------------------------------- */
+
+/* Reads a Lua table on top of the stack; stages one row of cells into
+ * each output column. Sets s->emit_failed + s->emit_err on type error. */
+static int sc_stage_row(LuaScript *s, lua_State *L, int tbl_idx) {
+    size_t row = s->n_buffered;
+    for (size_t c = 0; c < s->n_out; ++c) {
+        ScCol *col = &s->out_cols[c];
+        if (sc_col_reserve(col, row + 1) != 0) {
+            snprintf(s->emit_err, sizeof s->emit_err, "out of memory");
+            s->emit_failed = 1; return -1;
+        }
+        lua_getfield(L, tbl_idx, s->out_names[c]);
+        int t = lua_type(L, -1);
+        if (t == LUA_TNIL) {
+            col->nulls[row] = 1;
+            if (col->type == LM_T_UTF8) col->u8_offsets[row + 1] = (int32_t)col->u8_len;
+            lua_pop(L, 1);
+            continue;
+        }
+        col->nulls[row] = 0;
+        switch (col->type) {
+            case LM_T_INT64: {
+                if (t != LUA_TNUMBER) {
+                    snprintf(s->emit_err, sizeof s->emit_err,
+                        "column '%s' expects integer, got %s",
+                        s->out_names[c], lua_typename(L, t));
+                    s->emit_failed = 1; lua_pop(L, 1); return -1;
+                }
+                int isint = 0;
+                lua_Integer iv = lua_tointegerx(L, -1, &isint);
+                if (!isint) {
+                    snprintf(s->emit_err, sizeof s->emit_err,
+                        "column '%s' expects integer; got non-integer number",
+                        s->out_names[c]);
+                    s->emit_failed = 1; lua_pop(L, 1); return -1;
+                }
+                col->i64_vals[row] = (int64_t)iv;
+                break;
+            }
+            case LM_T_FLOAT64: {
+                if (t != LUA_TNUMBER) {
+                    snprintf(s->emit_err, sizeof s->emit_err,
+                        "column '%s' expects number, got %s",
+                        s->out_names[c], lua_typename(L, t));
+                    s->emit_failed = 1; lua_pop(L, 1); return -1;
+                }
+                col->f64_vals[row] = (double)lua_tonumber(L, -1);
+                break;
+            }
+            case LM_T_BOOL: {
+                col->b_vals[row] = (uint8_t)(lua_toboolean(L, -1) ? 1 : 0);
+                break;
+            }
+            case LM_T_UTF8: {
+                size_t slen = 0;
+                const char *str = NULL;
+                if (t == LUA_TSTRING || t == LUA_TNUMBER) {
+                    str = lua_tolstring(L, -1, &slen);
+                }
+                if (!str) {
+                    snprintf(s->emit_err, sizeof s->emit_err,
+                        "column '%s' expects string, got %s",
+                        s->out_names[c], lua_typename(L, t));
+                    s->emit_failed = 1; lua_pop(L, 1); return -1;
+                }
+                size_t need = col->u8_len + slen;
+                if (need > col->u8_cap) {
+                    size_t nc = col->u8_cap;
+                    while (nc < need) nc *= 2;
+                    char *nd = realloc(col->u8_data, nc);
+                    if (!nd) {
+                        snprintf(s->emit_err, sizeof s->emit_err, "out of memory");
+                        s->emit_failed = 1; lua_pop(L, 1); return -1;
+                    }
+                    col->u8_data = nd; col->u8_cap = nc;
+                }
+                if (slen) memcpy(col->u8_data + col->u8_len, str, slen);
+                col->u8_len += slen;
+                col->u8_offsets[row + 1] = (int32_t)col->u8_len;
+                break;
+            }
+            default:
+                snprintf(s->emit_err, sizeof s->emit_err,
+                    "internal: unhandled output type for '%s'", s->out_names[c]);
+                s->emit_failed = 1; lua_pop(L, 1); return -1;
+        }
+        lua_pop(L, 1);
+    }
+    ++s->n_buffered;
+    return 0;
+}
+
+/* upvalue 1: LuaScript* */
+static int l_emit(lua_State *L) {
+    LuaScript *s = lua_touserdata(L, lua_upvalueindex(1));
+    if (!lua_istable(L, 1)) {
+        return luaL_error(L, "emit: expected a table");
+    }
+    if (sc_stage_row(s, L, 1) != 0) {
+        /* Surface the staged error back into Lua so the script's
+         * pcall catches it (the host can then bail the batch). */
+        return luaL_error(L, "emit: %s", s->emit_err);
+    }
+    return 0;
+}
+
+/* --- lifecycle ------------------------------------------------- */
+
+static int lua_script_init(BetlContext *ctx, const char *cfg_json, void **state) {
+    LuaScript *s = calloc(1, sizeof *s);
+    if (!s) return BETL_ERR_INTERNAL;
+    s->ctx = ctx;
+    s->fn_on_row_ref = LUA_NOREF;
+    s->fn_on_eof_ref = LUA_NOREF;
+
+    if (json_get_string(cfg_json, "script", &s->script) != 0 || !s->script) {
+        betl_set_error(ctx, "lua.script: 'script' is required");
+        free(s); return BETL_ERR_INVALID;
+    }
+    const char *os = json_value_after(cfg_json, "output_schema");
+    if (!os || *os != '[') {
+        betl_set_error(ctx, "lua.script: 'output_schema' is required");
+        free(s->script); free(s); return BETL_ERR_INVALID;
+    }
+    OutSchemaCtx oc = { .s = s };
+    if (sc_walk_array(os, parse_out_col, &oc) != 0 || oc.err) {
+        if (s->last_err[0] == '\0')
+            betl_set_error(ctx, "lua.script: malformed 'output_schema'");
+        for (size_t i = 0; i < s->n_out; ++i) free(s->out_names[i]);
+        free(s->out_names); free(s->out_types); free(s->script); free(s);
+        return BETL_ERR_INVALID;
+    }
+    if (s->n_out == 0) {
+        betl_set_error(ctx, "lua.script: 'output_schema' is empty");
+        free(s->script); free(s); return BETL_ERR_INVALID;
+    }
+
+    /* Allocate per-output-column staging buffers. */
+    s->out_cols = calloc(s->n_out, sizeof *s->out_cols);
+    if (!s->out_cols) {
+        for (size_t i = 0; i < s->n_out; ++i) free(s->out_names[i]);
+        free(s->out_names); free(s->out_types); free(s->script); free(s);
+        return BETL_ERR_INTERNAL;
+    }
+    for (size_t i = 0; i < s->n_out; ++i) sc_col_init(&s->out_cols[i], s->out_types[i]);
+
+    s->L = luaL_newstate();
+    if (!s->L) {
+        for (size_t i = 0; i < s->n_out; ++i) free(s->out_names[i]);
+        free(s->out_cols); free(s->out_names); free(s->out_types);
+        free(s->script); free(s);
+        betl_set_error(ctx, "lua.script: luaL_newstate failed");
+        return BETL_ERR_INTERNAL;
+    }
+    luaL_openlibs(s->L);
+    install_log(s->L, ctx);
+    install_params(s->L, ctx);
+    install_connection(s->L, ctx);
+
+    /* Register `emit` as a global C closure carrying this state. */
+    lua_pushlightuserdata(s->L, s);
+    lua_pushcclosure(s->L, l_emit, 1);
+    lua_setglobal(s->L, "emit");
+
+    /* Run the script once (top level) to define on_row / on_eof globals. */
+    if (luaL_loadstring(s->L, s->script) != LUA_OK) {
+        const char *e = lua_tostring(s->L, -1);
+        betl_set_error(ctx, "lua.script: compile error: %s", e ? e : "(unknown)");
+        goto fail;
+    }
+    if (lua_pcall(s->L, 0, 0, 0) != LUA_OK) {
+        const char *e = lua_tostring(s->L, -1);
+        betl_set_error(ctx, "lua.script: top-level error: %s", e ? e : "(unknown)");
+        goto fail;
+    }
+
+    lua_getglobal(s->L, "on_row");
+    if (!lua_isfunction(s->L, -1)) {
+        lua_pop(s->L, 1);
+        betl_set_error(ctx, "lua.script: script must define a global function on_row");
+        goto fail;
+    }
+    s->fn_on_row_ref = luaL_ref(s->L, LUA_REGISTRYINDEX);
+
+    lua_getglobal(s->L, "on_eof");
+    if (lua_isfunction(s->L, -1)) {
+        s->fn_on_eof_ref = luaL_ref(s->L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(s->L, 1);     /* on_eof is optional */
+    }
+
+    *state = s;
+    return BETL_OK;
+
+fail:
+    if (s->L) lua_close(s->L);
+    for (size_t i = 0; i < s->n_out; ++i) {
+        free(s->out_names[i]);
+        sc_col_free(&s->out_cols[i]);
+    }
+    free(s->out_cols); free(s->out_names); free(s->out_types);
+    free(s->script); free(s);
+    return BETL_ERR_INVALID;
+}
+
+static int lua_script_attach_input(void *state, int port,
+                                   struct ArrowArrayStream *in) {
+    (void)port;
+    LuaScript *s = state;
+    s->input = *in;
+    s->have_input = 1;
+    memset(in, 0, sizeof *in);
+    return BETL_OK;
+}
+
+static void lua_script_destroy(void *state) {
+    if (!state) return;
+    LuaScript *s = state;
+    if (s->have_input && s->input.release) s->input.release(&s->input);
+    if (s->L) {
+        if (s->fn_on_row_ref != LUA_NOREF) luaL_unref(s->L, LUA_REGISTRYINDEX, s->fn_on_row_ref);
+        if (s->fn_on_eof_ref != LUA_NOREF) luaL_unref(s->L, LUA_REGISTRYINDEX, s->fn_on_eof_ref);
+        lua_close(s->L);
+    }
+    if (s->out_cols) {
+        for (size_t i = 0; i < s->n_out; ++i) sc_col_free(&s->out_cols[i]);
+        free(s->out_cols);
+    }
+    if (s->out_names) {
+        for (size_t i = 0; i < s->n_out; ++i) free(s->out_names[i]);
+        free(s->out_names);
+    }
+    free(s->out_types);
+    if (s->_in_names) {
+        for (size_t i = 0; i < s->_in_n; ++i) free(s->_in_names[i]);
+        free(s->_in_names);
+    }
+    free(s->_in_types);
+    free(s->script);
+    free(s);
+}
+
+/* --- output ArrowSchema --------------------------------------- */
+
+static void sc_release_schema_named(struct ArrowSchema *sch) {
+    free((void *)sch->name);
+    sch->name = NULL;
+    sch->release = NULL;
+}
+
+static void sc_release_schema_struct(struct ArrowSchema *sch) {
+    for (int64_t i = 0; i < sch->n_children; ++i) {
+        if (sch->children[i]) {
+            if (sch->children[i]->release) sch->children[i]->release(sch->children[i]);
+            free(sch->children[i]);
+        }
+    }
+    free(sch->children);
+    sch->release = NULL;
+}
+
+static int lua_script_get_schema(struct ArrowArrayStream *st,
+                                 struct ArrowSchema *out) {
+    LuaScript *s = st->private_data;
+    memset(out, 0, sizeof *out);
+    if (!s) return EINVAL;
+    struct ArrowSchema **kids = calloc(s->n_out, sizeof *kids);
+    if (!kids) return ENOMEM;
+    for (size_t i = 0; i < s->n_out; ++i) {
+        struct ArrowSchema *c = calloc(1, sizeof *c);
+        char *nm = strdup(s->out_names[i]);
+        if (!c || !nm) {
+            free(c); free(nm);
+            for (size_t k = 0; k < i; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids); return ENOMEM;
+        }
+        c->name    = nm;
+        c->flags   = ARROW_FLAG_NULLABLE;
+        c->release = sc_release_schema_named;
+        switch (s->out_types[i]) {
+            case LM_T_INT64:   c->format = "l"; break;
+            case LM_T_FLOAT64: c->format = "g"; break;
+            case LM_T_UTF8:    c->format = "u"; break;
+            case LM_T_BOOL:    c->format = "b"; break;
+            default:           c->format = "u"; break;
+        }
+        kids[i] = c;
+    }
+    out->format     = "+s";
+    out->n_children = (int64_t)s->n_out;
+    out->children   = kids;
+    out->release    = sc_release_schema_struct;
+    return 0;
+}
+
+/* --- output ArrowArray builders ------------------------------- */
+
+static void sc_release_leaf2(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 2 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+static void sc_release_leaf3(struct ArrowArray *arr) {
+    if (arr->n_buffers >= 3 && arr->buffers) {
+        free((void *)arr->buffers[0]);
+        free((void *)arr->buffers[1]);
+        free((void *)arr->buffers[2]);
+    }
+    free(arr->buffers);
+    arr->release = NULL;
+}
+static void sc_release_struct(struct ArrowArray *arr) {
+    for (int64_t i = 0; i < arr->n_children; ++i) {
+        if (arr->children[i]) {
+            if (arr->children[i]->release) arr->children[i]->release(arr->children[i]);
+            free(arr->children[i]);
+        }
+    }
+    free(arr->children);
+    free(arr->buffers);
+    arr->release = NULL;
+}
+
+/* Build a validity bitmap iff any nulls. Returns NULL with *out_nc=0
+ * if none, or a fresh malloc otherwise. */
+static uint8_t *sc_build_validity(const uint8_t *nulls, size_t n,
+                                  int64_t *out_nc) {
+    int64_t nc = 0;
+    for (size_t i = 0; i < n; ++i) if (nulls[i]) ++nc;
+    *out_nc = nc;
+    if (nc == 0) return NULL;
+    size_t bytes = (n + 7) / 8;
+    uint8_t *vmap = malloc(bytes ? bytes : 1);
+    if (!vmap) return NULL;
+    memset(vmap, 0xFF, bytes ? bytes : 1);
+    for (size_t i = 0; i < n; ++i) {
+        if (nulls[i]) vmap[i / 8] &= (uint8_t)~(1u << (i % 8));
+    }
+    return vmap;
+}
+
+static int sc_finalize_col(ScCol *c, size_t n, struct ArrowArray *out) {
+    int64_t null_count = 0;
+    uint8_t *vmap = sc_build_validity(c->nulls, n, &null_count);
+    if (null_count > 0 && !vmap) return -1;
+    free(c->nulls); c->nulls = NULL;
+
+    if (c->type == LM_T_INT64) {
+        int64_t *vals = c->i64_vals; c->i64_vals = NULL;
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(vals); return -1; }
+        bufs[0] = vmap; bufs[1] = vals;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs;
+        out->release = sc_release_leaf2;
+        return 0;
+    }
+    if (c->type == LM_T_FLOAT64) {
+        double *vals = c->f64_vals; c->f64_vals = NULL;
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(vals); return -1; }
+        bufs[0] = vmap; bufs[1] = vals;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs;
+        out->release = sc_release_leaf2;
+        return 0;
+    }
+    if (c->type == LM_T_BOOL) {
+        size_t bytes = (n + 7) / 8;
+        uint8_t *bm = calloc(bytes ? bytes : 1, 1);
+        if (!bm) { free(vmap); return -1; }
+        for (size_t i = 0; i < n; ++i) {
+            if (c->b_vals[i]) bm[i / 8] |= (uint8_t)(1u << (i % 8));
+        }
+        free(c->b_vals); c->b_vals = NULL;
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(bm); return -1; }
+        bufs[0] = vmap; bufs[1] = bm;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs;
+        out->release = sc_release_leaf2;
+        return 0;
+    }
+    /* LM_T_UTF8: smooth offsets across nulls before emitting. */
+    int32_t last = 0;
+    for (size_t i = 1; i <= n; ++i) {
+        if (c->u8_offsets[i] < last) c->u8_offsets[i] = last;
+        else last = c->u8_offsets[i];
+    }
+    int32_t *offs = c->u8_offsets; c->u8_offsets = NULL;
+    char    *data = c->u8_data;    c->u8_data = NULL;
+    if (!data) { data = malloc(1); if (!data) { free(vmap); free(offs); return -1; } }
+    const void **bufs = malloc(3 * sizeof *bufs);
+    if (!bufs) { free(vmap); free(offs); free(data); return -1; }
+    bufs[0] = vmap; bufs[1] = offs; bufs[2] = data;
+    out->length = (int64_t)n; out->null_count = null_count;
+    out->n_buffers = 3; out->buffers = bufs;
+    out->release = sc_release_leaf3;
+    return 0;
+}
+
+/* Build one struct ArrowArray from current buffered rows, then reset
+ * the per-column staging so emit() starts fresh. */
+static int sc_flush_batch(LuaScript *s, struct ArrowArray *out) {
+    size_t n = s->n_buffered;
+    struct ArrowArray **kids = calloc(s->n_out, sizeof *kids);
+    if (!kids) { lscript_set_err(s, "lua.script: OOM"); return -1; }
+    for (size_t i = 0; i < s->n_out; ++i) {
+        kids[i] = calloc(1, sizeof **kids);
+        if (!kids[i] || sc_finalize_col(&s->out_cols[i], n, kids[i]) != 0) {
+            for (size_t k = 0; k <= i; ++k) {
+                if (kids[k]) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+            }
+            free(kids);
+            lscript_set_err(s, "lua.script: finalize column %zu failed", i);
+            return -1;
+        }
+    }
+    const void **outer = malloc(1 * sizeof *outer);
+    if (!outer) {
+        for (size_t i = 0; i < s->n_out; ++i) {
+            if (kids[i]->release) kids[i]->release(kids[i]);
+            free(kids[i]);
+        }
+        free(kids); lscript_set_err(s, "lua.script: OOM");
+        return -1;
+    }
+    outer[0] = NULL;
+    out->length     = (int64_t)n;
+    out->null_count = 0;
+    out->n_buffers  = 1;
+    out->n_children = (int64_t)s->n_out;
+    out->buffers    = outer;
+    out->children   = kids;
+    out->release    = sc_release_struct;
+    s->n_buffered = 0;
+    for (size_t i = 0; i < s->n_out; ++i) sc_col_init(&s->out_cols[i], s->out_types[i]);
+    return 0;
+}
+
+/* --- input handling ------------------------------------------- */
+
+/* Push the row_idx-th row of a struct-of-leaves Arrow array onto the
+ * Lua stack as a table, keyed by upstream column names. Mirrors how
+ * lua.map builds the per-row table but threads through the schema we
+ * just cached on `in_col_*` arrays. */
+static void sc_push_row(LuaScript *s, const struct ArrowArray *in_arr,
+                        size_t r, char **in_names, LmType *in_types, size_t n_in) {
+    lua_createtable(s->L, 0, (int)n_in);
+    for (size_t c = 0; c < n_in; ++c) {
+        switch (in_types[c]) {
+            case LM_T_INT8: case LM_T_UINT8:
+            case LM_T_INT16: case LM_T_UINT16:
+            case LM_T_INT32: case LM_T_UINT32:
+            case LM_T_INT64: case LM_T_UINT64:
+                lm_push_int_cell(s->L, in_types[c], in_arr->children[c], r); break;
+            case LM_T_UTF8:
+                lm_push_utf8_cell(s->L, in_arr->children[c], r); break;
+            default:
+                lua_pushnil(s->L); break;
+        }
+        lua_setfield(s->L, -2, in_names[c]);
+    }
+}
+
+/* Cache upstream schema names + types onto the LuaScript state. */
+static int sc_cache_input_schema_self(LuaScript *s) {
+    if (s->_in_cached) return 0;
+    struct ArrowSchema up = {0};
+    if (!s->have_input || !s->input.get_schema
+        || s->input.get_schema(&s->input, &up) != 0) {
+        lscript_set_err(s, "lua.script: upstream get_schema failed");
+        return -1;
+    }
+    int rc = -1;
+    if (!up.format || strcmp(up.format, "+s") != 0 || up.n_children <= 0) {
+        lscript_set_err(s, "lua.script: input must be a struct"); goto done;
+    }
+    size_t n = (size_t)up.n_children;
+    char  **names = calloc(n, sizeof *names);
+    LmType *types = calloc(n, sizeof *types);
+    if (!names || !types) {
+        free(names); free(types);
+        lscript_set_err(s, "lua.script: OOM"); goto done;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        struct ArrowSchema *cs = up.children[i];
+        const char *fmt = (cs && cs->format) ? cs->format : NULL;
+        if (!fmt) { lscript_set_err(s, "lua.script: column %zu missing format", i); goto cleanup; }
+        LmType t;
+        if      (!strcmp(fmt, "l")) t = LM_T_INT64;
+        else if (!strcmp(fmt, "L")) t = LM_T_UINT64;
+        else if (!strcmp(fmt, "c")) t = LM_T_INT8;
+        else if (!strcmp(fmt, "C")) t = LM_T_UINT8;
+        else if (!strcmp(fmt, "s")) t = LM_T_INT16;
+        else if (!strcmp(fmt, "S")) t = LM_T_UINT16;
+        else if (!strcmp(fmt, "i")) t = LM_T_INT32;
+        else if (!strcmp(fmt, "I")) t = LM_T_UINT32;
+        else if (!strcmp(fmt, "u")) t = LM_T_UTF8;
+        else {
+            lscript_set_err(s,
+                "lua.script: input column '%s' has unsupported format '%s' "
+                "(supported: integer widths, utf8)",
+                (cs && cs->name) ? cs->name : "?", fmt);
+            goto cleanup;
+        }
+        names[i] = strdup(cs->name ? cs->name : "");
+        if (!names[i]) { lscript_set_err(s, "lua.script: OOM"); goto cleanup; }
+        types[i] = t;
+    }
+    s->_in_names = names; s->_in_types = types; s->_in_n = n;
+    s->_in_cached = 1;
+    rc = 0; goto done;
+cleanup:
+    for (size_t i = 0; i < n; ++i) free(names[i]);
+    free(names); free(types);
+done:
+    if (up.release) up.release(&up);
+    return rc;
+}
+
+/* --- get_next ------------------------------------------------- */
+
+static int lua_script_get_next(struct ArrowArrayStream *st,
+                               struct ArrowArray *out) {
+    LuaScript *s = st->private_data;
+    memset(out, 0, sizeof *out);
+    if (!s) return EINVAL;
+
+    /* Pull batches and run on_row until at least one output row is
+     * buffered, or upstream is exhausted (call on_eof then). */
+    while (s->n_buffered == 0) {
+        if (s->eof_seen) {
+            return 0;     /* terminal: empty out, release NULL */
+        }
+        struct ArrowArray in_arr = {0};
+        if (s->input.get_next(&s->input, &in_arr) != 0) {
+            lscript_set_err(s, "lua.script: upstream get_next failed");
+            return EIO;
+        }
+        if (!in_arr.release) {
+            /* End of stream — fire on_eof if present. */
+            s->eof_seen = 1;
+            if (s->fn_on_eof_ref != LUA_NOREF) {
+                lua_rawgeti(s->L, LUA_REGISTRYINDEX, s->fn_on_eof_ref);
+                if (lua_pcall(s->L, 0, 0, 0) != LUA_OK) {
+                    const char *e = lua_tostring(s->L, -1);
+                    lscript_set_err(s, "lua.script: on_eof error: %s", e ? e : "(unknown)");
+                    lua_pop(s->L, 1);
+                    return EIO;
+                }
+            }
+            if (s->n_buffered == 0) return 0;  /* nothing flushed at EOF */
+            break;
+        }
+        /* Cache the input schema once we see a real batch. */
+        if (!s->_in_cached) {
+            if (sc_cache_input_schema_self(s) != 0) {
+                in_arr.release(&in_arr);
+                return EIO;
+            }
+        }
+        size_t length = (size_t)in_arr.length;
+        for (size_t r = 0; r < length; ++r) {
+            if (betl_should_cancel(s->ctx)) {
+                in_arr.release(&in_arr);
+                lscript_set_err(s, "lua.script: cancelled");
+                return EIO;
+            }
+            lua_rawgeti(s->L, LUA_REGISTRYINDEX, s->fn_on_row_ref);
+            sc_push_row(s, &in_arr, r, s->_in_names, s->_in_types, s->_in_n);
+            if (lua_pcall(s->L, 1, 0, 0) != LUA_OK) {
+                const char *e = lua_tostring(s->L, -1);
+                lscript_set_err(s, "lua.script: on_row row=%zu: %s",
+                                r, e ? e : "(unknown)");
+                lua_pop(s->L, 1);
+                in_arr.release(&in_arr);
+                return EIO;
+            }
+        }
+        in_arr.release(&in_arr);
+    }
+    if (s->n_buffered == 0) return 0;
+    if (sc_flush_batch(s, out) != 0) return EIO;
+    return 0;
+}
+
+static const char *lua_script_get_last_error(struct ArrowArrayStream *st) {
+    LuaScript *s = st->private_data;
+    return (s && s->last_err[0]) ? s->last_err : NULL;
+}
+
+static void lua_script_release(struct ArrowArrayStream *st) {
+    st->private_data = NULL;
+    st->release = NULL;
+}
+
+static int lua_script_attach_output(void *state, int port,
+                                    struct ArrowArrayStream *out) {
+    (void)port;
+    LuaScript *s = state;
+    out->get_schema     = lua_script_get_schema;
+    out->get_next       = lua_script_get_next;
+    out->get_last_error = lua_script_get_last_error;
+    out->release        = lua_script_release;
+    out->private_data   = s;
+    return BETL_OK;
+}
+
+static const BetlPortDef ls_inputs[]  = {
+    { .name = "in",  .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "rows to process" },
+};
+static const BetlPortDef ls_outputs[] = {
+    { .name = "out", .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "emitted rows" },
+};
+
+
+/* ============================================================== *
  *  Provider entry                                                  *
  * ============================================================== */
 
@@ -1467,6 +2365,19 @@ static const BetlComponentDef components[] = {
       .destroy            = lua_map_destroy,
       .attach_input       = lua_map_attach_input,
       .attach_output      = lua_map_attach_output },
+
+    { .name               = "lua.script",
+      .kind               = BETL_KIND_TRANSFORM,
+      .config_schema_json = "{}",
+      .flags              = 0,
+      .inputs             = ls_inputs,
+      .input_count        = 1,
+      .outputs            = ls_outputs,
+      .output_count       = 1,
+      .init               = lua_script_init,
+      .destroy            = lua_script_destroy,
+      .attach_input       = lua_script_attach_input,
+      .attach_output      = lua_script_attach_output },
 };
 
 static const BetlProvider lua_provider = {
