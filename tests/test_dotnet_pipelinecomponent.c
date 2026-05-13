@@ -675,6 +675,128 @@ static const char PL_ERROR_UNWIRED[] =
     "        from: t\n"
     "        expect: 2\n";
 
+/* --- coverage closure C1: per-cell value assertions via a second
+ *     pipelinecomponent that throws on mismatch. -------------- */
+static const char PL_VALUE_VERIFY[] =
+    "betl: 1\n"
+    "name: dotnet-pc-value-verify\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "      - id: produce\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,          type: l }\n"
+    "          - { name: doubled,     type: l }\n"
+    "          - { name: stringified, type: u }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                buffer.SetInt64(1, id * 2);\n"
+    "                buffer.SetString(2, \"v\" + id);\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: verify\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: produce\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,          type: l }\n"
+    "          - { name: doubled,     type: l }\n"
+    "          - { name: stringified, type: u }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id      = buffer.GetInt64(0);\n"
+    "                long doubled = buffer.GetInt64(1);\n"
+    "                string s     = buffer.GetString(2);\n"
+    "                if (doubled != id * 2)\n"
+    "                  throw new System.Exception(\n"
+    "                    \"doubled mismatch: id=\" + id + \" doubled=\" + doubled);\n"
+    "                if (s != \"v\" + id)\n"
+    "                  throw new System.Exception(\"string mismatch: \" + s);\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: verify\n"
+    "        expect: 4\n";
+
+/* --- coverage closure C2: compile error (invalid C#). Expect
+ *     a non-OK rc with a useful error message. ------------------ */
+static const char PL_COMPILE_ERR[] =
+    "betl: 1\n"
+    "name: dotnet-pc-compile-err\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            THIS_IS_NOT_VALID_CSHARP\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 1\n";
+
+/* --- coverage closure C3: runtime throw in ProcessInput. Expect
+ *     a non-OK rc with the exception propagated. --------------- */
+static const char PL_RUNTIME_THROW[] =
+    "betl: 1\n"
+    "name: dotnet-pc-runtime-throw\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 3\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              throw new System.Exception(\"intentional ProcessInput failure\");\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 3\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -760,6 +882,43 @@ int main(int argc, char **argv) {
     rc = run_yaml(plugin_path, PL_ERROR_UNWIRED, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "error-unwired: %s\n", err);
     CHECK(rc == BETL_OK);
+
+    /* Per-cell value verification: downstream throws on mismatch,
+     * which fails the pipeline. Success here means every cell of
+     * every row produced the expected value. */
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_VALUE_VERIFY, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "value-verify: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    /* Negative: compile error in user source. Expect failure with a
+     * non-empty error message that mentions either "compile" or the
+     * underlying C# diagnostic. */
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_COMPILE_ERR, err, sizeof err);
+    CHECK(rc != BETL_OK);
+    CHECK(err[0] != '\0');
+    if (rc == BETL_OK)
+        fprintf(stderr, "compile-err: expected failure but got OK\n");
+
+    /* Negative: user code throws in ProcessInput. Expect failure
+     * with a non-empty error message. */
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_RUNTIME_THROW, err, sizeof err);
+    CHECK(rc != BETL_OK);
+    CHECK(err[0] != '\0');
+    if (rc == BETL_OK)
+        fprintf(stderr, "runtime-throw: expected failure but got OK\n");
+
+    /* Parallel-mode coverage: rerun the error-routing test with
+     * BETL_PARALLEL=off to exercise the single-threaded executor
+     * path. Both ports' streams must still coordinate correctly. */
+    setenv("BETL_PARALLEL", "off", 1);
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_ERROR_ROUTE, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "error-route-serial: %s\n", err);
+    CHECK(rc == BETL_OK);
+    unsetenv("BETL_PARALLEL");
 
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
