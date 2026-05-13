@@ -199,6 +199,78 @@ entry on demand). The existence check fires inside `AcquireConnection`
 — if the name isn't in the pipeline's `connections:` block, it throws
 with a clear message.
 
+## Performance
+
+Measured on a 16-core x86_64 box with .NET 8.0.404 NativeAOT,
+100k rows × 5 iterations per shape, steady-state (post-warmup).
+Full numbers and reproduction instructions in
+[`BENCHMARKS.md`](BENCHMARKS.md).
+
+### Throughput
+
+| shape                     | wall (min) | throughput     |
+|---------------------------|-----------:|---------------:|
+| 1-col passthrough         | ~7 ms      | ~14 M rows/s   |
+| 10-col passthrough        | ~24 ms     |  ~4 M rows/s   |
+| error_output, 10% tagged  | ~7 ms      | ~14 M rows/s   |
+| 5 decimal cells/row       | ~33 ms     |  ~3 M rows/s   |
+| async aggregator (N → 1)  |  ~3 ms     | ~30 M rows/s   |
+| 1-col passthrough (lua.script comparison) | ~19 ms | ~5 M rows/s |
+
+Per-cell throughput scales roughly linearly with column count —
+each `Get*` / `Set*` is its own function-pointer crossing into C.
+Error routing costs effectively nothing at low tag rates.
+Decimal128 is ~5× slower than int64 because of the per-cell
+`new byte[16]` heap allocation that flows through the staging
+buffer (the 128-bit arithmetic itself stays in registers via
+`System.Int128` / `UInt128`); a previous `BigInteger`-based
+implementation was ~10× slower than int64.
+
+The async aggregator pattern (no per-row `Set*` in the hot loop)
+shows the FFI ceiling: ~30 M rows/s when nothing crosses back
+into C per row.
+
+### Startup cost
+
+| state | wall time | notes |
+|-------|----------:|-------|
+| **Cold** (cache empty, NuGet warm)   | ~1.5 s | `dotnet publish -p:PublishAot=true` runs from scratch |
+| **Warm** (per-source-hash cache hit) | ~0.6 ms | just `dlopen` + lifecycle methods |
+
+The cold cost is dominated by `dotnet publish` (Roslyn compile +
+NativeAOT link). Each unique `(source, lang, schema)` tuple gets
+its own cache entry under `$HOME/.cache/betl/dotnet/<hash>.so`;
+re-running an unchanged component reuses the cached `.so` and
+pays only the per-process `dlopen` cost. Cold cost grows with
+component complexity — a real SSIS-migration PipelineComponent
+with multiple referenced assemblies will be 5–15 s cold.
+
+First-ever AOT compile on a clean machine (NuGet cache empty too)
+is slower than the 1.5 s above — NuGet has to download packages.
+Subsequent compiles share the system-wide NuGet cache.
+
+### Parallel mode
+
+`BETL_PARALLEL` doesn't materially affect the `pc-*` shapes:
+in a 3-stage pipeline (`gen → pc → sink`) the dotnet component
+is the single hot stage and the pipeline-parallel executor has
+little to overlap. Long chains with `dotnet.pipelinecomponent`
+sandwiched between other CPU-bound stages would see the usual
+overlap gains.
+
+### Comparison vs SSIS
+
+We can't claim measured numbers against real SSIS without a
+Windows + SQL Server + SSDT setup. Based on published SSIS
+performance guidance (typical 100k–500k rows/s for custom
+transforms) and the architecture difference (NativeAOT direct
+function calls vs SSIS's COM-RCW per-cell access), the
+component-level throughput is plausibly **5–30× faster** for
+sync transforms. End-to-end throughput in real ETL is usually
+source/sink-bottlenecked, so the realised advantage is closer
+to **1.2–3×** for typical workloads. Cold-start: SSIS wins
+(no AOT compile penalty).
+
 ## Limitations
 
 | Area | What's missing |
