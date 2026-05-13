@@ -273,6 +273,25 @@ if(BETL_LUA_FOUND)
             PASS_REGULAR_EXPRESSION "ok: dotnet.pipelinecomponent test passed"
             TIMEOUT 300
         )
+
+        # C-side init/destroy alloc test. Doesn't need the .NET SDK
+        # (AOT compile fires lazily on first get_next, which this
+        # test never reaches). Runs under valgrind to catch
+        # provider-side memory bugs.
+        add_executable(test_dotnet_pc_alloc test_dotnet_pc_alloc.c)
+        target_link_libraries(test_dotnet_pc_alloc PRIVATE betl_core)
+        set_target_properties(test_dotnet_pc_alloc PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_dotnet_pc_alloc PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_DOTNET_TARGET}>"
+        )
+        add_dependencies(test_dotnet_pc_alloc ${BETL_DOTNET_TARGET})
+        add_test(NAME dotnet_pc_alloc
+            COMMAND test_dotnet_pc_alloc $<TARGET_FILE:${BETL_DOTNET_TARGET}>
+        )
+        set_tests_properties(dotnet_pc_alloc PROPERTIES
+            PASS_REGULAR_EXPRESSION "ok: dotnet.pipelinecomponent alloc test passed"
+            TIMEOUT 30
+        )
     endif()
 
     # End-to-end: lua.script — the SSIS async script component analogue.
