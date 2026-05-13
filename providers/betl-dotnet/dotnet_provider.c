@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "2"
+#define BETL_DOTNET_SHIM_ABI_VERSION "3"
 
 
 /* ============================================================== *
@@ -837,13 +837,72 @@ typedef enum {
     DS_FLOAT64,
     DS_BOOL,
     DS_UTF8,
+    /* Phase 1b narrow numerics. Storage piggy-backs on i64_vals /
+     * f64_vals — the values are widened on input and narrowed at
+     * finalize, so the staging hot path stays one-type-per-vector. */
+    DS_INT8,
+    DS_INT16,
+    DS_INT32,
+    DS_UINT8,
+    DS_UINT16,
+    DS_UINT32,
+    DS_UINT64,
+    DS_FLOAT32,
 } DsType;
 
 typedef struct {
     char  *name;
     DsType type;
-    char   arrow_fmt;     /* 'l' / 'g' / 'b' / 'u' */
+    char   arrow_fmt;     /* 'l' / 'g' / 'b' / 'u' / 'c' / 'C' / 's' / 'S' / 'i' / 'I' / 'L' / 'f' */
 } DsCol;
+
+/* Map an Arrow format char to a DsType, or DS_INT64 + return -1 on
+ * unsupported. Single source of truth for the supported set. */
+static int ds_fmt_to_type(char fmt, DsType *out) {
+    switch (fmt) {
+        case 'l': *out = DS_INT64;   return 0;
+        case 'g': *out = DS_FLOAT64; return 0;
+        case 'b': *out = DS_BOOL;    return 0;
+        case 'u': *out = DS_UTF8;    return 0;
+        case 'c': *out = DS_INT8;    return 0;
+        case 's': *out = DS_INT16;   return 0;
+        case 'i': *out = DS_INT32;   return 0;
+        case 'C': *out = DS_UINT8;   return 0;
+        case 'S': *out = DS_UINT16;  return 0;
+        case 'I': *out = DS_UINT32;  return 0;
+        case 'L': *out = DS_UINT64;  return 0;
+        case 'f': *out = DS_FLOAT32; return 0;
+        default:  *out = DS_INT64;   return -1;
+    }
+}
+
+static char ds_type_to_fmt(DsType t) {
+    switch (t) {
+        case DS_INT64:   return 'l';
+        case DS_FLOAT64: return 'g';
+        case DS_BOOL:    return 'b';
+        case DS_UTF8:    return 'u';
+        case DS_INT8:    return 'c';
+        case DS_INT16:   return 's';
+        case DS_INT32:   return 'i';
+        case DS_UINT8:   return 'C';
+        case DS_UINT16:  return 'S';
+        case DS_UINT32:  return 'I';
+        case DS_UINT64:  return 'L';
+        case DS_FLOAT32: return 'f';
+    }
+    return '?';
+}
+
+/* Group test: does this type use the i64_vals storage vector? */
+static int ds_type_is_int64_stored(DsType t) {
+    return t == DS_INT64 || t == DS_INT8 || t == DS_INT16 || t == DS_INT32
+        || t == DS_UINT8 || t == DS_UINT16 || t == DS_UINT32 || t == DS_UINT64;
+}
+/* Does this type use the f64_vals storage vector? */
+static int ds_type_is_f64_stored(DsType t) {
+    return t == DS_FLOAT64 || t == DS_FLOAT32;
+}
 
 /* Per-output-column growable staging — populated by Emit setter
  * callbacks from C#, flushed to an Arrow leaf at end of each batch. */
@@ -971,13 +1030,10 @@ static int parse_output_schema(DotnetScript *s, const char *cfg) {
             free(name); free(type); return -1;
         }
         DsType t;
-        if      (!strcmp(type, "l")) t = DS_INT64;
-        else if (!strcmp(type, "g")) t = DS_FLOAT64;
-        else if (!strcmp(type, "b")) t = DS_BOOL;
-        else if (!strcmp(type, "u")) t = DS_UTF8;
-        else {
+        if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0) {
             ds_set_err(s, "dotnet.script: output column '%s' type '%s' "
-                          "not yet supported (v0.2: l, g, b, u)", name, type);
+                          "not supported (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)",
+                       name, type);
             free(name); free(type); return -1;
         }
         free(type);
@@ -986,9 +1042,7 @@ static int parse_output_schema(DotnetScript *s, const char *cfg) {
         s->out_cols = grow;
         s->out_cols[s->n_out].name = name;
         s->out_cols[s->n_out].type = t;
-        s->out_cols[s->n_out].arrow_fmt =
-            (t == DS_INT64 ? 'l' : t == DS_FLOAT64 ? 'g' :
-             t == DS_BOOL  ? 'b' : 'u');
+        s->out_cols[s->n_out].arrow_fmt = ds_type_to_fmt(t);
         ++s->n_out;
 
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
@@ -1019,13 +1073,9 @@ static int cache_input_schema(DotnetScript *s) {
         struct ArrowSchema *c = up.children[i];
         const char *fmt = c && c->format ? c->format : "";
         DsType t;
-        if      (!strcmp(fmt, "l")) t = DS_INT64;
-        else if (!strcmp(fmt, "g")) t = DS_FLOAT64;
-        else if (!strcmp(fmt, "b")) t = DS_BOOL;
-        else if (!strcmp(fmt, "u")) t = DS_UTF8;
-        else {
+        if (strlen(fmt) != 1 || ds_fmt_to_type(fmt[0], &t) != 0) {
             ds_set_err(s, "dotnet.script: input column '%s' has unsupported "
-                          "Arrow format '%s' (v0.2: l, g, b, u)",
+                          "Arrow format '%s' (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)",
                        c && c->name ? c->name : "?", fmt);
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -1081,8 +1131,34 @@ static const char *ds_cs_type(DsType t) {
         case DS_FLOAT64: return "double?";
         case DS_BOOL:    return "bool?";
         case DS_UTF8:    return "string?";
+        case DS_INT8:    return "sbyte?";
+        case DS_INT16:   return "short?";
+        case DS_INT32:   return "int?";
+        case DS_UINT8:   return "byte?";
+        case DS_UINT16:  return "ushort?";
+        case DS_UINT32:  return "uint?";
+        case DS_UINT64:  return "ulong?";
+        case DS_FLOAT32: return "float?";
     }
     return "object?";
+}
+
+/* Native C# unmanaged-pointer type for the Arrow values buffer of a
+ * given DsType — used in generated input-extraction code. */
+static const char *ds_cs_buffer_ptr_type(DsType t) {
+    switch (t) {
+        case DS_INT64:   return "long";
+        case DS_FLOAT64: return "double";
+        case DS_INT8:    return "sbyte";
+        case DS_INT16:   return "short";
+        case DS_INT32:   return "int";
+        case DS_UINT8:   return "byte";
+        case DS_UINT16:  return "ushort";
+        case DS_UINT32:  return "uint";
+        case DS_UINT64:  return "ulong";
+        case DS_FLOAT32: return "float";
+        default:         return "byte"; /* unused */
+    }
 }
 
 /* Emit the per-column extraction for one input cell into a generated
@@ -1095,33 +1171,30 @@ static int gen_input_extract(Sbuf *out, const DsCol *c, size_t idx) {
         "      bool isNull = c->NullCount > 0 && c->Buffers[0] != null && "
         "        ((((byte*)c->Buffers[0])[rowOff/8] >> (int)(rowOff&7)) & 1u) == 0;\n",
         idx);
-    switch (c->type) {
-        case DS_INT64:
-            sb_appendf(out,
-                "      r.%s = isNull ? (long?)null : ((long*)c->Buffers[1])[rowOff];\n",
-                c->name);
-            break;
-        case DS_FLOAT64:
-            sb_appendf(out,
-                "      r.%s = isNull ? (double?)null : ((double*)c->Buffers[1])[rowOff];\n",
-                c->name);
-            break;
-        case DS_BOOL:
-            sb_appendf(out,
-                "      if (isNull) r.%s = null;\n"
-                "      else { byte b = ((byte*)c->Buffers[1])[rowOff/8];\n"
-                "             r.%s = ((b >> (int)(rowOff&7)) & 1) != 0; }\n",
-                c->name, c->name);
-            break;
-        case DS_UTF8:
-            sb_appendf(out,
-                "      if (isNull) r.%s = null;\n"
-                "      else { int *offs = (int*)c->Buffers[1];\n"
-                "             byte *data = (byte*)c->Buffers[2];\n"
-                "             int s = offs[rowOff], e = offs[rowOff+1];\n"
-                "             r.%s = System.Text.Encoding.UTF8.GetString(data + s, e - s); }\n",
-                c->name, c->name);
-            break;
+    if (c->type == DS_BOOL) {
+        sb_appendf(out,
+            "      if (isNull) r.%s = null;\n"
+            "      else { byte b = ((byte*)c->Buffers[1])[rowOff/8];\n"
+            "             r.%s = ((b >> (int)(rowOff&7)) & 1) != 0; }\n",
+            c->name, c->name);
+    } else if (c->type == DS_UTF8) {
+        sb_appendf(out,
+            "      if (isNull) r.%s = null;\n"
+            "      else { int *offs = (int*)c->Buffers[1];\n"
+            "             byte *data = (byte*)c->Buffers[2];\n"
+            "             int s = offs[rowOff], e = offs[rowOff+1];\n"
+            "             r.%s = System.Text.Encoding.UTF8.GetString(data + s, e - s); }\n",
+            c->name, c->name);
+    } else {
+        /* All fixed-width numerics: read via the typed pointer at
+         * rowOff. Narrow types auto-widen on assignment into r.X
+         * because the field is nullable<narrow>; the C# compiler
+         * inserts the implicit conversion. */
+        const char *cs    = ds_cs_type(c->type);   /* e.g. "int?" */
+        const char *ptr_t = ds_cs_buffer_ptr_type(c->type);
+        sb_appendf(out,
+            "      r.%s = isNull ? (%s)null : ((%s*)c->Buffers[1])[rowOff];\n",
+            c->name, cs, ptr_t);
     }
     sb_append(out, "    }\n");
     return 0;
@@ -1129,32 +1202,31 @@ static int gen_input_extract(Sbuf *out, const DsCol *c, size_t idx) {
 
 /* Emit the per-column output write for one cell. */
 static int gen_output_write(Sbuf *out, const DsCol *c, size_t idx) {
-    switch (c->type) {
-        case DS_INT64:
-            sb_appendf(out,
-                "    if (row.%s.HasValue) SetInt64Fn(emitCtx, %zu, row.%s.Value);\n"
-                "    else SetNullFn(emitCtx, %zu);\n",
-                c->name, idx, c->name, idx);
-            break;
-        case DS_FLOAT64:
-            sb_appendf(out,
-                "    if (row.%s.HasValue) SetFloat64Fn(emitCtx, %zu, row.%s.Value);\n"
-                "    else SetNullFn(emitCtx, %zu);\n",
-                c->name, idx, c->name, idx);
-            break;
-        case DS_BOOL:
-            sb_appendf(out,
-                "    if (row.%s.HasValue) SetBoolFn(emitCtx, %zu, (byte)(row.%s.Value ? 1 : 0));\n"
-                "    else SetNullFn(emitCtx, %zu);\n",
-                c->name, idx, c->name, idx);
-            break;
-        case DS_UTF8:
-            sb_appendf(out,
-                "    if (row.%s != null) { var b = System.Text.Encoding.UTF8.GetBytes(row.%s);\n"
-                "                          fixed (byte *p = b) SetUtf8Fn(emitCtx, %zu, p, b.Length); }\n"
-                "    else SetNullFn(emitCtx, %zu);\n",
-                c->name, c->name, idx, idx);
-            break;
+    if (c->type == DS_BOOL) {
+        sb_appendf(out,
+            "    if (row.%s.HasValue) SetBoolFn(emitCtx, %zu, (byte)(row.%s.Value ? 1 : 0));\n"
+            "    else SetNullFn(emitCtx, %zu);\n",
+            c->name, idx, c->name, idx);
+    } else if (c->type == DS_UTF8) {
+        sb_appendf(out,
+            "    if (row.%s != null) { var b = System.Text.Encoding.UTF8.GetBytes(row.%s);\n"
+            "                          fixed (byte *p = b) SetUtf8Fn(emitCtx, %zu, p, b.Length); }\n"
+            "    else SetNullFn(emitCtx, %zu);\n",
+            c->name, c->name, idx, idx);
+    } else if (ds_type_is_f64_stored(c->type)) {
+        /* DT_R8 direct; DT_R4 widens (double)(float) is implicit but
+         * we cast explicitly to avoid an analyzer warning. */
+        sb_appendf(out,
+            "    if (row.%s.HasValue) SetFloat64Fn(emitCtx, %zu, (double)row.%s.Value);\n"
+            "    else SetNullFn(emitCtx, %zu);\n",
+            c->name, idx, c->name, idx);
+    } else {
+        /* All integer widths route through SetInt64Fn — staging is
+         * widened to long, narrowed at finalize. */
+        sb_appendf(out,
+            "    if (row.%s.HasValue) SetInt64Fn(emitCtx, %zu, (long)row.%s.Value);\n"
+            "    else SetNullFn(emitCtx, %zu);\n",
+            c->name, idx, c->name, idx);
     }
     return 0;
 }
@@ -1204,36 +1276,27 @@ static int ds_out_reserve(DsOutCol *c, size_t want) {
     if (!nn) return -1;
     c->nulls = nn;
     memset(c->nulls + c->cap, 0, nc - c->cap);
-    switch (c->type) {
-        case DS_INT64: {
-            int64_t *p = realloc(c->i64_vals, nc * sizeof *p);
-            if (!p) return -1;
-            c->i64_vals = p;
-            break;
-        }
-        case DS_FLOAT64: {
-            double *p = realloc(c->f64_vals, nc * sizeof *p);
-            if (!p) return -1;
-            c->f64_vals = p;
-            break;
-        }
-        case DS_BOOL: {
-            uint8_t *p = realloc(c->b_vals, nc);
-            if (!p) return -1;
-            c->b_vals = p;
-            break;
-        }
-        case DS_UTF8: {
-            int32_t *po = realloc(c->u8_offsets, (nc + 1) * sizeof *po);
-            if (!po) return -1;
-            c->u8_offsets = po;
-            if (c->cap == 0) c->u8_offsets[0] = 0;
-            if (c->u8_cap == 0) {
-                c->u8_cap = 128;
-                c->u8_data = malloc(c->u8_cap);
-                if (!c->u8_data) return -1;
-            }
-            break;
+    if (ds_type_is_int64_stored(c->type)) {
+        int64_t *p = realloc(c->i64_vals, nc * sizeof *p);
+        if (!p) return -1;
+        c->i64_vals = p;
+    } else if (ds_type_is_f64_stored(c->type)) {
+        double *p = realloc(c->f64_vals, nc * sizeof *p);
+        if (!p) return -1;
+        c->f64_vals = p;
+    } else if (c->type == DS_BOOL) {
+        uint8_t *p = realloc(c->b_vals, nc);
+        if (!p) return -1;
+        c->b_vals = p;
+    } else if (c->type == DS_UTF8) {
+        int32_t *po = realloc(c->u8_offsets, (nc + 1) * sizeof *po);
+        if (!po) return -1;
+        c->u8_offsets = po;
+        if (c->cap == 0) c->u8_offsets[0] = 0;
+        if (c->u8_cap == 0) {
+            c->u8_cap = 128;
+            c->u8_data = malloc(c->u8_cap);
+            if (!c->u8_data) return -1;
         }
     }
     c->cap = nc;
@@ -1347,6 +1410,41 @@ static void ds_release_struct(struct ArrowArray *a) {
     free(a->children); free(a->buffers); a->release = NULL;
 }
 
+/* Narrow the widened i64/f64 storage into a typed Arrow buffer of
+ * `elem_size` bytes per row. Caller owns the returned buffer. The
+ * widened source is freed unconditionally on success. */
+static void *ds_narrow_int(int64_t *src, size_t n, DsType t) {
+    if (!src && n > 0) return NULL;
+    switch (t) {
+        case DS_INT8: case DS_UINT8: {
+            uint8_t *p = malloc(n ? n : 1);
+            if (!p) return NULL;
+            for (size_t i = 0; i < n; ++i) p[i] = (uint8_t)src[i];
+            return p;
+        }
+        case DS_INT16: case DS_UINT16: {
+            uint16_t *p = malloc((n ? n : 1) * sizeof *p);
+            if (!p) return NULL;
+            for (size_t i = 0; i < n; ++i) p[i] = (uint16_t)src[i];
+            return p;
+        }
+        case DS_INT32: case DS_UINT32: {
+            uint32_t *p = malloc((n ? n : 1) * sizeof *p);
+            if (!p) return NULL;
+            for (size_t i = 0; i < n; ++i) p[i] = (uint32_t)src[i];
+            return p;
+        }
+        default:
+            return NULL;
+    }
+}
+static float *ds_narrow_float32(double *src, size_t n) {
+    float *p = malloc((n ? n : 1) * sizeof *p);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; ++i) p[i] = (float)src[i];
+    return p;
+}
+
 static int ds_finalize_col(DsOutCol *c, struct ArrowArray *out) {
     size_t n = c->n;
     int64_t null_count = 0;
@@ -1362,12 +1460,39 @@ static int ds_finalize_col(DsOutCol *c, struct ArrowArray *out) {
         }
     }
     free(c->nulls); c->nulls = NULL;
-    if (c->type == DS_INT64 || c->type == DS_FLOAT64) {
+    /* Wide passthrough: int64 / uint64 / float64 own the wide buffer
+     * and hand it straight to Arrow (DS_UINT64 is bit-identical to
+     * DS_INT64 here — i64_vals already holds the right 64 bits). */
+    if (c->type == DS_INT64 || c->type == DS_UINT64 || c->type == DS_FLOAT64) {
         const void **bufs = malloc(2 * sizeof *bufs);
         if (!bufs) { free(vmap); return -1; }
         bufs[0] = vmap;
-        bufs[1] = (c->type == DS_INT64) ? (void *)c->i64_vals : (void *)c->f64_vals;
+        bufs[1] = (c->type == DS_FLOAT64) ? (void *)c->f64_vals : (void *)c->i64_vals;
         c->i64_vals = NULL; c->f64_vals = NULL;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
+        return 0;
+    }
+    /* Narrow numerics: allocate a typed buffer, narrow into it, free
+     * the wide source. Same Arrow leaf shape (validity + values). */
+    if (ds_type_is_int64_stored(c->type)) {
+        void *narrow = ds_narrow_int(c->i64_vals, n, c->type);
+        if (!narrow) { free(vmap); return -1; }
+        free(c->i64_vals); c->i64_vals = NULL;
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(narrow); return -1; }
+        bufs[0] = vmap; bufs[1] = narrow;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
+        return 0;
+    }
+    if (c->type == DS_FLOAT32) {
+        float *narrow = ds_narrow_float32(c->f64_vals, n);
+        if (!narrow) { free(vmap); return -1; }
+        free(c->f64_vals); c->f64_vals = NULL;
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(narrow); return -1; }
+        bufs[0] = vmap; bufs[1] = narrow;
         out->length = (int64_t)n; out->null_count = null_count;
         out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
         return 0;
@@ -1531,6 +1656,14 @@ static int ds_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
             case DS_FLOAT64: c->format = "g"; break;
             case DS_BOOL:    c->format = "b"; break;
             case DS_UTF8:    c->format = "u"; break;
+            case DS_INT8:    c->format = "c"; break;
+            case DS_INT16:   c->format = "s"; break;
+            case DS_INT32:   c->format = "i"; break;
+            case DS_UINT8:   c->format = "C"; break;
+            case DS_UINT16:  c->format = "S"; break;
+            case DS_UINT32:  c->format = "I"; break;
+            case DS_UINT64:  c->format = "L"; break;
+            case DS_FLOAT32: c->format = "f"; break;
         }
         c->release = ds_release_schema_named;
         kids[i] = c;
@@ -1824,14 +1957,10 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
             free(name); free(type); return -1;
         }
         DsType t;
-        if      (!strcmp(type, "l")) t = DS_INT64;
-        else if (!strcmp(type, "g")) t = DS_FLOAT64;
-        else if (!strcmp(type, "b")) t = DS_BOOL;
-        else if (!strcmp(type, "u")) t = DS_UTF8;
-        else {
+        if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0) {
             dpc_set_err(p,
                 "dotnet.pipelinecomponent: output column '%s' type '%s' "
-                "not yet supported (Phase 1a: l, g, b, u)", name, type);
+                "not supported (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)", name, type);
             free(name); free(type); return -1;
         }
         free(type);
@@ -1840,9 +1969,7 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
         p->out_cols = grow;
         p->out_cols[p->n_out].name = name;
         p->out_cols[p->n_out].type = t;
-        p->out_cols[p->n_out].arrow_fmt =
-            (t == DS_INT64 ? 'l' : t == DS_FLOAT64 ? 'g' :
-             t == DS_BOOL  ? 'b' : 'u');
+        p->out_cols[p->n_out].arrow_fmt = ds_type_to_fmt(t);
         ++p->n_out;
 
         while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') ++q;
@@ -1874,14 +2001,10 @@ static int dpc_cache_input_schema(DotnetPipelineComponent *p) {
         struct ArrowSchema *c = up.children[i];
         const char *fmt = c && c->format ? c->format : "";
         DsType t;
-        if      (!strcmp(fmt, "l")) t = DS_INT64;
-        else if (!strcmp(fmt, "g")) t = DS_FLOAT64;
-        else if (!strcmp(fmt, "b")) t = DS_BOOL;
-        else if (!strcmp(fmt, "u")) t = DS_UTF8;
-        else {
+        if (strlen(fmt) != 1 || ds_fmt_to_type(fmt[0], &t) != 0) {
             dpc_set_err(p,
                 "dotnet.pipelinecomponent: input column '%s' has unsupported "
-                "Arrow format '%s' (Phase 1a: l, g, b, u)",
+                "Arrow format '%s' (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)",
                 c && c->name ? c->name : "?", fmt);
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -2044,6 +2167,14 @@ static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
             case DS_FLOAT64: c->format = "g"; break;
             case DS_BOOL:    c->format = "b"; break;
             case DS_UTF8:    c->format = "u"; break;
+            case DS_INT8:    c->format = "c"; break;
+            case DS_INT16:   c->format = "s"; break;
+            case DS_INT32:   c->format = "i"; break;
+            case DS_UINT8:   c->format = "C"; break;
+            case DS_UINT16:  c->format = "S"; break;
+            case DS_UINT32:  c->format = "I"; break;
+            case DS_UINT64:  c->format = "L"; break;
+            case DS_FLOAT32: c->format = "f"; break;
         }
         c->release = ds_release_schema_named;
         kids[i] = c;

@@ -155,6 +155,46 @@ static const char PL_HARDCODED[] =
     "        from: t\n"
     "        expect: 4\n";
 
+/* --- Phase 1b: narrow ints + float32 ---------------------------- */
+static const char PL_NARROW[] =
+    "betl: 1\n"
+    "name: dotnet-pc-narrow\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 3\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,    type: l }\n"
+    "          - { name: as_i8, type: c }\n"
+    "          - { name: as_i4, type: i }\n"
+    "          - { name: as_u4, type: I }\n"
+    "          - { name: as_r4, type: f }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                buffer.SetInt32(1, (int)id);\n"     /* widens through SetInt64 */
+    "                buffer.SetInt32(2, (int)id);\n"
+    "                buffer.SetInt32(3, (int)id);\n"
+    "                buffer.SetSingle(4, (float)id);\n"  /* widens through SetDouble */
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 3\n";
+
 /* --- SSIS-idiomatic: PreExecute + FindColumnByLineageID lookup -- */
 static const char PL_LINEAGE_LOOKUP[] =
     "betl: 1\n"
@@ -232,6 +272,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_LINEAGE_LOOKUP, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "lineage-lookup: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_NARROW, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "narrow: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

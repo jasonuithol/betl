@@ -103,6 +103,7 @@ internal static unsafe class PcDispatch
                     Name = name,
                     Type = ArrowFmtToCellType(fmt),
                     InputIndex = -1,
+                    InputFmt   = '?',
                 };
             }
             /* Pair input columns to outputs by name; assign matching
@@ -122,6 +123,7 @@ internal static unsafe class PcDispatch
                             Scale = inputs[i].Scale, CodePage = inputs[i].CodePage,
                         };
                         specs[j].InputIndex = i;
+                        specs[j].InputFmt   = (char)inputFmts[i];
                         break;
                     }
                 }
@@ -235,18 +237,30 @@ internal static unsafe class PcDispatch
         'g' => DataType.DT_R8,
         'b' => DataType.DT_BOOL,
         'u' => DataType.DT_WSTR,
+        'c' => DataType.DT_I1,
+        's' => DataType.DT_I2,
+        'i' => DataType.DT_I4,
+        'C' => DataType.DT_UI1,
+        'S' => DataType.DT_UI2,
+        'I' => DataType.DT_UI4,
+        'L' => DataType.DT_UI8,
+        'f' => DataType.DT_R4,
         _   => throw new BetlPipelineException(
                    $"dotnet.pipelinecomponent: unsupported Arrow format '{fmt}' "
-                   + "(Phase 1a: l, g, b, u)"),
+                   + "(Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)"),
     };
 
+    /* Narrow integer + float Arrow formats fold to the widened
+     * storage (CellType.Int64 / CellType.Float64). The DataType is
+     * preserved separately via ArrowFmtToDataType so the user can
+     * still inspect column metadata accurately. */
     private static CellType ArrowFmtToCellType(char fmt) => fmt switch
     {
-        'l' => CellType.Int64,
-        'g' => CellType.Float64,
-        'b' => CellType.Bool,
-        'u' => CellType.Utf8,
-        _   => throw new BetlPipelineException(
-                   $"dotnet.pipelinecomponent: unsupported Arrow format '{fmt}'"),
+        'l' or 'L' or 'i' or 'I' or 's' or 'S' or 'c' or 'C' => CellType.Int64,
+        'g' or 'f'                                           => CellType.Float64,
+        'b'                                                  => CellType.Bool,
+        'u'                                                  => CellType.Utf8,
+        _ => throw new BetlPipelineException(
+                $"dotnet.pipelinecomponent: unsupported Arrow format '{fmt}'"),
     };
 }

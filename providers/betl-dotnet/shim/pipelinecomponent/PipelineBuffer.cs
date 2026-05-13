@@ -86,6 +86,7 @@ internal sealed class BufferColumnSpec
     public string   Name = "";
     public CellType Type;
     public int      InputIndex = -1; /* -1 = no same-named input column */
+    public char     InputFmt   = '?'; /* Arrow format of the paired input column */
 }
 
 /* Internal staging row representation. Built once per batch from
@@ -138,86 +139,176 @@ internal sealed unsafe class BetlPipelineBuffer : PipelineBuffer
             int ic = cols[c].InputIndex;
             if (ic < 0) continue;
             ArrowArray* child = batch->Children[ic];
-            PopulateFromArrowChild(c, cols[c].Type, child);
+            PopulateFromArrowChild(c, cols[c].InputFmt, child);
         }
     }
 
-    private void PopulateFromArrowChild(int colIdx, CellType type, ArrowArray* child)
+    private void PopulateFromArrowChild(int colIdx, char inputFmt, ArrowArray* child)
     {
         long off  = child->Offset;
         long n    = child->Length;
         byte* validity = child->NullCount > 0 && child->Buffers[0] != null
             ? (byte*)child->Buffers[0] : null;
 
-        switch (type)
+        switch (inputFmt)
         {
-            case CellType.Int64:
-            {
-                long* vals = (long*)child->Buffers[1];
-                for (long r = 0; r < n; ++r)
-                {
-                    long ix = off + r;
-                    bool isNull = validity != null
-                        && ((validity[ix / 8] >> (int)(ix & 7)) & 1u) == 0;
-                    if (!isNull)
-                    {
-                        _rows[r].I64[colIdx] = vals[ix];
-                        _rows[r].IsNull[colIdx] = false;
-                    }
-                }
+            case 'l':
+                ReadWideInt(colIdx, (long*)child->Buffers[1], off, n, validity);
                 break;
+            case 'L':
+                /* uint64 storage is bit-identical to int64 here */
+                ReadWideInt(colIdx, (long*)child->Buffers[1], off, n, validity);
+                break;
+            case 'i':
+                ReadNarrowInt32(colIdx, (int*)child->Buffers[1], off, n, validity);
+                break;
+            case 'I':
+                ReadNarrowUInt32(colIdx, (uint*)child->Buffers[1], off, n, validity);
+                break;
+            case 's':
+                ReadNarrowInt16(colIdx, (short*)child->Buffers[1], off, n, validity);
+                break;
+            case 'S':
+                ReadNarrowUInt16(colIdx, (ushort*)child->Buffers[1], off, n, validity);
+                break;
+            case 'c':
+                ReadNarrowInt8(colIdx, (sbyte*)child->Buffers[1], off, n, validity);
+                break;
+            case 'C':
+                ReadNarrowUInt8(colIdx, (byte*)child->Buffers[1], off, n, validity);
+                break;
+            case 'g':
+                ReadWideFloat(colIdx, (double*)child->Buffers[1], off, n, validity);
+                break;
+            case 'f':
+                ReadNarrowFloat32(colIdx, (float*)child->Buffers[1], off, n, validity);
+                break;
+            case 'b':
+                ReadBoolBits(colIdx, (byte*)child->Buffers[1], off, n, validity);
+                break;
+            case 'u':
+                ReadUtf8(colIdx, (int*)child->Buffers[1], (byte*)child->Buffers[2],
+                         off, n, validity);
+                break;
+            default:
+                throw new BetlPipelineException(
+                    $"PipelineBuffer: unsupported input Arrow format '{inputFmt}' "
+                    + $"at column index {colIdx}");
+        }
+    }
+
+    private static bool IsNull(byte* validity, long ix) =>
+        validity != null && ((validity[ix / 8] >> (int)(ix & 7)) & 1u) == 0;
+
+    private void ReadWideInt(int colIdx, long* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
             }
-            case CellType.Float64:
-            {
-                double* vals = (double*)child->Buffers[1];
-                for (long r = 0; r < n; ++r)
-                {
-                    long ix = off + r;
-                    bool isNull = validity != null
-                        && ((validity[ix / 8] >> (int)(ix & 7)) & 1u) == 0;
-                    if (!isNull)
-                    {
-                        _rows[r].F64[colIdx] = vals[ix];
-                        _rows[r].IsNull[colIdx] = false;
-                    }
-                }
-                break;
+        }
+    }
+    private void ReadNarrowInt32(int colIdx, int* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
             }
-            case CellType.Bool:
-            {
-                byte* bits = (byte*)child->Buffers[1];
-                for (long r = 0; r < n; ++r)
-                {
-                    long ix = off + r;
-                    bool isNull = validity != null
-                        && ((validity[ix / 8] >> (int)(ix & 7)) & 1u) == 0;
-                    if (!isNull)
-                    {
-                        byte b = bits[ix / 8];
-                        _rows[r].Bool[colIdx] = ((b >> (int)(ix & 7)) & 1) != 0;
-                        _rows[r].IsNull[colIdx] = false;
-                    }
-                }
-                break;
+        }
+    }
+    private void ReadNarrowUInt32(int colIdx, uint* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
             }
-            case CellType.Utf8:
-            {
-                int*  offs = (int*) child->Buffers[1];
-                byte* data = (byte*)child->Buffers[2];
-                for (long r = 0; r < n; ++r)
-                {
-                    long ix = off + r;
-                    bool isNull = validity != null
-                        && ((validity[ix / 8] >> (int)(ix & 7)) & 1u) == 0;
-                    if (!isNull)
-                    {
-                        int s = offs[ix], e = offs[ix + 1];
-                        _rows[r].Utf8[colIdx] =
-                            System.Text.Encoding.UTF8.GetString(data + s, e - s);
-                        _rows[r].IsNull[colIdx] = false;
-                    }
-                }
-                break;
+        }
+    }
+    private void ReadNarrowInt16(int colIdx, short* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadNarrowUInt16(int colIdx, ushort* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadNarrowInt8(int colIdx, sbyte* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadNarrowUInt8(int colIdx, byte* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].I64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadWideFloat(int colIdx, double* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].F64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadNarrowFloat32(int colIdx, float* vals, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                _rows[r].F64[colIdx] = vals[ix];
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadBoolBits(int colIdx, byte* bits, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                byte b = bits[ix / 8];
+                _rows[r].Bool[colIdx] = ((b >> (int)(ix & 7)) & 1) != 0;
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
+    private void ReadUtf8(int colIdx, int* offs, byte* data, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                int s = offs[ix], e = offs[ix + 1];
+                _rows[r].Utf8[colIdx] = System.Text.Encoding.UTF8.GetString(data + s, e - s);
+                _rows[r].IsNull[colIdx] = false;
             }
         }
     }
