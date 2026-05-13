@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "3"
+#define BETL_DOTNET_SHIM_ABI_VERSION "4"
 
 
 /* ============================================================== *
@@ -1864,9 +1864,11 @@ typedef int (*dpc_register_emit_fn)(
     void (*commit_row) (void *));
 typedef int (*dpc_register_schema_fn)(
     const char **input_names,  const char *input_fmts,  int n_input,
-    const char **output_names, const char *output_fmts, int n_output);
+    const char **output_names, const char *output_fmts, int n_output,
+    int async);
 typedef int (*dpc_lifecycle0_fn)(void);
 typedef int (*dpc_process_batch_fn)(struct ArrowArray *batch, void *emit_ctx);
+typedef int (*dpc_post_execute_fn)(void *emit_ctx);
 
 typedef struct {
     BetlContext             *ctx;
@@ -1879,6 +1881,9 @@ typedef struct {
     DsCol                   *in_cols;
     size_t                   n_in;
 
+    /* Async (PrimeOutput-driven) vs sync (output_schema-populated). */
+    int                      async;
+
     /* dlopen / function pointers */
     char                    *so_path;
     void                    *handle;
@@ -1887,8 +1892,9 @@ typedef struct {
     dpc_register_schema_fn   register_schema_fn;
     dpc_lifecycle0_fn        pc_init_fn;
     dpc_lifecycle0_fn        pre_execute_fn;
+    dpc_lifecycle0_fn        prime_output_fn;
     dpc_process_batch_fn     process_batch_fn;
-    dpc_lifecycle0_fn        post_execute_fn;
+    dpc_post_execute_fn      post_execute_fn;
     dpc_lifecycle0_fn        cleanup_fn;
 
     struct ArrowArrayStream  input;
@@ -2074,12 +2080,13 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
     *(void **)&p->register_schema_fn = dlsym(p->handle, "betl_dotnet_pc_register_schema");
     *(void **)&p->pc_init_fn         = dlsym(p->handle, "betl_dotnet_pc_init");
     *(void **)&p->pre_execute_fn     = dlsym(p->handle, "betl_dotnet_pc_pre_execute");
+    *(void **)&p->prime_output_fn    = dlsym(p->handle, "betl_dotnet_pc_prime_output");
     *(void **)&p->process_batch_fn   = dlsym(p->handle, "betl_dotnet_pc_process_batch");
     *(void **)&p->post_execute_fn    = dlsym(p->handle, "betl_dotnet_pc_post_execute");
     *(void **)&p->cleanup_fn         = dlsym(p->handle, "betl_dotnet_pc_cleanup");
     if (!p->init_fn || !p->register_emit_fn || !p->register_schema_fn
-        || !p->pc_init_fn || !p->pre_execute_fn || !p->process_batch_fn
-        || !p->post_execute_fn || !p->cleanup_fn) {
+        || !p->pc_init_fn || !p->pre_execute_fn || !p->prime_output_fn
+        || !p->process_batch_fn || !p->post_execute_fn || !p->cleanup_fn) {
         dpc_set_err(p, "dotnet.pipelinecomponent: AOT'd .so is missing required entry points");
         return -1;
     }
@@ -2112,7 +2119,8 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
         out_fmts[i]  = p->out_cols[i].arrow_fmt;
     }
     int rs = p->register_schema_fn(in_names, in_fmts, (int)p->n_in,
-                                   out_names, out_fmts, (int)p->n_out);
+                                   out_names, out_fmts, (int)p->n_out,
+                                   p->async);
     free(in_names); free(out_names); free(in_fmts); free(out_fmts);
     if (rs != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: register_schema returned non-zero "
@@ -2125,6 +2133,14 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
     }
     if (p->pre_execute_fn() != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: PreExecute threw "
+                       "(see [ERROR] log above)");
+        return -1;
+    }
+    /* PrimeOutput is a no-op in sync mode (the shim early-returns)
+     * so we always call it — keeps the lifecycle ordering identical
+     * between modes. */
+    if (p->prime_output_fn() != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: PrimeOutput threw "
                        "(see [ERROR] log above)");
         return -1;
     }
@@ -2239,7 +2255,11 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         if (p->eof_seen) {
             if (!p->post_executed) {
                 p->post_executed = 1;
-                if (p->post_execute_fn() != 0) {
+                /* In async mode PostExecute may emit final rows into
+                 * the output buffer, which the shim flushes through
+                 * the same setter ABI using this emit_ctx. Sync mode
+                 * gets a no-op pass-through. */
+                if (p->post_execute_fn(&em) != 0) {
                     dpc_set_err(p, "dotnet.pipelinecomponent: PostExecute threw "
                                    "(see [ERROR] log above)");
                     return EIO;
@@ -2249,6 +2269,9 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
                                    "(see [ERROR] log above)");
                     return EIO;
                 }
+                /* PostExecute might have staged rows; if so, fall
+                 * through to flush_batch. Otherwise return EOF. */
+                if (p->out_staging[0].n > 0) break;
             }
             return 0;
         }
@@ -2301,6 +2324,16 @@ static int dotnet_pc_init(BetlContext *ctx, const char *cfg, void **state) {
             "Phase 1a is C# only", p->lang);
         free(p->source); free(p->lang); free(p);
         return BETL_ERR_UNSUPPORTED;
+    }
+    /* async: true|false  — toggles the SSIS sync/async transform model.
+     * Default sync. The JSON config value is a bareword from YAML so
+     * we accept "true" / "1" / "yes" as truthy. */
+    {
+        char *av = NULL;
+        const char *q = json_value_after(cfg, "async");
+        if (q && (*q == 't' || *q == 'T' || *q == '1' || *q == 'y' || *q == 'Y'))
+            p->async = 1;
+        (void)av;
     }
     if (dpc_parse_output_schema(p, cfg) != 0) {
         for (size_t i = 0; i < p->n_out; ++i) free(p->out_cols[i].name);

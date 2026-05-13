@@ -27,28 +27,33 @@ using Microsoft.SqlServer.Dts.Pipeline.Wrapper;
 
 namespace Microsoft.SqlServer.Dts.Pipeline;
 
+/* The base type has every accessor declared so SSIS-derived source
+ * compiles against it. Sync transforms use one concrete buffer with
+ * all of them; async transforms get two — an input view that only
+ * implements Get* / NextRow and an output view that only implements
+ * Set* / AddRow. Unsupported calls throw with a clear message. */
 public abstract class PipelineBuffer
 {
-    public abstract long  RowCount    { get; }
-    public abstract bool  EndOfRowset { get; }
-    public abstract int   ColumnCount { get; }
-    public abstract bool  NextRow();
+    public virtual long  RowCount    => throw NotSupported("RowCount");
+    public virtual bool  EndOfRowset => throw NotSupported("EndOfRowset");
+    public virtual int   ColumnCount => throw NotSupported("ColumnCount");
+    public virtual bool  NextRow()                  => throw NotSupported("NextRow");
+    public virtual void  AddRow()                   => throw NotSupported("AddRow");
+    public virtual void  SetEndOfRowset()           { }    /* tolerated as a hint */
 
-    public abstract bool  IsNull   (int columnIndex);
-    public abstract void  SetNull  (int columnIndex);
+    public virtual bool  IsNull   (int c)           => throw NotSupported("IsNull");
+    public virtual void  SetNull  (int c)           => throw NotSupported("SetNull");
 
-    public abstract long      GetInt64 (int columnIndex);
-    public abstract void      SetInt64 (int columnIndex, long value);
-    public abstract double    GetDouble(int columnIndex);
-    public abstract void      SetDouble(int columnIndex, double value);
-    public abstract bool      GetBoolean(int columnIndex);
-    public abstract void      SetBoolean(int columnIndex, bool value);
-    public abstract string    GetString(int columnIndex);
-    public abstract void      SetString(int columnIndex, string value);
+    public virtual long      GetInt64 (int c)               => throw NotSupported("GetInt64");
+    public virtual void      SetInt64 (int c, long v)       => throw NotSupported("SetInt64");
+    public virtual double    GetDouble(int c)               => throw NotSupported("GetDouble");
+    public virtual void      SetDouble(int c, double v)     => throw NotSupported("SetDouble");
+    public virtual bool      GetBoolean(int c)              => throw NotSupported("GetBoolean");
+    public virtual void      SetBoolean(int c, bool v)      => throw NotSupported("SetBoolean");
+    public virtual string    GetString(int c)               => throw NotSupported("GetString");
+    public virtual void      SetString(int c, string v)     => throw NotSupported("SetString");
 
-    /* SSIS API surface — alternative typed accessors that
-     * narrow/widen through the supported set. Implemented in terms
-     * of the abstract methods so subclasses only fill those in. */
+    /* Narrow accessors route through the widened ones. */
     public int    GetInt32 (int c) => (int)   GetInt64(c);
     public short  GetInt16 (int c) => (short) GetInt64(c);
     public sbyte  GetSByte (int c) => (sbyte) GetInt64(c);
@@ -65,10 +70,10 @@ public abstract class PipelineBuffer
     public void   SetByte  (int c, byte v)   => SetInt64(c, v);
     public void   SetSingle(int c, float v)  => SetDouble(c, v);
 
-    /* SetEndOfRowset is meaningful on output buffers in async
-     * transforms; in Phase 1a sync model it's a no-op the
-     * ProcessInput flush handles automatically. */
-    public virtual void SetEndOfRowset() { }
+    private static System.Exception NotSupported(string op) =>
+        new BetlPipelineException(
+            "PipelineBuffer: " + op + " is not supported in this buffer's mode "
+            + "(input vs output vs sync).");
 }
 
 /* ---- runtime impl ----------------------------------------------------- */
@@ -116,7 +121,10 @@ internal sealed class StagingRow
     }
 }
 
-internal sealed unsafe class BetlPipelineBuffer : PipelineBuffer
+/* Sync transform: a single buffer used for both reads and writes,
+ * indexed by output_schema. Same-named input columns pre-populate
+ * cells; user reads/writes via Get / Set; NextRow advances. */
+internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
 {
     private readonly BufferColumnSpec[] _cols;
     private readonly StagingRow[]       _rows;
@@ -126,7 +134,7 @@ internal sealed unsafe class BetlPipelineBuffer : PipelineBuffer
     public override bool EndOfRowset => _currentRow >= _rows.LongLength;
     public override int  ColumnCount => _cols.Length;
 
-    internal BetlPipelineBuffer(BufferColumnSpec[] cols, ArrowArray* batch)
+    internal BetlSyncPipelineBuffer(BufferColumnSpec[] cols, ArrowArray* batch)
     {
         _cols = cols;
         long n = batch->Length;
@@ -430,5 +438,228 @@ internal sealed unsafe class BetlPipelineBuffer : PipelineBuffer
             }
             Betl.Pipeline.PcDispatch.CommitRowFn(emitCtx);
         }
+    }
+}
+
+/* Async input view: read-only over an upstream Arrow batch.
+ * NextRow advances; Get / IsNull work; Set / AddRow throw. Indexing
+ * is by INPUT column position (the upstream Arrow batch's children),
+ * NOT by output_schema. */
+internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
+{
+    private readonly char[]   _fmts;
+    private readonly ArrowArray* _batch;
+    private long _currentRow = -1;
+    private readonly long _rowCount;
+
+    public override long RowCount    => _rowCount;
+    public override bool EndOfRowset => _currentRow >= _rowCount;
+    public override int  ColumnCount => _fmts.Length;
+
+    internal BetlInputPipelineBuffer(char[] fmts, ArrowArray* batch)
+    {
+        _fmts = fmts;
+        _batch = batch;
+        _rowCount = batch->Length;
+    }
+
+    public override bool NextRow()
+    {
+        _currentRow++;
+        return _currentRow < _rowCount;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private long CurIx(int colIdx)
+    {
+        if (_currentRow < 0 || _currentRow >= _rowCount)
+            throw new BetlPipelineException(
+                "PipelineBuffer: row cursor not positioned. Call NextRow() first.");
+        if (colIdx < 0 || colIdx >= _fmts.Length)
+            throw new BetlPipelineException(
+                $"PipelineBuffer: input column index out of range: {colIdx}");
+        ArrowArray* child = _batch->Children[colIdx];
+        return child->Offset + _currentRow;
+    }
+
+    private static bool IsBitZero(byte* validity, long ix) =>
+        validity != null && ((validity[ix / 8] >> (int)(ix & 7)) & 1u) == 0;
+
+    public override bool IsNull(int colIdx)
+    {
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        byte* validity = child->NullCount > 0 && child->Buffers[0] != null
+            ? (byte*)child->Buffers[0] : null;
+        return IsBitZero(validity, ix);
+    }
+
+    private void RequireFmt(int colIdx, params char[] accepted)
+    {
+        char f = _fmts[colIdx];
+        foreach (char a in accepted) if (f == a) return;
+        throw new BetlPipelineException(
+            $"PipelineBuffer: input column {colIdx} is '{f}', "
+            + $"not one of [{string.Join(",", accepted)}]");
+    }
+
+    public override long GetInt64(int colIdx)
+    {
+        RequireFmt(colIdx, 'l', 'L', 'i', 'I', 's', 'S', 'c', 'C');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        void* buf = child->Buffers[1];
+        return _fmts[colIdx] switch
+        {
+            'l' => ((long*)buf)[ix],
+            'L' => ((long*)buf)[ix],
+            'i' => ((int*)buf)[ix],
+            'I' => ((uint*)buf)[ix],
+            's' => ((short*)buf)[ix],
+            'S' => ((ushort*)buf)[ix],
+            'c' => ((sbyte*)buf)[ix],
+            'C' => ((byte*)buf)[ix],
+            _   => throw new BetlPipelineException("unreachable"),
+        };
+    }
+
+    public override double GetDouble(int colIdx)
+    {
+        RequireFmt(colIdx, 'g', 'f');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        void* buf = child->Buffers[1];
+        return _fmts[colIdx] == 'g' ? ((double*)buf)[ix] : ((float*)buf)[ix];
+    }
+
+    public override bool GetBoolean(int colIdx)
+    {
+        RequireFmt(colIdx, 'b');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        byte* bits = (byte*)child->Buffers[1];
+        return ((bits[ix / 8] >> (int)(ix & 7)) & 1) != 0;
+    }
+
+    public override string GetString(int colIdx)
+    {
+        RequireFmt(colIdx, 'u');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        int*  offs = (int*) child->Buffers[1];
+        byte* data = (byte*)child->Buffers[2];
+        int s = offs[ix], e = offs[ix + 1];
+        return System.Text.Encoding.UTF8.GetString(data + s, e - s);
+    }
+}
+
+/* Async output view: write-only sink. AddRow appends a new staging
+ * row (initially all-null); Set* writes to that row; FlushTo emits
+ * all staged rows through the host setters and clears for the next
+ * batch. Indexing is by OUTPUT column position. */
+internal sealed unsafe class BetlOutputPipelineBuffer : PipelineBuffer
+{
+    private readonly BufferColumnSpec[] _cols;
+    private readonly System.Collections.Generic.List<StagingRow> _rows = new();
+
+    public override int  ColumnCount => _cols.Length;
+    public override long RowCount    => _rows.Count;
+    public override bool EndOfRowset => false; /* output never EOFs from the user side */
+
+    internal BetlOutputPipelineBuffer(BufferColumnSpec[] cols) { _cols = cols; }
+
+    public override void AddRow() { _rows.Add(new StagingRow(_cols.Length)); }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private StagingRow Cur()
+    {
+        if (_rows.Count == 0)
+            throw new BetlPipelineException(
+                "PipelineBuffer: AddRow() must be called before Set*().");
+        return _rows[_rows.Count - 1];
+    }
+
+    private void RequireType(int colIdx, CellType expected)
+    {
+        if (colIdx < 0 || colIdx >= _cols.Length)
+            throw new BetlPipelineException(
+                $"PipelineBuffer: output column index out of range: {colIdx}");
+        if (_cols[colIdx].Type != expected)
+            throw new BetlPipelineException(
+                $"PipelineBuffer: output column {colIdx} ({_cols[colIdx].Name}) "
+                + $"is {_cols[colIdx].Type}, not {expected}");
+    }
+
+    public override void SetNull(int colIdx)
+    {
+        if (colIdx < 0 || colIdx >= _cols.Length)
+            throw new BetlPipelineException(
+                $"PipelineBuffer: output column index out of range: {colIdx}");
+        var r = Cur();
+        r.IsNull[colIdx] = true;
+    }
+    public override void SetInt64(int colIdx, long value)
+    {
+        RequireType(colIdx, CellType.Int64);
+        var r = Cur();
+        r.I64[colIdx] = value;
+        r.IsNull[colIdx] = false;
+    }
+    public override void SetDouble(int colIdx, double value)
+    {
+        RequireType(colIdx, CellType.Float64);
+        var r = Cur();
+        r.F64[colIdx] = value;
+        r.IsNull[colIdx] = false;
+    }
+    public override void SetBoolean(int colIdx, bool value)
+    {
+        RequireType(colIdx, CellType.Bool);
+        var r = Cur();
+        r.Bool[colIdx] = value;
+        r.IsNull[colIdx] = false;
+    }
+    public override void SetString(int colIdx, string value)
+    {
+        RequireType(colIdx, CellType.Utf8);
+        var r = Cur();
+        r.Utf8[colIdx] = value ?? "";
+        r.IsNull[colIdx] = false;
+    }
+
+    /* Flush staged rows to the host via the same setter ABI sync
+     * mode uses; clear the staging for the next batch. */
+    internal void FlushTo(IntPtr emitCtx)
+    {
+        for (int r = 0; r < _rows.Count; ++r)
+        {
+            var row = _rows[r];
+            for (int c = 0; c < _cols.Length; ++c)
+            {
+                if (row.IsNull[c])
+                {
+                    Betl.Pipeline.PcDispatch.SetNullFn(emitCtx, c);
+                    continue;
+                }
+                switch (_cols[c].Type)
+                {
+                    case CellType.Int64:
+                        Betl.Pipeline.PcDispatch.SetInt64Fn(emitCtx, c, row.I64[c]); break;
+                    case CellType.Float64:
+                        Betl.Pipeline.PcDispatch.SetFloat64Fn(emitCtx, c, row.F64[c]); break;
+                    case CellType.Bool:
+                        Betl.Pipeline.PcDispatch.SetBoolFn(emitCtx, c, (byte)(row.Bool[c] ? 1 : 0)); break;
+                    case CellType.Utf8:
+                    {
+                        var bytes = System.Text.Encoding.UTF8.GetBytes(row.Utf8[c] ?? "");
+                        fixed (byte* p = bytes)
+                            Betl.Pipeline.PcDispatch.SetUtf8Fn(emitCtx, c, p, bytes.Length);
+                        break;
+                    }
+                }
+            }
+            Betl.Pipeline.PcDispatch.CommitRowFn(emitCtx);
+        }
+        _rows.Clear();
     }
 }

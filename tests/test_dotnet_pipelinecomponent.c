@@ -243,6 +243,92 @@ static const char PL_LINEAGE_LOOKUP[] =
     "        from: t\n"
     "        expect: 5\n";
 
+/* --- Phase 1c: async filter (N input rows → M output rows) ----- */
+static const char PL_ASYNC_FILTER[] =
+    "betl: 1\n"
+    "name: dotnet-pc-async-filter\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 6\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        async: true\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            PipelineBuffer? outBuf;\n"
+    "            public override void PrimeOutput(int outputs, int[] outputIDs, PipelineBuffer[] buffers) {\n"
+    "              outBuf = buffers[0];\n"
+    "            }\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                if ((id & 1) == 0) {\n"
+    "                  outBuf!.AddRow();\n"
+    "                  outBuf.SetInt64(0, id);\n"
+    "                }\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 3\n";
+
+/* --- Phase 1c: async aggregator (N rows → 1 summary at PostExecute) -- */
+static const char PL_ASYNC_AGGREGATE[] =
+    "betl: 1\n"
+    "name: dotnet-pc-async-aggregate\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 5\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        async: true\n"
+    "        output_schema:\n"
+    "          - { name: total, type: l }\n"
+    "          - { name: count, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            PipelineBuffer? outBuf;\n"
+    "            long sum = 0; long count = 0;\n"
+    "            public override void PrimeOutput(int outputs, int[] outputIDs, PipelineBuffer[] buffers) {\n"
+    "              outBuf = buffers[0];\n"
+    "            }\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                sum += buffer.GetInt64(0);\n"
+    "                count++;\n"
+    "              }\n"
+    "            }\n"
+    "            public override void PostExecute() {\n"
+    "              outBuf!.AddRow();\n"
+    "              outBuf.SetInt64(0, sum);\n"
+    "              outBuf.SetInt64(1, count);\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 1\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -277,6 +363,16 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_NARROW, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "narrow: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_ASYNC_FILTER, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "async-filter: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_ASYNC_AGGREGATE, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "async-aggregate: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

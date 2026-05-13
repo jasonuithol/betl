@@ -5,19 +5,27 @@
  * with the existing script dispatch.
  *
  * The C provider:
- *   1. Calls betl_dotnet_init (registers Log/Param/Connection
- *      bridges into Betl.Bridges) — same as for dotnet.script.
- *   2. Calls betl_dotnet_pc_register_emit to install the per-cell
- *      output setters + commit_row callback.
- *   3. Calls betl_dotnet_pc_register_schema once with the input
- *      and output schema descriptors. Builds metadata + column
- *      specs.
- *   4. Calls betl_dotnet_pc_init to construct the UserComponent.
- *   5. Calls betl_dotnet_pc_pre_execute.
- *   6. For each batch: betl_dotnet_pc_process_batch(arrowArray*,
- *      emit_ctx).
- *   7. betl_dotnet_pc_post_execute + betl_dotnet_pc_cleanup at
- *      end-of-stream. */
+ *   1. betl_dotnet_init — register Log/Param/Connection bridges.
+ *   2. betl_dotnet_pc_register_emit — host setters.
+ *   3. betl_dotnet_pc_register_schema(..., async) — schema + mode.
+ *   4. betl_dotnet_pc_init — construct UserComponent.
+ *   5. betl_dotnet_pc_pre_execute.
+ *   6. betl_dotnet_pc_prime_output — async mode only; passes the
+ *      long-lived output buffer to user.PrimeOutput so the user
+ *      can stash it for AddRow / Set* calls during ProcessInput.
+ *   7. Per batch: betl_dotnet_pc_process_batch(arrowArray*,emit_ctx).
+ *   8. betl_dotnet_pc_post_execute + cleanup at end-of-stream.
+ *
+ * Sync vs async branch:
+ *   - Sync: ProcessBatch constructs a BetlSyncPipelineBuffer over
+ *     the input batch (output_schema column space, pre-populated
+ *     from same-named input cols), passes to ProcessInput, flushes.
+ *     PrimeOutput is not driven.
+ *   - Async: PrimeOutput delivers a long-lived BetlOutputPipeline-
+ *     Buffer. ProcessBatch constructs a fresh BetlInputPipeline-
+ *     Buffer over each input batch and passes that to ProcessInput.
+ *     After the call, the OutputBuffer's staged rows are flushed.
+ *     PostExecute can emit final rows; those are flushed too. */
 
 using System;
 using System.Collections.Generic;
@@ -35,11 +43,15 @@ internal static unsafe class PcDispatch
     /* Singleton user-component instance. */
     internal static PipelineComponent? Component;
 
-    /* Schema state (filled at register_schema, used to construct
-     * the PipelineBuffer for each batch). */
+    /* Schema state (filled at register_schema). */
     internal static BufferColumnSpec[] OutputCols = Array.Empty<BufferColumnSpec>();
+    internal static char[]             InputFmts  = Array.Empty<char>();
+    internal static bool               Async      = false;
     internal static BetlComponentMetaData Metadata = new();
     internal static BetlBufferManager     BufManager = new();
+
+    /* Long-lived output buffer for async mode. Null in sync. */
+    internal static BetlOutputPipelineBuffer? OutputBuffer;
 
     /* Host-supplied output setters (same shape as script's). */
     internal static delegate* unmanaged<IntPtr, int, long,            void> SetInt64Fn;
@@ -71,22 +83,35 @@ internal static unsafe class PcDispatch
 
     /* Schema descriptors are passed as parallel arrays of
      * NUL-terminated C strings: names and one-char Arrow format
-     * codes ('l', 'g', 'b', 'u'). The host owns the buffers; we
-     * copy into managed strings immediately. */
+     * codes. `async` (0/1) controls sync vs async wiring:
+     *   - sync (0): input cols pair to outputs by name with matching
+     *     lineage IDs; input.Buffer = output.Buffer = 0 so BufferManager
+     *     lookups translate identically in either column space.
+     *   - async (1): input and output have independent lineage IDs
+     *     (0..n_in-1 vs 0..n_out-1) and different buffer IDs (0 vs 1). */
     [UnmanagedCallersOnly(EntryPoint = "betl_dotnet_pc_register_schema")]
     public static int RegisterSchema(
         byte** inputNames,  byte* inputFmts,  int nInput,
-        byte** outputNames, byte* outputFmts, int nOutput)
+        byte** outputNames, byte* outputFmts, int nOutput,
+        int async)
     {
         try
         {
+            bool isAsync = async != 0;
+            Async = isAsync;
+
+            var inFmts = new char[nInput];
+            for (int i = 0; i < nInput; ++i) inFmts[i] = (char)inputFmts[i];
+            InputFmts = inFmts;
+
             var inputs  = new List<BetlInputColumn>(nInput);
             for (int i = 0; i < nInput; ++i)
             {
                 var name = CStr(inputNames[i]);
                 inputs.Add(new BetlInputColumn {
-                    ID = i, Name = name, LineageID = -1,    /* unset until paired below */
-                    DataType = ArrowFmtToDataType((char)inputFmts[i]),
+                    ID = i, Name = name,
+                    LineageID = isAsync ? i : -1, /* async: identity; sync: paired below */
+                    DataType  = ArrowFmtToDataType(inFmts[i]),
                 });
             }
             var outputs = new List<BetlOutputColumn>(nOutput);
@@ -106,36 +131,43 @@ internal static unsafe class PcDispatch
                     InputFmt   = '?',
                 };
             }
-            /* Pair input columns to outputs by name; assign matching
-             * lineage IDs so user lookups by input lineageID hit
-             * the same buffer index as output lookups. */
-            for (int i = 0; i < nInput; ++i)
+
+            if (!isAsync)
             {
-                for (int j = 0; j < nOutput; ++j)
+                /* Sync: pair input cols to same-named outputs so
+                 * the unified column space (output_schema) gets
+                 * pre-populated, and input lineage IDs align with
+                 * output positions. */
+                for (int i = 0; i < nInput; ++i)
                 {
-                    if (inputs[i].Name == outputs[j].Name)
+                    for (int j = 0; j < nOutput; ++j)
                     {
-                        /* Mutate via init-set proxy: re-create with paired LineageID. */
-                        inputs[i] = new BetlInputColumn {
-                            ID = inputs[i].ID, Name = inputs[i].Name,
-                            LineageID = j, DataType = inputs[i].DataType,
-                            Length = inputs[i].Length, Precision = inputs[i].Precision,
-                            Scale = inputs[i].Scale, CodePage = inputs[i].CodePage,
-                        };
-                        specs[j].InputIndex = i;
-                        specs[j].InputFmt   = (char)inputFmts[i];
-                        break;
+                        if (inputs[i].Name == outputs[j].Name)
+                        {
+                            inputs[i] = new BetlInputColumn {
+                                ID = inputs[i].ID, Name = inputs[i].Name,
+                                LineageID = j, DataType = inputs[i].DataType,
+                                Length = inputs[i].Length, Precision = inputs[i].Precision,
+                                Scale = inputs[i].Scale, CodePage = inputs[i].CodePage,
+                            };
+                            specs[j].InputIndex = i;
+                            specs[j].InputFmt   = inFmts[i];
+                            break;
+                        }
                     }
                 }
             }
 
+            int inputBufferID  = 0;
+            int outputBufferID = isAsync ? 1 : 0;
+
             var inputColl  = new BetlInputColumnCollection(inputs);
             var outputColl = new BetlOutputColumnCollection(outputs);
-            var inputObj   = new BetlInput  { ID = 0, Buffer = 0,
+            var inputObj   = new BetlInput  { ID = 0, Buffer = inputBufferID,
                                               InputColumnCollection  = inputColl };
-            var outputObj  = new BetlOutput { ID = 0, Buffer = 0,
+            var outputObj  = new BetlOutput { ID = 0, Buffer = outputBufferID,
                                               OutputColumnCollection = outputColl,
-                                              SynchronousInputID = 0 };
+                                              SynchronousInputID = isAsync ? 0 : 1 };
             Metadata = new BetlComponentMetaData {
                 InputCollection  = new BetlInputCollection (new List<BetlInput> { inputObj }),
                 OutputCollection = new BetlOutputCollection(new List<BetlOutput> { outputObj }),
@@ -158,6 +190,8 @@ internal static unsafe class PcDispatch
             Component = new UserComponent();
             Component.ComponentMetaData = Metadata;
             Component.BufferManager     = BufManager;
+            if (Async)
+                OutputBuffer = new BetlOutputPipelineBuffer(OutputCols);
             return 0;
         }
         catch (Exception ex)
@@ -179,15 +213,44 @@ internal static unsafe class PcDispatch
         }
     }
 
+    [UnmanagedCallersOnly(EntryPoint = "betl_dotnet_pc_prime_output")]
+    public static int PrimeOutput()
+    {
+        if (Component == null) return 1;
+        if (!Async || OutputBuffer == null) return 0;     /* sync: no-op */
+        try
+        {
+            /* SSIS convention: outputIDs[] is the output ID list,
+             * buffers[] is the matching PipelineBuffer list. We
+             * pass [outputID=0] and [OutputBuffer]. */
+            Component.PrimeOutput(1, new int[] { 0 }, new PipelineBuffer[] { OutputBuffer });
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            try { Betl.Log.Error("PrimeOutput threw: " + ex); } catch { }
+            return 1;
+        }
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "betl_dotnet_pc_process_batch")]
     public static int ProcessBatch(ArrowArray* batch, IntPtr emitCtx)
     {
         if (Component == null) return 1;
         try
         {
-            var buffer = new BetlPipelineBuffer(OutputCols, batch);
-            Component.ProcessInput(0, buffer);
-            buffer.FlushTo(emitCtx);
+            if (Async)
+            {
+                var inputBuf = new BetlInputPipelineBuffer(InputFmts, batch);
+                Component.ProcessInput(0, inputBuf);
+                OutputBuffer?.FlushTo(emitCtx);
+            }
+            else
+            {
+                var buffer = new BetlSyncPipelineBuffer(OutputCols, batch);
+                Component.ProcessInput(0, buffer);
+                buffer.FlushTo(emitCtx);
+            }
             return 0;
         }
         catch (Exception ex)
@@ -197,11 +260,21 @@ internal static unsafe class PcDispatch
         }
     }
 
+    /* In async mode, PostExecute may add final rows to the output
+     * buffer; those need to be flushed via the emit_ctx the host
+     * supplies on this call. The C side passes the same DsEmitter
+     * pointer it would for process_batch. */
     [UnmanagedCallersOnly(EntryPoint = "betl_dotnet_pc_post_execute")]
-    public static int PostExecute()
+    public static int PostExecute(IntPtr emitCtx)
     {
         if (Component == null) return 1;
-        try { Component.PostExecute(); return 0; }
+        try
+        {
+            Component.PostExecute();
+            if (Async && OutputBuffer != null && emitCtx != IntPtr.Zero)
+                OutputBuffer.FlushTo(emitCtx);
+            return 0;
+        }
         catch (Exception ex)
         {
             try { Betl.Log.Error("PostExecute threw: " + ex); } catch { }
