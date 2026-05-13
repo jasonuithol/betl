@@ -327,6 +327,7 @@ internal static unsafe class PcDispatch
         'T' => DataType.DT_DBTIMESTAMP2,
         'M' => DataType.DT_DBTIME2,
         'z' => DataType.DT_BYTES,
+        'G' => DataType.DT_GUID,
         _   => throw new BetlPipelineException(
                    $"dotnet.pipelinecomponent: unsupported format '{fmt}'"),
     };
@@ -341,7 +342,7 @@ internal static unsafe class PcDispatch
         'g' or 'f'                                           => CellType.Float64,
         'b'                                                  => CellType.Bool,
         'u'                                                  => CellType.Utf8,
-        'z'                                                  => CellType.Binary,
+        'z' or 'G'                                           => CellType.Binary,
         _ => throw new BetlPipelineException(
                 $"dotnet.pipelinecomponent: unsupported format '{fmt}'"),
     };

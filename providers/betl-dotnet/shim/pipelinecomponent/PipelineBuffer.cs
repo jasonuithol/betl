@@ -64,6 +64,8 @@ public abstract class PipelineBuffer
     public virtual void      SetBytes(int c, byte[] v)      => throw NotSupported("SetBytes");
     public virtual System.DateTime GetDate(int c)           => throw NotSupported("GetDate");
     public virtual void      SetDate(int c, System.DateTime v) => throw NotSupported("SetDate");
+    public virtual System.Guid GetGuid(int c)               => throw NotSupported("GetGuid");
+    public virtual void      SetGuid(int c, System.Guid v)  => throw NotSupported("SetGuid");
 
     /* Narrow accessors route through the widened ones. */
     public int    GetInt32 (int c) => (int)   GetInt64(c);
@@ -231,6 +233,12 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
                 ReadBinary(colIdx, (int*)child->Buffers[1], (byte*)child->Buffers[2],
                            off, n, validity);
                 break;
+            case 'G':
+                /* Fixed-size 16-byte binary (UNIQUEIDENTIFIER). Arrow's
+                 * "w:16" leaf has two buffers: validity + data; data is
+                 * 16 bytes per row, indexed by row * 16. */
+                ReadGuid(colIdx, (byte*)child->Buffers[1], off, n, validity);
+                break;
             default:
                 throw new BetlPipelineException(
                     $"PipelineBuffer: unsupported input Arrow format '{inputFmt}' "
@@ -368,6 +376,19 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
             }
         }
     }
+    private void ReadGuid(int colIdx, byte* data, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                byte[] buf = new byte[16];
+                System.Runtime.InteropServices.Marshal.Copy(
+                    (System.IntPtr)(data + ix * 16), buf, 0, 16);
+                _rows[r].Bytes[colIdx] = buf;
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
 
     public override bool NextRow()
     {
@@ -470,6 +491,22 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
         RequireType(columnIndex, CellType.Binary);
         var r = Cur();
         r.Bytes[columnIndex] = value ?? System.Array.Empty<byte>();
+        r.IsNull[columnIndex] = false;
+    }
+    public override System.Guid GetGuid(int columnIndex)
+    {
+        RequireType(columnIndex, CellType.Binary);
+        var b = Cur().Bytes[columnIndex];
+        if (b == null || b.Length != 16)
+            throw new BetlPipelineException(
+                $"PipelineBuffer.GetGuid: column {columnIndex} is not a 16-byte GUID");
+        return new System.Guid(b);
+    }
+    public override void SetGuid(int columnIndex, System.Guid value)
+    {
+        RequireType(columnIndex, CellType.Binary);
+        var r = Cur();
+        r.Bytes[columnIndex] = value.ToByteArray();
         r.IsNull[columnIndex] = false;
     }
     /* Date / timestamp cells store an integer:
@@ -694,6 +731,17 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
             (System.IntPtr)(data + s), buf, 0, ln);
         return buf;
     }
+    public override System.Guid GetGuid(int colIdx)
+    {
+        RequireFmt(colIdx, 'G');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        byte* data = (byte*)child->Buffers[1];
+        byte[] buf = new byte[16];
+        System.Runtime.InteropServices.Marshal.Copy(
+            (System.IntPtr)(data + ix * 16), buf, 0, 16);
+        return new System.Guid(buf);
+    }
 
     public override System.DateTime GetDate(int colIdx)
     {
@@ -784,6 +832,13 @@ internal sealed unsafe class BetlOutputPipelineBuffer : PipelineBuffer
         RequireType(colIdx, CellType.Binary);
         var r = Cur();
         r.Bytes[colIdx] = value ?? System.Array.Empty<byte>();
+        r.IsNull[colIdx] = false;
+    }
+    public override void SetGuid(int colIdx, System.Guid value)
+    {
+        RequireType(colIdx, CellType.Binary);
+        var r = Cur();
+        r.Bytes[colIdx] = value.ToByteArray();
         r.IsNull[colIdx] = false;
     }
     public override void SetDate(int colIdx, System.DateTime value)

@@ -461,6 +461,40 @@ static const char PL_TEMPORAL_BINARY[] =
     "        from: t\n"
     "        expect: 3\n";
 
+/* --- Phase 1b.3: GUID (UNIQUEIDENTIFIER) round-trip ----------- */
+static const char PL_GUID[] =
+    "betl: 1\n"
+    "name: dotnet-pc-guid\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,  type: l }\n"
+    "          - { name: gid, type: G }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                buffer.SetGuid(1, System.Guid.NewGuid());\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 2\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -520,6 +554,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_TEMPORAL_BINARY, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "temporal-binary: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_GUID, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "guid: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

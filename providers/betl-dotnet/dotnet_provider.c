@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "6"
+#define BETL_DOTNET_SHIM_ABI_VERSION "7"
 
 
 /* ============================================================== *
@@ -866,6 +866,12 @@ typedef enum {
     DS_TIMESTAMP_US,
     DS_TIME_US,
     DS_BINARY,
+    /* Phase 1b.3 — fixed-size 16-byte binary (UNIQUEIDENTIFIER / Guid).
+     * Storage: 16 bytes per row stored contiguously in u8_data; offsets
+     * are unused (every row is exactly 16 bytes). At finalize we hand
+     * a single 16*n byte buffer to Arrow (no offsets). Internal char
+     * 'G' ⇄ "w:16". */
+    DS_GUID,
 } DsType;
 
 typedef struct {
@@ -897,6 +903,7 @@ static int ds_fmt_to_type(char fmt, DsType *out) {
         case 'T': *out = DS_TIMESTAMP_US;return 0;
         case 'M': *out = DS_TIME_US;     return 0;
         case 'z': *out = DS_BINARY;      return 0;
+        case 'G': *out = DS_GUID;        return 0;
         default:  *out = DS_INT64;       return -1;
     }
 }
@@ -919,6 +926,7 @@ static char ds_type_to_fmt(DsType t) {
         case DS_TIMESTAMP_US: return 'T';
         case DS_TIME_US:      return 'M';
         case DS_BINARY:       return 'z';
+        case DS_GUID:         return 'G';
     }
     return '?';
 }
@@ -933,6 +941,7 @@ static int ds_arrow_fmt_str_to_char(const char *fmt, char *out) {
     if (strcmp(fmt, "tdD") == 0)          { *out = 'D'; return 0; }
     if (strncmp(fmt, "tsu:", 4) == 0)     { *out = 'T'; return 0; }
     if (strncmp(fmt, "ttu:", 4) == 0)     { *out = 'M'; return 0; }
+    if (strcmp(fmt, "w:16") == 0)         { *out = 'G'; return 0; }
     return -1;
 }
 
@@ -956,6 +965,7 @@ static const char *ds_type_to_arrow_fmt_str(DsType t) {
         case DS_TIMESTAMP_US: return "tsu:";    /* no timezone */
         case DS_TIME_US:      return "ttu:";
         case DS_BINARY:       return "z";
+        case DS_GUID:         return "w:16";    /* fixed-size 16-byte */
     }
     return "?";
 }
@@ -972,7 +982,7 @@ static int ds_type_is_f64_stored(DsType t) {
 }
 /* Does this type use the u8_offsets + u8_data storage? */
 static int ds_type_is_bytes_stored(DsType t) {
-    return t == DS_UTF8 || t == DS_BINARY;
+    return t == DS_UTF8 || t == DS_BINARY || t == DS_GUID;
 }
 
 /* Per-output-column growable staging — populated by Emit setter
@@ -1117,12 +1127,11 @@ static int parse_output_schema(DotnetScript *s, const char *cfg) {
         DsType t;
         if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0
             || t == DS_DATE32 || t == DS_TIMESTAMP_US
-            || t == DS_TIME_US || t == DS_BINARY) {
+            || t == DS_TIME_US || t == DS_BINARY || t == DS_GUID) {
             ds_set_err(s, "dotnet.script: output column '%s' type '%s' "
                           "not supported (Phase 1b script types: "
-                          "l/g/b/u + c/C/s/S/i/I/L/f). Temporal and "
-                          "binary types are dotnet.pipelinecomponent-only "
-                          "in Phase 1b.2.",
+                          "l/g/b/u + c/C/s/S/i/I/L/f). Temporal, binary, "
+                          "and GUID types are dotnet.pipelinecomponent-only.",
                        name, type);
             free(name); free(type); return -1;
         }
@@ -1167,10 +1176,10 @@ static int cache_input_schema(DotnetScript *s) {
         if (ds_arrow_fmt_str_to_char(fmt, &fmt_ch) != 0
             || ds_fmt_to_type(fmt_ch, &t) != 0
             || t == DS_DATE32 || t == DS_TIMESTAMP_US
-            || t == DS_TIME_US || t == DS_BINARY) {
+            || t == DS_TIME_US || t == DS_BINARY || t == DS_GUID) {
             ds_set_err(s, "dotnet.script: input column '%s' has unsupported "
-                          "Arrow format '%s' (temporal / binary types are "
-                          "dotnet.pipelinecomponent-only in Phase 1b.2)",
+                          "Arrow format '%s' (temporal / binary / GUID types "
+                          "are dotnet.pipelinecomponent-only)",
                        c && c->name ? c->name : "?", fmt);
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -1240,6 +1249,7 @@ static const char *ds_cs_type(DsType t) {
         case DS_TIMESTAMP_US: return "long?";
         case DS_TIME_US:      return "long?";
         case DS_BINARY:       return "byte[]?";
+        case DS_GUID:         return "byte[]?";     /* 16-byte */
     }
     return "object?";
 }
@@ -1262,6 +1272,7 @@ static const char *ds_cs_buffer_ptr_type(DsType t) {
         case DS_TIMESTAMP_US: return "long";
         case DS_TIME_US:      return "long";
         case DS_BINARY:       return "byte"; /* not reachable */
+        case DS_GUID:         return "byte";
         default:              return "byte";
     }
 }
@@ -1712,6 +1723,20 @@ static int ds_finalize_col(DsOutCol *c, struct ArrowArray *out) {
         const void **bufs = malloc(2 * sizeof *bufs);
         if (!bufs) { free(vmap); free(bm); return -1; }
         bufs[0] = vmap; bufs[1] = bm;
+        out->length = (int64_t)n; out->null_count = null_count;
+        out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
+        return 0;
+    }
+    if (c->type == DS_GUID) {
+        /* Fixed-size 16-byte binary: hand u8_data (size 16*n) to Arrow
+         * as buffers[1]. No offsets — every row is exactly 16 bytes,
+         * so the consumer indexes by row * 16. */
+        free(c->u8_offsets); c->u8_offsets = NULL;
+        char *data = c->u8_data; c->u8_data = NULL;
+        if (!data) { data = malloc(1); if (!data) { free(vmap); return -1; } }
+        const void **bufs = malloc(2 * sizeof *bufs);
+        if (!bufs) { free(vmap); free(data); return -1; }
+        bufs[0] = vmap; bufs[1] = data;
         out->length = (int64_t)n; out->null_count = null_count;
         out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
         return 0;
