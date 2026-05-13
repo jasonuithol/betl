@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "7"
+#define BETL_DOTNET_SHIM_ABI_VERSION "8"
 
 
 /* ============================================================== *
@@ -872,12 +872,20 @@ typedef enum {
      * a single 16*n byte buffer to Arrow (no offsets). Internal char
      * 'G' ⇄ "w:16". */
     DS_GUID,
+    /* Phase 1b.4 — decimal128 (DT_NUMERIC). Storage: 16 bytes per row
+     * (little-endian two's-complement 128-bit mantissa). Same physical
+     * layout as DS_GUID (no offsets array). Scale varies per column
+     * and lives in DsCol.scale; precision is always 38. Internal char
+     * 'E' ⇄ "d:38,<scale>". C# side: System.Decimal accessor (precision
+     * loss when values exceed Decimal's 28-digit / 96-bit limit). */
+    DS_DECIMAL128,
 } DsType;
 
 typedef struct {
     char  *name;
     DsType type;
-    char   arrow_fmt;     /* 'l' / 'g' / 'b' / 'u' / 'c' / 'C' / 's' / 'S' / 'i' / 'I' / 'L' / 'f' */
+    char   arrow_fmt;     /* betl-internal char; see ds_fmt_to_type for the set */
+    int8_t scale;         /* decimal128 only — number of fractional digits */
 } DsCol;
 
 /* Map a betl-internal format char to a DsType. Returns 0 + sets out,
@@ -904,6 +912,7 @@ static int ds_fmt_to_type(char fmt, DsType *out) {
         case 'M': *out = DS_TIME_US;     return 0;
         case 'z': *out = DS_BINARY;      return 0;
         case 'G': *out = DS_GUID;        return 0;
+        case 'E': *out = DS_DECIMAL128;  return 0;
         default:  *out = DS_INT64;       return -1;
     }
 }
@@ -927,6 +936,7 @@ static char ds_type_to_fmt(DsType t) {
         case DS_TIME_US:      return 'M';
         case DS_BINARY:       return 'z';
         case DS_GUID:         return 'G';
+        case DS_DECIMAL128:   return 'E';
     }
     return '?';
 }
@@ -942,6 +952,7 @@ static int ds_arrow_fmt_str_to_char(const char *fmt, char *out) {
     if (strncmp(fmt, "tsu:", 4) == 0)     { *out = 'T'; return 0; }
     if (strncmp(fmt, "ttu:", 4) == 0)     { *out = 'M'; return 0; }
     if (strcmp(fmt, "w:16") == 0)         { *out = 'G'; return 0; }
+    if (fmt[0] == 'd' && fmt[1] == ':')   { *out = 'E'; return 0; }   /* decimal */
     return -1;
 }
 
@@ -966,6 +977,7 @@ static const char *ds_type_to_arrow_fmt_str(DsType t) {
         case DS_TIME_US:      return "ttu:";
         case DS_BINARY:       return "z";
         case DS_GUID:         return "w:16";    /* fixed-size 16-byte */
+        case DS_DECIMAL128:   return "d:38,0";  /* fallback if no col context; per-col impl uses scale */
     }
     return "?";
 }
@@ -982,7 +994,24 @@ static int ds_type_is_f64_stored(DsType t) {
 }
 /* Does this type use the u8_offsets + u8_data storage? */
 static int ds_type_is_bytes_stored(DsType t) {
-    return t == DS_UTF8 || t == DS_BINARY || t == DS_GUID;
+    return t == DS_UTF8 || t == DS_BINARY || t == DS_GUID || t == DS_DECIMAL128;
+}
+/* Is this a fixed-size 16-byte type (GUID or decimal128)? Both share
+ * the same Arrow leaf shape: validity + raw 16-byte data, no offsets. */
+static int ds_type_is_fixed16(DsType t) {
+    return t == DS_GUID || t == DS_DECIMAL128;
+}
+
+/* Parse the scale from an Arrow decimal format string "d:p,s" (or
+ * "d:p,s,128"). Returns 0 on success. */
+static int ds_parse_decimal_scale(const char *fmt, int8_t *scale) {
+    if (!fmt || fmt[0] != 'd' || fmt[1] != ':') return -1;
+    const char *comma = strchr(fmt + 2, ',');
+    if (!comma) return -1;
+    int v = atoi(comma + 1);
+    if (v < 0 || v > 38) return -1;
+    *scale = (int8_t)v;
+    return 0;
 }
 
 /* Per-output-column growable staging — populated by Emit setter
@@ -1127,11 +1156,12 @@ static int parse_output_schema(DotnetScript *s, const char *cfg) {
         DsType t;
         if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0
             || t == DS_DATE32 || t == DS_TIMESTAMP_US
-            || t == DS_TIME_US || t == DS_BINARY || t == DS_GUID) {
+            || t == DS_TIME_US || t == DS_BINARY || t == DS_GUID
+            || t == DS_DECIMAL128) {
             ds_set_err(s, "dotnet.script: output column '%s' type '%s' "
                           "not supported (Phase 1b script types: "
                           "l/g/b/u + c/C/s/S/i/I/L/f). Temporal, binary, "
-                          "and GUID types are dotnet.pipelinecomponent-only.",
+                          "GUID, and decimal are dotnet.pipelinecomponent-only.",
                        name, type);
             free(name); free(type); return -1;
         }
@@ -1176,10 +1206,11 @@ static int cache_input_schema(DotnetScript *s) {
         if (ds_arrow_fmt_str_to_char(fmt, &fmt_ch) != 0
             || ds_fmt_to_type(fmt_ch, &t) != 0
             || t == DS_DATE32 || t == DS_TIMESTAMP_US
-            || t == DS_TIME_US || t == DS_BINARY || t == DS_GUID) {
+            || t == DS_TIME_US || t == DS_BINARY || t == DS_GUID
+            || t == DS_DECIMAL128) {
             ds_set_err(s, "dotnet.script: input column '%s' has unsupported "
-                          "Arrow format '%s' (temporal / binary / GUID types "
-                          "are dotnet.pipelinecomponent-only)",
+                          "Arrow format '%s' (temporal / binary / GUID / "
+                          "decimal types are dotnet.pipelinecomponent-only)",
                        c && c->name ? c->name : "?", fmt);
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -1250,6 +1281,7 @@ static const char *ds_cs_type(DsType t) {
         case DS_TIME_US:      return "long?";
         case DS_BINARY:       return "byte[]?";
         case DS_GUID:         return "byte[]?";     /* 16-byte */
+        case DS_DECIMAL128:   return "decimal?";    /* not reachable in script */
     }
     return "object?";
 }
@@ -1273,6 +1305,7 @@ static const char *ds_cs_buffer_ptr_type(DsType t) {
         case DS_TIME_US:      return "long";
         case DS_BINARY:       return "byte"; /* not reachable */
         case DS_GUID:         return "byte";
+        case DS_DECIMAL128:   return "byte";
         default:              return "byte";
     }
 }
@@ -1727,10 +1760,10 @@ static int ds_finalize_col(DsOutCol *c, struct ArrowArray *out) {
         out->n_buffers = 2; out->buffers = bufs; out->release = ds_release_leaf2;
         return 0;
     }
-    if (c->type == DS_GUID) {
-        /* Fixed-size 16-byte binary: hand u8_data (size 16*n) to Arrow
-         * as buffers[1]. No offsets — every row is exactly 16 bytes,
-         * so the consumer indexes by row * 16. */
+    if (ds_type_is_fixed16(c->type)) {
+        /* Fixed-size 16-byte binary (GUID, decimal128): hand u8_data
+         * (size 16*n) to Arrow as buffers[1]. No offsets — every row
+         * is exactly 16 bytes, so the consumer indexes by row * 16. */
         free(c->u8_offsets); c->u8_offsets = NULL;
         char *data = c->u8_data; c->u8_data = NULL;
         if (!data) { data = malloc(1); if (!data) { free(vmap); return -1; } }
@@ -1851,7 +1884,21 @@ static int compile_and_load(DotnetScript *s) {
 /* --- Arrow stream callbacks ----------------------------------- */
 
 static void ds_release_schema_named(struct ArrowSchema *sch) {
-    free((void *)sch->name); sch->name = NULL; sch->release = NULL;
+    free((void *)sch->name);   sch->name   = NULL;
+    free((void *)sch->format); sch->format = NULL;
+    sch->release = NULL;
+}
+
+/* Build the per-column Arrow format string. Decimal columns need
+ * the scale baked in ("d:38,<scale>"); other types use a static
+ * canonical form. Returns a malloc'd string the caller owns. */
+static char *ds_alloc_fmt_for_type_scale(DsType t, int8_t scale) {
+    if (t == DS_DECIMAL128) {
+        char *s = NULL;
+        if (asprintf(&s, "d:38,%d", (int)scale) < 0) return NULL;
+        return s;
+    }
+    return strdup(ds_type_to_arrow_fmt_str(t));
 }
 static void ds_release_schema_struct(struct ArrowSchema *sch) {
     for (int64_t i = 0; i < sch->n_children; ++i) {
@@ -1879,8 +1926,18 @@ static int ds_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
             }
             free(kids); return ENOMEM;
         }
+        char *fmt_s = ds_alloc_fmt_for_type_scale(s->out_cols[i].type,
+                                                  s->out_cols[i].scale);
+        if (!fmt_s) {
+            free(c); free(nm);
+            for (size_t k = 0; k < i; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids); return ENOMEM;
+        }
         c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
-        c->format = ds_type_to_arrow_fmt_str(s->out_cols[i].type);
+        c->format = fmt_s;
         c->release = ds_release_schema_named;
         kids[i] = c;
     }
@@ -2080,8 +2137,10 @@ typedef int (*dpc_register_emit_fn)(
     void (*commit_row) (void *),
     void (*set_error)  (void *, int32_t, int32_t));   /* Phase 2 */
 typedef int (*dpc_register_schema_fn)(
-    const char **input_names,  const char *input_fmts,  int n_input,
-    const char **output_names, const char *output_fmts, int n_output,
+    const char **input_names,  const char *input_fmts,  const int8_t *input_scales,
+    int n_input,
+    const char **output_names, const char *output_fmts, const int8_t *output_scales,
+    int n_output,
     int async);
 typedef int (*dpc_lifecycle0_fn)(void);
 typedef int (*dpc_process_batch_fn)(struct ArrowArray *batch, void *emit_ctx);
@@ -2205,6 +2264,10 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
         char *name = NULL, *type = NULL;
         json_get_string(buf, "name", &name);
         json_get_string(buf, "type", &type);
+        /* Optional `scale: N` for decimal128 columns. */
+        int scale = 0;
+        const char *sp = json_value_after(buf, "scale");
+        if (sp) scale = atoi(sp);
         free(buf);
         if (!name || !type) {
             dpc_set_err(p, "dotnet.pipelinecomponent: output column needs name + type");
@@ -2214,7 +2277,13 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
         if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0) {
             dpc_set_err(p,
                 "dotnet.pipelinecomponent: output column '%s' type '%s' "
-                "not supported (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)", name, type);
+                "not supported", name, type);
+            free(name); free(type); return -1;
+        }
+        if (t == DS_DECIMAL128 && (scale < 0 || scale > 38)) {
+            dpc_set_err(p,
+                "dotnet.pipelinecomponent: decimal column '%s' scale %d "
+                "out of range [0,38]", name, scale);
             free(name); free(type); return -1;
         }
         free(type);
@@ -2224,6 +2293,7 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
         p->out_cols[p->n_out].name = name;
         p->out_cols[p->n_out].type = t;
         p->out_cols[p->n_out].arrow_fmt = ds_type_to_fmt(t);
+        p->out_cols[p->n_out].scale = (int8_t)scale;
         ++p->n_out;
 
         while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') ++q;
@@ -2265,9 +2335,18 @@ static int dpc_cache_input_schema(DotnetPipelineComponent *p) {
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
         }
+        int8_t scale = 0;
+        if (t == DS_DECIMAL128 && ds_parse_decimal_scale(fmt, &scale) != 0) {
+            dpc_set_err(p,
+                "dotnet.pipelinecomponent: input column '%s' has malformed "
+                "decimal format '%s'", c && c->name ? c->name : "?", fmt);
+            for (size_t k = 0; k < i; ++k) free(cols[k].name);
+            free(cols); goto done;
+        }
         cols[i].name = strdup(c && c->name ? c->name : "");
         cols[i].type = t;
         cols[i].arrow_fmt = fmt_ch;
+        cols[i].scale = scale;
         if (!cols[i].name) {
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -2356,23 +2435,29 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
     const char **out_names = calloc(p->n_out, sizeof *out_names);
     char *in_fmts  = calloc(p->n_in  + 1, 1);
     char *out_fmts = calloc(p->n_out + 1, 1);
-    if (!in_names || !out_names || !in_fmts || !out_fmts) {
+    int8_t *in_scales  = calloc(p->n_in  > 0 ? p->n_in  : 1, sizeof *in_scales);
+    int8_t *out_scales = calloc(p->n_out > 0 ? p->n_out : 1, sizeof *out_scales);
+    if (!in_names || !out_names || !in_fmts || !out_fmts || !in_scales || !out_scales) {
         free(in_names); free(out_names); free(in_fmts); free(out_fmts);
+        free(in_scales); free(out_scales);
         dpc_set_err(p, "dotnet.pipelinecomponent: OOM");
         return -1;
     }
     for (size_t i = 0; i < p->n_in;  ++i) {
         in_names[i]  = p->in_cols[i].name;
         in_fmts[i]   = p->in_cols[i].arrow_fmt;
+        in_scales[i] = p->in_cols[i].scale;
     }
     for (size_t i = 0; i < p->n_out; ++i) {
-        out_names[i] = p->out_cols[i].name;
-        out_fmts[i]  = p->out_cols[i].arrow_fmt;
+        out_names[i]  = p->out_cols[i].name;
+        out_fmts[i]   = p->out_cols[i].arrow_fmt;
+        out_scales[i] = p->out_cols[i].scale;
     }
-    int rs = p->register_schema_fn(in_names, in_fmts, (int)p->n_in,
-                                   out_names, out_fmts, (int)p->n_out,
+    int rs = p->register_schema_fn(in_names,  in_fmts,  in_scales,  (int)p->n_in,
+                                   out_names, out_fmts, out_scales, (int)p->n_out,
                                    p->async);
     free(in_names); free(out_names); free(in_fmts); free(out_fmts);
+    free(in_scales); free(out_scales);
     if (rs != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: register_schema returned non-zero "
                        "(see [ERROR] log above)");
@@ -2445,18 +2530,20 @@ static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
     if (!kids) return ENOMEM;
     for (size_t i = 0; i < n_cols; ++i) {
         struct ArrowSchema *c = calloc(1, sizeof *c);
-        const char *src_name; DsType src_type;
+        const char *src_name; DsType src_type; int8_t src_scale = 0;
         if (i < p->n_out) {
-            src_name = p->out_cols[i].name;
-            src_type = p->out_cols[i].type;
+            src_name  = p->out_cols[i].name;
+            src_type  = p->out_cols[i].type;
+            src_scale = p->out_cols[i].scale;
         } else if (i == p->n_out) {
             src_name = "ErrorCode";   src_type = DS_INT32;
         } else {
             src_name = "ErrorColumn"; src_type = DS_INT32;
         }
         char *nm = strdup(src_name);
-        if (!c || !nm) {
-            free(c); free(nm);
+        char *fmt_s = ds_alloc_fmt_for_type_scale(src_type, src_scale);
+        if (!c || !nm || !fmt_s) {
+            free(c); free(nm); free(fmt_s);
             for (size_t k = 0; k < i; ++k) {
                 if (kids[k]->release) kids[k]->release(kids[k]);
                 free(kids[k]);
@@ -2464,7 +2551,7 @@ static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
             free(kids); return ENOMEM;
         }
         c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
-        c->format = ds_type_to_arrow_fmt_str(src_type);
+        c->format = fmt_s;
         c->release = ds_release_schema_named;
         kids[i] = c;
     }

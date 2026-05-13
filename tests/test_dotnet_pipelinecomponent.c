@@ -495,6 +495,41 @@ static const char PL_GUID[] =
     "        from: t\n"
     "        expect: 2\n";
 
+/* --- Phase 1b.4: decimal128 (DT_NUMERIC) round-trip ----------- */
+static const char PL_DECIMAL[] =
+    "betl: 1\n"
+    "name: dotnet-pc-decimal\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 3\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,     type: l }\n"
+    "          - { name: amount, type: E, scale: 4 }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                /* amount = id * 100.5 — exercises sign, scale, fractional. */\n"
+    "                buffer.SetDecimal(1, (decimal)id * 100.5m);\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 3\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -559,6 +594,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_GUID, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "guid: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_DECIMAL, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "decimal: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

@@ -45,7 +45,8 @@ internal static unsafe class PcDispatch
 
     /* Schema state (filled at register_schema). */
     internal static BufferColumnSpec[] OutputCols = Array.Empty<BufferColumnSpec>();
-    internal static char[]             InputFmts  = Array.Empty<char>();
+    internal static char[]             InputFmts   = Array.Empty<char>();
+    internal static sbyte[]            InputScales = Array.Empty<sbyte>();
     internal static bool               Async      = false;
     internal static BetlComponentMetaData Metadata = new();
     internal static BetlBufferManager     BufManager = new();
@@ -95,8 +96,8 @@ internal static unsafe class PcDispatch
      *     (0..n_in-1 vs 0..n_out-1) and different buffer IDs (0 vs 1). */
     [UnmanagedCallersOnly(EntryPoint = "betl_dotnet_pc_register_schema")]
     public static int RegisterSchema(
-        byte** inputNames,  byte* inputFmts,  int nInput,
-        byte** outputNames, byte* outputFmts, int nOutput,
+        byte** inputNames,  byte* inputFmts,  sbyte* inputScales,  int nInput,
+        byte** outputNames, byte* outputFmts, sbyte* outputScales, int nOutput,
         int async)
     {
         try
@@ -105,8 +106,13 @@ internal static unsafe class PcDispatch
             Async = isAsync;
 
             var inFmts = new char[nInput];
-            for (int i = 0; i < nInput; ++i) inFmts[i] = (char)inputFmts[i];
-            InputFmts = inFmts;
+            var inScales = new sbyte[nInput];
+            for (int i = 0; i < nInput; ++i) {
+                inFmts[i]   = (char)inputFmts[i];
+                inScales[i] = inputScales[i];
+            }
+            InputFmts   = inFmts;
+            InputScales = inScales;
 
             var inputs  = new List<BetlInputColumn>(nInput);
             for (int i = 0; i < nInput; ++i)
@@ -134,6 +140,7 @@ internal static unsafe class PcDispatch
                     InputIndex = -1,
                     InputFmt   = '?',
                     OutputFmt  = fmt,
+                    OutputScale = outputScales[i],
                 };
             }
 
@@ -157,6 +164,7 @@ internal static unsafe class PcDispatch
                             };
                             specs[j].InputIndex = i;
                             specs[j].InputFmt   = inFmts[i];
+                            specs[j].InputScale = inputScales[i];
                             break;
                         }
                     }
@@ -246,7 +254,7 @@ internal static unsafe class PcDispatch
         {
             if (Async)
             {
-                var inputBuf = new BetlInputPipelineBuffer(InputFmts, batch);
+                var inputBuf = new BetlInputPipelineBuffer(InputFmts, InputScales, batch);
                 Component.ProcessInput(0, inputBuf);
                 OutputBuffer?.FlushTo(emitCtx);
             }
@@ -328,6 +336,7 @@ internal static unsafe class PcDispatch
         'M' => DataType.DT_DBTIME2,
         'z' => DataType.DT_BYTES,
         'G' => DataType.DT_GUID,
+        'E' => DataType.DT_NUMERIC,
         _   => throw new BetlPipelineException(
                    $"dotnet.pipelinecomponent: unsupported format '{fmt}'"),
     };
@@ -342,7 +351,7 @@ internal static unsafe class PcDispatch
         'g' or 'f'                                           => CellType.Float64,
         'b'                                                  => CellType.Bool,
         'u'                                                  => CellType.Utf8,
-        'z' or 'G'                                           => CellType.Binary,
+        'z' or 'G' or 'E'                                    => CellType.Binary,
         _ => throw new BetlPipelineException(
                 $"dotnet.pipelinecomponent: unsupported format '{fmt}'"),
     };

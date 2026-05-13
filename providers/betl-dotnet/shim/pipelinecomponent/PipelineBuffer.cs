@@ -66,6 +66,8 @@ public abstract class PipelineBuffer
     public virtual void      SetDate(int c, System.DateTime v) => throw NotSupported("SetDate");
     public virtual System.Guid GetGuid(int c)               => throw NotSupported("GetGuid");
     public virtual void      SetGuid(int c, System.Guid v)  => throw NotSupported("SetGuid");
+    public virtual decimal   GetDecimal(int c)              => throw NotSupported("GetDecimal");
+    public virtual void      SetDecimal(int c, decimal v)   => throw NotSupported("SetDecimal");
 
     /* Narrow accessors route through the widened ones. */
     public int    GetInt32 (int c) => (int)   GetInt64(c);
@@ -107,7 +109,9 @@ internal sealed class BufferColumnSpec
     public CellType Type;
     public int      InputIndex = -1; /* -1 = no same-named input column */
     public char     InputFmt   = '?'; /* betl-internal format char of paired input col */
+    public sbyte    InputScale = 0;  /* decimal128 only */
     public char     OutputFmt  = '?'; /* betl-internal format char of this output col */
+    public sbyte    OutputScale= 0;  /* decimal128 only */
 }
 
 /* Internal staging row representation. Built once per batch from
@@ -118,6 +122,71 @@ internal sealed class BufferColumnSpec
  * Why a per-row object rather than per-column SoA: simplicity.
  * The Phase 1a hot-path cost is the user's per-cell access, not
  * the staging layout. SoA can come in Phase 2 if profiling justifies. */
+/* Two-way conversion between System.Decimal and Arrow's 128-bit
+ * decimal byte representation. The 16 bytes are little-endian
+ * two's-complement; the decimal value = (signed 128-bit integer) /
+ * 10^scale.
+ *
+ * Precision caveat: System.Decimal has a 96-bit unsigned mantissa
+ * and a scale in [0,28]. Arrow decimal128 supports a 128-bit mantissa
+ * and scale up to 38. Values outside System.Decimal's range throw
+ * BetlPipelineException on conversion. */
+internal static class Decimal128Conv
+{
+    private static readonly System.Numerics.BigInteger TwoPow96 =
+        System.Numerics.BigInteger.Pow(2, 96);
+
+    public static byte[] FromDecimal(decimal value, sbyte targetScale)
+    {
+        int[] bits = decimal.GetBits(value);
+        uint lo  = unchecked((uint)bits[0]);
+        uint mid = unchecked((uint)bits[1]);
+        uint hi  = unchecked((uint)bits[2]);
+        int flags = bits[3];
+        int decScale = (flags >> 16) & 0x7F;
+        bool negative = (flags & unchecked((int)0x80000000)) != 0;
+
+        var m = new System.Numerics.BigInteger(hi);
+        m = (m << 32) | new System.Numerics.BigInteger(mid);
+        m = (m << 32) | new System.Numerics.BigInteger(lo);
+
+        int diff = targetScale - decScale;
+        if (diff > 0) m *= System.Numerics.BigInteger.Pow(10, diff);
+        else if (diff < 0) m /= System.Numerics.BigInteger.Pow(10, -diff);
+
+        if (negative) m = -m;
+
+        byte[] arr = m.ToByteArray();          /* signed little-endian, minimal */
+        if (arr.Length > 16)
+            throw new BetlPipelineException(
+                $"decimal128: value {value} rescaled to {targetScale} digits "
+                + "exceeds 128-bit two's-complement range");
+        byte[] result = new byte[16];
+        byte signExt = (arr.Length > 0 && (arr[arr.Length - 1] & 0x80) != 0)
+                       ? (byte)0xFF : (byte)0x00;
+        System.Array.Copy(arr, result, arr.Length);
+        for (int i = arr.Length; i < 16; ++i) result[i] = signExt;
+        return result;
+    }
+
+    public static decimal ToDecimal(byte[] le16, sbyte scale)
+    {
+        var m = new System.Numerics.BigInteger(le16);   /* signed LE */
+        bool negative = m.Sign < 0;
+        var abs = System.Numerics.BigInteger.Abs(m);
+        if (abs >= TwoPow96)
+            throw new BetlPipelineException(
+                "decimal128: value exceeds System.Decimal's 96-bit mantissa");
+        if (scale < 0 || scale > 28)
+            throw new BetlPipelineException(
+                $"decimal128: scale {scale} exceeds System.Decimal's 28-digit limit");
+        int lo  = unchecked((int)(uint)(abs & 0xFFFFFFFFu));
+        int mid = unchecked((int)(uint)((abs >> 32) & 0xFFFFFFFFu));
+        int hi  = unchecked((int)(uint)((abs >> 64) & 0xFFFFFFFFu));
+        return new decimal(lo, mid, hi, negative, (byte)scale);
+    }
+}
+
 internal sealed class StagingRow
 {
     public long[]    I64;
@@ -237,6 +306,12 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
                 /* Fixed-size 16-byte binary (UNIQUEIDENTIFIER). Arrow's
                  * "w:16" leaf has two buffers: validity + data; data is
                  * 16 bytes per row, indexed by row * 16. */
+                ReadGuid(colIdx, (byte*)child->Buffers[1], off, n, validity);
+                break;
+            case 'E':
+                /* decimal128: same 16-byte fixed-size layout as GUID.
+                 * Stored in StagingRow.Bytes; scale interpretation is
+                 * applied by GetDecimal at access time. */
                 ReadGuid(colIdx, (byte*)child->Buffers[1], off, n, validity);
                 break;
             default:
@@ -509,6 +584,29 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
         r.Bytes[columnIndex] = value.ToByteArray();
         r.IsNull[columnIndex] = false;
     }
+    public override decimal GetDecimal(int columnIndex)
+    {
+        RequireType(columnIndex, CellType.Binary);
+        if (_cols[columnIndex].OutputFmt != 'E')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.GetDecimal: column {columnIndex} is not a decimal");
+        var b = Cur().Bytes[columnIndex];
+        if (b == null || b.Length != 16)
+            throw new BetlPipelineException(
+                $"PipelineBuffer.GetDecimal: column {columnIndex} has bad byte length");
+        return Decimal128Conv.ToDecimal(b, _cols[columnIndex].OutputScale);
+    }
+    public override void SetDecimal(int columnIndex, decimal value)
+    {
+        RequireType(columnIndex, CellType.Binary);
+        if (_cols[columnIndex].OutputFmt != 'E')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetDecimal: column {columnIndex} is not a decimal");
+        var r = Cur();
+        r.Bytes[columnIndex] = Decimal128Conv.FromDecimal(
+            value, _cols[columnIndex].OutputScale);
+        r.IsNull[columnIndex] = false;
+    }
     /* Date / timestamp cells store an integer:
      *   - date32 columns store INT32 days since 1970-01-01
      *   - timestamp_us columns store INT64 microseconds since epoch
@@ -610,6 +708,7 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
 internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
 {
     private readonly char[]   _fmts;
+    private readonly sbyte[]  _scales;
     private readonly ArrowArray* _batch;
     private long _currentRow = -1;
     private readonly long _rowCount;
@@ -618,10 +717,11 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
     public override bool EndOfRowset => _currentRow >= _rowCount;
     public override int  ColumnCount => _fmts.Length;
 
-    internal BetlInputPipelineBuffer(char[] fmts, ArrowArray* batch)
+    internal BetlInputPipelineBuffer(char[] fmts, sbyte[] scales, ArrowArray* batch)
     {
-        _fmts = fmts;
-        _batch = batch;
+        _fmts   = fmts;
+        _scales = scales;
+        _batch  = batch;
         _rowCount = batch->Length;
     }
 
@@ -752,6 +852,18 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
         throw new BetlPipelineException(
             $"PipelineBuffer.GetDate: input column {colIdx} ('{f}') is not a date/timestamp");
     }
+    public override decimal GetDecimal(int colIdx)
+    {
+        RequireFmt(colIdx, 'E');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        byte* data = (byte*)child->Buffers[1];
+        byte[] buf = new byte[16];
+        System.Runtime.InteropServices.Marshal.Copy(
+            (System.IntPtr)(data + ix * 16), buf, 0, 16);
+        sbyte scale = (colIdx >= 0 && colIdx < _scales.Length) ? _scales[colIdx] : (sbyte)0;
+        return Decimal128Conv.ToDecimal(buf, scale);
+    }
 }
 
 /* Async output view: write-only sink. AddRow appends a new staging
@@ -839,6 +951,16 @@ internal sealed unsafe class BetlOutputPipelineBuffer : PipelineBuffer
         RequireType(colIdx, CellType.Binary);
         var r = Cur();
         r.Bytes[colIdx] = value.ToByteArray();
+        r.IsNull[colIdx] = false;
+    }
+    public override void SetDecimal(int colIdx, decimal value)
+    {
+        RequireType(colIdx, CellType.Binary);
+        if (_cols[colIdx].OutputFmt != 'E')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetDecimal: column {colIdx} is not a decimal");
+        var r = Cur();
+        r.Bytes[colIdx] = Decimal128Conv.FromDecimal(value, _cols[colIdx].OutputScale);
         r.IsNull[colIdx] = false;
     }
     public override void SetDate(int colIdx, System.DateTime value)
