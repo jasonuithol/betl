@@ -68,6 +68,12 @@ public abstract class PipelineBuffer
     public virtual void      SetGuid(int c, System.Guid v)  => throw NotSupported("SetGuid");
     public virtual decimal   GetDecimal(int c)              => throw NotSupported("GetDecimal");
     public virtual void      SetDecimal(int c, decimal v)   => throw NotSupported("SetDecimal");
+    public virtual System.TimeSpan GetTime(int c)           => throw NotSupported("GetTime");
+    public virtual void      SetTime(int c, System.TimeSpan v) => throw NotSupported("SetTime");
+    public virtual System.DateTimeOffset GetDateTimeOffset(int c)
+        => throw NotSupported("GetDateTimeOffset");
+    public virtual void SetDateTimeOffset(int c, System.DateTimeOffset v)
+        => throw NotSupported("SetDateTimeOffset");
 
     /* Narrow accessors route through the widened ones. */
     public int    GetInt32 (int c) => (int)   GetInt64(c);
@@ -110,8 +116,10 @@ internal sealed class BufferColumnSpec
     public int      InputIndex = -1; /* -1 = no same-named input column */
     public char     InputFmt   = '?'; /* betl-internal format char of paired input col */
     public sbyte    InputScale = 0;  /* decimal128 only */
+    public string?  InputTz    = null; /* timestamp_us only */
     public char     OutputFmt  = '?'; /* betl-internal format char of this output col */
     public sbyte    OutputScale= 0;  /* decimal128 only */
+    public string?  OutputTz   = null; /* timestamp_us only */
 }
 
 /* Internal staging row representation. Built once per batch from
@@ -607,6 +615,68 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
             value, _cols[columnIndex].OutputScale);
         r.IsNull[columnIndex] = false;
     }
+
+    /* TimeSpan accessor: works on time_us ('M') columns. Internal
+     * storage is int64 microseconds since midnight. */
+    public override System.TimeSpan GetTime(int columnIndex)
+    {
+        if (_cols[columnIndex].OutputFmt != 'M')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.GetTime: column {columnIndex} is not a time");
+        return System.TimeSpan.FromTicks(GetInt64(columnIndex) * 10L);
+    }
+    public override void SetTime(int columnIndex, System.TimeSpan value)
+    {
+        if (_cols[columnIndex].OutputFmt != 'M')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetTime: column {columnIndex} is not a time");
+        SetInt64(columnIndex, value.Ticks / 10L);
+    }
+
+    /* DateTimeOffset accessor: works on timestamp_us ('T') columns.
+     * The column's tz string (parsed from "tsu:<tz>") supplies the
+     * UTC offset. If no tz on the column, Offset is zero. */
+    public override System.DateTimeOffset GetDateTimeOffset(int columnIndex)
+    {
+        if (_cols[columnIndex].OutputFmt != 'T')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.GetDateTimeOffset: column {columnIndex} is not a timestamp");
+        long us = GetInt64(columnIndex);
+        var utc = new System.DateTime(
+            System.DateTime.UnixEpoch.Ticks + us * 10L, System.DateTimeKind.Utc);
+        var offset = ResolveTzOffset(_cols[columnIndex].OutputTz);
+        return new System.DateTimeOffset(utc).ToOffset(offset);
+    }
+    public override void SetDateTimeOffset(int columnIndex, System.DateTimeOffset value)
+    {
+        if (_cols[columnIndex].OutputFmt != 'T')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetDateTimeOffset: column {columnIndex} is not a timestamp");
+        long us = (value.UtcTicks - System.DateTime.UnixEpoch.Ticks) / 10L;
+        SetInt64(columnIndex, us);
+    }
+
+    /* Resolve a timezone tag to a UTC offset. Accepts ID strings
+     * (TimeZoneInfo lookup) and explicit "+HH:MM" / "-HH:MM" tokens.
+     * Invariant-globalization builds may lack zone DB — falls back
+     * to zero offset on lookup failure. */
+    private static System.TimeSpan ResolveTzOffset(string? tz)
+    {
+        if (string.IsNullOrEmpty(tz)) return System.TimeSpan.Zero;
+        if (tz == "UTC" || tz == "Z" || tz == "+00:00" || tz == "-00:00")
+            return System.TimeSpan.Zero;
+        if ((tz[0] == '+' || tz[0] == '-') && tz.Length >= 3)
+        {
+            if (System.TimeSpan.TryParseExact(tz.Substring(1), @"hh\:mm", null, out var ts))
+                return tz[0] == '-' ? -ts : ts;
+        }
+        try
+        {
+            var tzi = System.TimeZoneInfo.FindSystemTimeZoneById(tz);
+            return tzi.BaseUtcOffset;
+        }
+        catch { return System.TimeSpan.Zero; }
+    }
     /* Date / timestamp cells store an integer:
      *   - date32 columns store INT32 days since 1970-01-01
      *   - timestamp_us columns store INT64 microseconds since epoch
@@ -708,7 +778,8 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
 internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
 {
     private readonly char[]   _fmts;
-    private readonly sbyte[]  _scales;
+    private readonly sbyte[]   _scales;
+    private readonly string?[] _tzs;
     private readonly ArrowArray* _batch;
     private long _currentRow = -1;
     private readonly long _rowCount;
@@ -717,10 +788,12 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
     public override bool EndOfRowset => _currentRow >= _rowCount;
     public override int  ColumnCount => _fmts.Length;
 
-    internal BetlInputPipelineBuffer(char[] fmts, sbyte[] scales, ArrowArray* batch)
+    internal BetlInputPipelineBuffer(char[] fmts, sbyte[] scales, string?[] tzs,
+                                     ArrowArray* batch)
     {
         _fmts   = fmts;
         _scales = scales;
+        _tzs    = tzs;
         _batch  = batch;
         _rowCount = batch->Length;
     }
@@ -864,6 +937,34 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
         sbyte scale = (colIdx >= 0 && colIdx < _scales.Length) ? _scales[colIdx] : (sbyte)0;
         return Decimal128Conv.ToDecimal(buf, scale);
     }
+    public override System.TimeSpan GetTime(int colIdx)
+    {
+        RequireFmt(colIdx, 'M');
+        return System.TimeSpan.FromTicks(GetInt64(colIdx) * 10L);
+    }
+    public override System.DateTimeOffset GetDateTimeOffset(int colIdx)
+    {
+        RequireFmt(colIdx, 'T');
+        long us = GetInt64(colIdx);
+        var utc = new System.DateTime(
+            System.DateTime.UnixEpoch.Ticks + us * 10L, System.DateTimeKind.Utc);
+        string? tz = (colIdx >= 0 && colIdx < _tzs.Length) ? _tzs[colIdx] : null;
+        var offset = ResolveTzOffsetStatic(tz);
+        return new System.DateTimeOffset(utc).ToOffset(offset);
+    }
+
+    private static System.TimeSpan ResolveTzOffsetStatic(string? tz)
+    {
+        if (string.IsNullOrEmpty(tz)) return System.TimeSpan.Zero;
+        if (tz == "UTC" || tz == "Z") return System.TimeSpan.Zero;
+        if ((tz[0] == '+' || tz[0] == '-') && tz.Length >= 3)
+        {
+            if (System.TimeSpan.TryParseExact(tz.Substring(1), @"hh\:mm", null, out var ts))
+                return tz[0] == '-' ? -ts : ts;
+        }
+        try { return System.TimeZoneInfo.FindSystemTimeZoneById(tz).BaseUtcOffset; }
+        catch { return System.TimeSpan.Zero; }
+    }
 }
 
 /* Async output view: write-only sink. AddRow appends a new staging
@@ -962,6 +1063,21 @@ internal sealed unsafe class BetlOutputPipelineBuffer : PipelineBuffer
         var r = Cur();
         r.Bytes[colIdx] = Decimal128Conv.FromDecimal(value, _cols[colIdx].OutputScale);
         r.IsNull[colIdx] = false;
+    }
+    public override void SetTime(int colIdx, System.TimeSpan value)
+    {
+        if (_cols[colIdx].OutputFmt != 'M')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetTime: column {colIdx} is not a time");
+        SetInt64(colIdx, value.Ticks / 10L);
+    }
+    public override void SetDateTimeOffset(int colIdx, System.DateTimeOffset value)
+    {
+        if (_cols[colIdx].OutputFmt != 'T')
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetDateTimeOffset: column {colIdx} is not a timestamp");
+        long us = (value.UtcTicks - System.DateTime.UnixEpoch.Ticks) / 10L;
+        SetInt64(colIdx, us);
     }
     public override void SetDate(int colIdx, System.DateTime value)
     {

@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "8"
+#define BETL_DOTNET_SHIM_ABI_VERSION "9"
 
 
 /* ============================================================== *
@@ -886,6 +886,7 @@ typedef struct {
     DsType type;
     char   arrow_fmt;     /* betl-internal char; see ds_fmt_to_type for the set */
     int8_t scale;         /* decimal128 only — number of fractional digits */
+    char  *tz;            /* timestamp_us only — owned tz string, NULL = none */
 } DsCol;
 
 /* Map a betl-internal format char to a DsType. Returns 0 + sets out,
@@ -1890,12 +1891,18 @@ static void ds_release_schema_named(struct ArrowSchema *sch) {
 }
 
 /* Build the per-column Arrow format string. Decimal columns need
- * the scale baked in ("d:38,<scale>"); other types use a static
- * canonical form. Returns a malloc'd string the caller owns. */
-static char *ds_alloc_fmt_for_type_scale(DsType t, int8_t scale) {
+ * the scale baked in ("d:38,<scale>"); timestamp columns may carry
+ * a timezone suffix ("tsu:UTC"); other types use a static canonical
+ * form. Returns a malloc'd string the caller owns. */
+static char *ds_alloc_fmt_for_col(DsType t, int8_t scale, const char *tz) {
     if (t == DS_DECIMAL128) {
         char *s = NULL;
         if (asprintf(&s, "d:38,%d", (int)scale) < 0) return NULL;
+        return s;
+    }
+    if (t == DS_TIMESTAMP_US) {
+        char *s = NULL;
+        if (asprintf(&s, "tsu:%s", tz ? tz : "") < 0) return NULL;
         return s;
     }
     return strdup(ds_type_to_arrow_fmt_str(t));
@@ -1926,8 +1933,9 @@ static int ds_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
             }
             free(kids); return ENOMEM;
         }
-        char *fmt_s = ds_alloc_fmt_for_type_scale(s->out_cols[i].type,
-                                                  s->out_cols[i].scale);
+        char *fmt_s = ds_alloc_fmt_for_col(s->out_cols[i].type,
+                                           s->out_cols[i].scale,
+                                           s->out_cols[i].tz);
         if (!fmt_s) {
             free(c); free(nm);
             for (size_t k = 0; k < i; ++k) {
@@ -2096,9 +2104,15 @@ static void dotnet_script_destroy(void *state) {
     /* See dotnet_task_destroy for the dlclose-leak rationale. */
     free(s->so_path);
     free(s->source); free(s->lang);
-    for (size_t i = 0; i < s->n_out; ++i) free(s->out_cols[i].name);
+    for (size_t i = 0; i < s->n_out; ++i) {
+        free(s->out_cols[i].name);
+        free(s->out_cols[i].tz);
+    }
     free(s->out_cols);
-    for (size_t i = 0; i < s->n_in; ++i) free(s->in_cols[i].name);
+    for (size_t i = 0; i < s->n_in; ++i) {
+        free(s->in_cols[i].name);
+        free(s->in_cols[i].tz);
+    }
     free(s->in_cols);
     if (s->out_staging) {
         for (size_t i = 0; i < s->n_out; ++i) ds_out_free(&s->out_staging[i]);
@@ -2138,9 +2152,9 @@ typedef int (*dpc_register_emit_fn)(
     void (*set_error)  (void *, int32_t, int32_t));   /* Phase 2 */
 typedef int (*dpc_register_schema_fn)(
     const char **input_names,  const char *input_fmts,  const int8_t *input_scales,
-    int n_input,
+    const char **input_tzs,    int n_input,
     const char **output_names, const char *output_fmts, const int8_t *output_scales,
-    int n_output,
+    const char **output_tzs,   int n_output,
     int async);
 typedef int (*dpc_lifecycle0_fn)(void);
 typedef int (*dpc_process_batch_fn)(struct ArrowArray *batch, void *emit_ctx);
@@ -2268,6 +2282,9 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
         int scale = 0;
         const char *sp = json_value_after(buf, "scale");
         if (sp) scale = atoi(sp);
+        /* Optional `tz: "UTC"` for timestamp_us columns. */
+        char *tz = NULL;
+        json_get_string(buf, "tz", &tz);
         free(buf);
         if (!name || !type) {
             dpc_set_err(p, "dotnet.pipelinecomponent: output column needs name + type");
@@ -2294,6 +2311,7 @@ static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) 
         p->out_cols[p->n_out].type = t;
         p->out_cols[p->n_out].arrow_fmt = ds_type_to_fmt(t);
         p->out_cols[p->n_out].scale = (int8_t)scale;
+        p->out_cols[p->n_out].tz = tz;
         ++p->n_out;
 
         while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') ++q;
@@ -2343,12 +2361,20 @@ static int dpc_cache_input_schema(DotnetPipelineComponent *p) {
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
         }
+        /* Extract timezone suffix from "tsu:<tz>" if present. */
+        char *tz = NULL;
+        if (t == DS_TIMESTAMP_US) {
+            const char *colon = strchr(fmt, ':');
+            if (colon && colon[1] != '\0') tz = strdup(colon + 1);
+        }
         cols[i].name = strdup(c && c->name ? c->name : "");
         cols[i].type = t;
         cols[i].arrow_fmt = fmt_ch;
         cols[i].scale = scale;
+        cols[i].tz = tz;
         if (!cols[i].name) {
-            for (size_t k = 0; k < i; ++k) free(cols[k].name);
+            free(tz);
+            for (size_t k = 0; k < i; ++k) { free(cols[k].name); free(cols[k].tz); }
             free(cols); goto done;
         }
     }
@@ -2437,9 +2463,12 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
     char *out_fmts = calloc(p->n_out + 1, 1);
     int8_t *in_scales  = calloc(p->n_in  > 0 ? p->n_in  : 1, sizeof *in_scales);
     int8_t *out_scales = calloc(p->n_out > 0 ? p->n_out : 1, sizeof *out_scales);
-    if (!in_names || !out_names || !in_fmts || !out_fmts || !in_scales || !out_scales) {
+    const char **in_tzs  = calloc(p->n_in  > 0 ? p->n_in  : 1, sizeof *in_tzs);
+    const char **out_tzs = calloc(p->n_out > 0 ? p->n_out : 1, sizeof *out_tzs);
+    if (!in_names || !out_names || !in_fmts || !out_fmts || !in_scales || !out_scales
+        || !in_tzs || !out_tzs) {
         free(in_names); free(out_names); free(in_fmts); free(out_fmts);
-        free(in_scales); free(out_scales);
+        free(in_scales); free(out_scales); free(in_tzs); free(out_tzs);
         dpc_set_err(p, "dotnet.pipelinecomponent: OOM");
         return -1;
     }
@@ -2447,17 +2476,19 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
         in_names[i]  = p->in_cols[i].name;
         in_fmts[i]   = p->in_cols[i].arrow_fmt;
         in_scales[i] = p->in_cols[i].scale;
+        in_tzs[i]    = p->in_cols[i].tz;       /* NULL = no tz */
     }
     for (size_t i = 0; i < p->n_out; ++i) {
         out_names[i]  = p->out_cols[i].name;
         out_fmts[i]   = p->out_cols[i].arrow_fmt;
         out_scales[i] = p->out_cols[i].scale;
+        out_tzs[i]    = p->out_cols[i].tz;
     }
-    int rs = p->register_schema_fn(in_names,  in_fmts,  in_scales,  (int)p->n_in,
-                                   out_names, out_fmts, out_scales, (int)p->n_out,
+    int rs = p->register_schema_fn(in_names,  in_fmts,  in_scales,  in_tzs,  (int)p->n_in,
+                                   out_names, out_fmts, out_scales, out_tzs, (int)p->n_out,
                                    p->async);
     free(in_names); free(out_names); free(in_fmts); free(out_fmts);
-    free(in_scales); free(out_scales);
+    free(in_scales); free(out_scales); free(in_tzs); free(out_tzs);
     if (rs != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: register_schema returned non-zero "
                        "(see [ERROR] log above)");
@@ -2531,17 +2562,19 @@ static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
     for (size_t i = 0; i < n_cols; ++i) {
         struct ArrowSchema *c = calloc(1, sizeof *c);
         const char *src_name; DsType src_type; int8_t src_scale = 0;
+        const char *src_tz = NULL;
         if (i < p->n_out) {
             src_name  = p->out_cols[i].name;
             src_type  = p->out_cols[i].type;
             src_scale = p->out_cols[i].scale;
+            src_tz    = p->out_cols[i].tz;
         } else if (i == p->n_out) {
             src_name = "ErrorCode";   src_type = DS_INT32;
         } else {
             src_name = "ErrorColumn"; src_type = DS_INT32;
         }
         char *nm = strdup(src_name);
-        char *fmt_s = ds_alloc_fmt_for_type_scale(src_type, src_scale);
+        char *fmt_s = ds_alloc_fmt_for_col(src_type, src_scale, src_tz);
         if (!c || !nm || !fmt_s) {
             free(c); free(nm); free(fmt_s);
             for (size_t k = 0; k < i; ++k) {
@@ -2759,9 +2792,15 @@ static void dotnet_pc_destroy(void *state) {
     if (p->have_input && p->input.release) p->input.release(&p->input);
     free(p->so_path);
     free(p->source); free(p->lang);
-    for (size_t i = 0; i < p->n_out; ++i) free(p->out_cols[i].name);
+    for (size_t i = 0; i < p->n_out; ++i) {
+        free(p->out_cols[i].name);
+        free(p->out_cols[i].tz);
+    }
     free(p->out_cols);
-    for (size_t i = 0; i < p->n_in; ++i) free(p->in_cols[i].name);
+    for (size_t i = 0; i < p->n_in; ++i) {
+        free(p->in_cols[i].name);
+        free(p->in_cols[i].tz);
+    }
     free(p->in_cols);
     if (p->out_staging) {
         for (size_t i = 0; i < p->n_out; ++i) ds_out_free(&p->out_staging[i]);

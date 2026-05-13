@@ -530,6 +530,47 @@ static const char PL_DECIMAL[] =
     "        from: t\n"
     "        expect: 3\n";
 
+/* --- chunks 2+3+4: tz-tagged timestamp output + DateTimeOffset +
+ *                   TimeSpan accessors. ----------------------- */
+static const char PL_TZ_DTO_TIMESPAN[] =
+    "betl: 1\n"
+    "name: dotnet-pc-tz-dto-timespan\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,    type: l }\n"
+    "          - { name: utcts, type: T, tz: \"UTC\" }\n"
+    "          - { name: tod,   type: M }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                /* utcts: SSIS-faithful DateTimeOffset accessor */\n"
+    "                buffer.SetDateTimeOffset(1,\n"
+    "                    new System.DateTimeOffset(\n"
+    "                        2026, 5, 13, 12, 0, (int)id, System.TimeSpan.Zero));\n"
+    "                /* tod: TimeSpan accessor for DT_DBTIME2 */\n"
+    "                buffer.SetTime(2, new System.TimeSpan(9, 30, (int)id));\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 2\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -599,6 +640,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_DECIMAL, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "decimal: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_TZ_DTO_TIMESPAN, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "tz-dto-timespan: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

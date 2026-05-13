@@ -47,6 +47,7 @@ internal static unsafe class PcDispatch
     internal static BufferColumnSpec[] OutputCols = Array.Empty<BufferColumnSpec>();
     internal static char[]             InputFmts   = Array.Empty<char>();
     internal static sbyte[]            InputScales = Array.Empty<sbyte>();
+    internal static string?[]          InputTzs    = Array.Empty<string?>();
     internal static bool               Async      = false;
     internal static BetlComponentMetaData Metadata = new();
     internal static BetlBufferManager     BufManager = new();
@@ -96,8 +97,10 @@ internal static unsafe class PcDispatch
      *     (0..n_in-1 vs 0..n_out-1) and different buffer IDs (0 vs 1). */
     [UnmanagedCallersOnly(EntryPoint = "betl_dotnet_pc_register_schema")]
     public static int RegisterSchema(
-        byte** inputNames,  byte* inputFmts,  sbyte* inputScales,  int nInput,
-        byte** outputNames, byte* outputFmts, sbyte* outputScales, int nOutput,
+        byte** inputNames,  byte* inputFmts,  sbyte* inputScales,  byte** inputTzs,
+        int nInput,
+        byte** outputNames, byte* outputFmts, sbyte* outputScales, byte** outputTzs,
+        int nOutput,
         int async)
     {
         try
@@ -107,12 +110,15 @@ internal static unsafe class PcDispatch
 
             var inFmts = new char[nInput];
             var inScales = new sbyte[nInput];
+            var inTzs = new string?[nInput];
             for (int i = 0; i < nInput; ++i) {
                 inFmts[i]   = (char)inputFmts[i];
                 inScales[i] = inputScales[i];
+                inTzs[i]    = inputTzs[i] != null ? CStr(inputTzs[i]) : null;
             }
             InputFmts   = inFmts;
             InputScales = inScales;
+            InputTzs    = inTzs;
 
             var inputs  = new List<BetlInputColumn>(nInput);
             for (int i = 0; i < nInput; ++i)
@@ -139,8 +145,9 @@ internal static unsafe class PcDispatch
                     Type = ArrowFmtToCellType(fmt),
                     InputIndex = -1,
                     InputFmt   = '?',
-                    OutputFmt  = fmt,
+                    OutputFmt   = fmt,
                     OutputScale = outputScales[i],
+                    OutputTz    = outputTzs[i] != null ? CStr(outputTzs[i]) : null,
                 };
             }
 
@@ -165,6 +172,7 @@ internal static unsafe class PcDispatch
                             specs[j].InputIndex = i;
                             specs[j].InputFmt   = inFmts[i];
                             specs[j].InputScale = inputScales[i];
+                            specs[j].InputTz    = inputTzs[i] != null ? CStr(inputTzs[i]) : null;
                             break;
                         }
                     }
@@ -254,7 +262,7 @@ internal static unsafe class PcDispatch
         {
             if (Async)
             {
-                var inputBuf = new BetlInputPipelineBuffer(InputFmts, InputScales, batch);
+                var inputBuf = new BetlInputPipelineBuffer(InputFmts, InputScales, InputTzs, batch);
                 Component.ProcessInput(0, inputBuf);
                 OutputBuffer?.FlushTo(emitCtx);
             }
