@@ -93,6 +93,13 @@ public interface IDTSCustomPropertyCollection100 : IEnumerable
 public interface IDTSRuntimeConnection100 : IDTSObject100
 {
     string  ConnectionManagerID { get; set; }
+    /* Returns whatever the host hands back for the connection — for
+     * betl-dotnet that's the connection's JSON blob as a string.
+     * SSIS-original code casts to OleDbConnection / SqlConnection /
+     * etc.; ported code casts to string and constructs its own
+     * .NET connection object from the parsed JSON. */
+    object  AcquireConnection(object transaction);
+    void    ReleaseConnection(object connection);
 }
 
 public interface IDTSRuntimeConnectionCollection100 : IEnumerable
@@ -272,13 +279,72 @@ internal sealed class EmptyCustomPropertyCollection : IDTSCustomPropertyCollecti
     public IEnumerator GetEnumerator() => System.Array.Empty<IDTSCustomProperty100>().GetEnumerator();
 }
 
-internal sealed class EmptyRuntimeConnectionCollection : IDTSRuntimeConnectionCollection100
+/* Connection Manager wrapper. Holds a name; AcquireConnection
+ * delegates to Betl.Connection.Get which talks to the host's
+ * `connections:` block via the bridge function pointer. */
+internal sealed class BetlRuntimeConnection : IDTSRuntimeConnection100
 {
-    public int Count => 0;
-    public IDTSRuntimeConnection100 this[object index] =>
-        throw new BetlPipelineException("RuntimeConnectionCollection is empty in Phase 1a; " +
-            "use Betl.Connection.Get(name) to fetch connection JSON directly");
-    public IEnumerator GetEnumerator() => System.Array.Empty<IDTSRuntimeConnection100>().GetEnumerator();
+    public int     ID                  { get; init; }
+    public string  Name                { get; set; } = "";
+    public string  Description         { get; set; } = "";
+    public string  ConnectionManagerID { get; set; } = "";
+
+    public object AcquireConnection(object transaction)
+    {
+        var json = Betl.Connection.Get(Name);
+        if (json == null)
+            throw new BetlPipelineException(
+                $"RuntimeConnection '{Name}': no connection of that name defined in "
+                + "the pipeline's `connections:` block");
+        return json;
+    }
+
+    public void ReleaseConnection(object connection) { /* nothing to release */ }
+}
+
+/* Lazy lookup: indexer constructs a BetlRuntimeConnection on demand
+ * for any name. Iteration / Count are zero unless explicit names were
+ * registered (see RegisterNames). This matches how most ported SSIS
+ * components use the collection — lookup by known name from
+ * PreExecute, never iterate. */
+internal sealed class BetlRuntimeConnectionCollection : IDTSRuntimeConnectionCollection100
+{
+    private readonly List<BetlRuntimeConnection> _known = new();
+
+    internal void RegisterNames(IEnumerable<string> names)
+    {
+        int id = 0;
+        foreach (var n in names)
+            _known.Add(new BetlRuntimeConnection { ID = id++, Name = n });
+    }
+
+    public int Count => _known.Count;
+    public IDTSRuntimeConnection100 this[object index]
+    {
+        get
+        {
+            if (index is int i)
+            {
+                if (i < 0 || i >= _known.Count) throw new BetlPipelineException(
+                    $"RuntimeConnectionCollection index out of range: {i}");
+                return _known[i];
+            }
+            if (index is string s)
+            {
+                /* Lookup-by-name always succeeds: if not pre-registered,
+                 * we synthesize on the fly. AcquireConnection later will
+                 * fail with a clear error if the name doesn't exist in
+                 * the pipeline's connections block. */
+                foreach (var c in _known) if (c.Name == s) return c;
+                var fresh = new BetlRuntimeConnection { ID = _known.Count, Name = s };
+                _known.Add(fresh);
+                return fresh;
+            }
+            throw new BetlPipelineException(
+                $"RuntimeConnectionCollection: bad index type {index?.GetType()}");
+        }
+    }
+    public IEnumerator GetEnumerator() => _known.GetEnumerator();
 }
 
 internal sealed class BetlComponentMetaData : IDTSComponentMetaData100
@@ -292,7 +358,7 @@ internal sealed class BetlComponentMetaData : IDTSComponentMetaData100
     public IDTSCustomPropertyCollection100    CustomPropertyCollection { get; init; } =
         new EmptyCustomPropertyCollection();
     public IDTSRuntimeConnectionCollection100 RuntimeConnectionCollection { get; init; } =
-        new EmptyRuntimeConnectionCollection();
+        new BetlRuntimeConnectionCollection();
 
     public void FireError(int errorCode, string subComponent, string description,
                           string helpFile, int helpContext, out bool cancel)

@@ -21,6 +21,7 @@
 #include "loader/registry.h"
 #include "pipeline/pipeline.h"
 #include "runtime/builtins.h"
+#include "runtime/connections.h"
 #include "runtime/context.h"
 #include "runtime/exec.h"
 
@@ -105,6 +106,12 @@ static int run_yaml(const char *plugin_path, const char *yaml,
     rc = betl_registry_load(reg, plugin_path);
     if (rc != BETL_OK) {
         if (err) snprintf(err, err_cap, "%s", betl_registry_last_error(reg));
+        goto cleanup;
+    }
+    char conn_err[1024] = {0};
+    rc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
+    if (rc != BETL_OK) {
+        if (err) snprintf(err, err_cap, "apply_connections: %s", conn_err);
         goto cleanup;
     }
     rc = betl_run(ctx, reg, p);
@@ -329,6 +336,46 @@ static const char PL_ASYNC_AGGREGATE[] =
     "        from: t\n"
     "        expect: 1\n";
 
+/* --- Phase 2: Connection Manager lookup via RuntimeConnectionCollection */
+static const char PL_CONN_MGR[] =
+    "betl: 1\n"
+    "name: dotnet-pc-conn-mgr\n"
+    "connections:\n"
+    "  warehouse:\n"
+    "    type: postgres\n"
+    "    dsn: \"host=localhost dbname=test_betl_warehouse\"\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void PreExecute() {\n"
+    "              var cm = ComponentMetaData.RuntimeConnectionCollection[(object)\"warehouse\"];\n"
+    "              var json = (string)cm.AcquireConnection(null!);\n"
+    "              if (!json.Contains(\"dbname=test_betl_warehouse\"))\n"
+    "                throw new System.Exception(\"unexpected CN JSON: \" + json);\n"
+    "            }\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) { /* passthrough */ }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 2\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -373,6 +420,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_ASYNC_AGGREGATE, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "async-aggregate: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_CONN_MGR, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "conn-mgr: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {
