@@ -1,33 +1,44 @@
 # betl — Better ETL
 
-A cross-platform, open-source, text-first ETL runtime aimed at being a
-modern replacement for SQL Server Integration Services (SSIS).
+A cross-platform, open-source, text-first ETL system. Pipelines are
+plain YAML you can diff, review, and merge — no GUID-stamped XML, no
+binary blobs, no IDE lock-in.
 
-> **Status:** v0.1, alpha. Useful for experimentation and small ingest
-> jobs against the supported sources/sinks. The C ABI for providers
-> (`include/betl/provider.h`) is stable in shape but may gain fields
-> before v1.0.
+> **Status:** v0.2 landed 2026-05-12. The pipeline file format,
+> provider ABI (`include/betl/provider.h`), and expression-engine
+> sub-ABI are stable in shape but may gain fields before v1.0.
+>
+> The runtime-neutral contract is documented in
+> [`SPEC_CORE.md`](SPEC_CORE.md). This repository hosts **betl-legacy**
+> — the first reference implementation (C engine + Lua scripting). A
+> second reference implementation, `betl.dotnet` (headless .NET 8,
+> hosts compiled SSIS components on Linux), is planned. See
+> [SPEC_CORE.md §14](SPEC_CORE.md).
 
-## What it is
+## Why betl
 
 - **Pipelines as plain text.** A pipeline is a YAML file. Two engineers
   editing different parts produce a clean three-way merge — no GUIDs,
   no embedded XML coordinates, no binary blobs.
-- **Engine in C, types from Apache Arrow.** Cross-component data is
-  passed as Arrow record batches via the C Data Interface; no
-  serialization between steps inside a pipeline.
+- **Open spec, not just an implementation.** The pipeline file format
+  is defined by [`SPEC_CORE.md`](SPEC_CORE.md) — a runtime-neutral
+  contract any conforming implementation can target. The C/Lua engine
+  in this repo is one such implementation; more are planned.
+- **Apache Arrow types end-to-end.** Cross-component data is passed
+  as Arrow record batches via the C Data Interface; no serialization
+  between steps inside a pipeline.
 - **Pluggable.** Sources, sinks, transforms, expression languages, and
   language hosts are providers loaded at runtime via a stable C ABI.
 - **Embedded scripting.** Inline Lua expressions for `where:` /
-  `expr:`; full Lua scripts for `lua.task` / `lua.map`. SSIS users
-  migrating off `.dtsx` files can keep their Data Flow expressions
-  verbatim via the **`ssisexpr`** engine (`MONTH`, `DATEADD`, typed
-  `(DT_*)` casts, 3VL nulls). Other languages (Python, SQL host, …)
-  can be added without touching the core.
+  `expr:`; full Lua scripts for `lua.task` / `lua.map` / `lua.script`
+  (1:N async). C#/VB.NET via `dotnet.task` / `dotnet.script` (NativeAOT
+  compile-on-validate). Other languages (Python, SQL host, …) can be
+  added without touching the core.
 
-The full design lives in `SPEC.md`. The provider ABI is documented in
-`include/betl/provider.h`; the expression-engine sub-ABI is in
-`docs/EXPR_ABI.md`.
+This repository's full design lives in `SPEC.md`; the runtime-neutral
+contract that other implementations target lives in `SPEC_CORE.md`.
+The provider ABI is documented in `include/betl/provider.h`; the
+expression-engine sub-ABI is in `docs/EXPR_ABI.md`.
 
 ## A small but real pipeline
 
@@ -85,7 +96,37 @@ More examples live under `examples/`: CSV-to-Postgres, sales-star
 build with a star-schema lookup join, CRM migration with multi-stage
 upserts, and SSIS-style date enrichment with `ssisexpr`.
 
-## What's in v0.1
+## Migrating from SSIS
+
+SSIS migration is one supported use case, not the headline. betl-legacy
+ships three pieces aimed at it:
+
+- **`betl-dtsx2yaml`** (in `tools/`) — a C# console converter that reads
+  `.dtsx` packages and emits betl YAML. Handles OLEDB / Flat File sources
+  and sinks, Execute SQL Task, the standard SSIS transforms (Conditional
+  Split, Aggregate, Sort, Distinct, Lookup, Merge Join, Union All,
+  Multicast, Derived Column, Data Conversion, Pivot, Unpivot, plus the
+  rest of the SSIS default set), Script Task and Script Component (with
+  VB.NET auto-translated to C#), and the wider control-flow surface
+  (containers, precedence constraints, file / process / bulk-insert
+  tasks).
+- **`ssisexpr`** — the SSIS Expression Language, fully implemented as a
+  betl expression provider. Migrated pipelines keep their SSIS derived-
+  column / conditional-split expressions verbatim — typed `(DT_*)` casts
+  (incl. NUMERIC / GUID / dates), 3VL nulls, ~30 SSIS functions. See
+  [`docs/SSISEXPR.md`](docs/SSISEXPR.md).
+- **`dotnet.task` / `dotnet.script`** — C# / VB.NET Script Task and
+  Script Component analogues, with NativeAOT compile-on-validate. The
+  designer-free runtime side of SSIS scripting.
+
+The longer-term plan is for `betl.dotnet` (planned, see
+[SPEC_CORE.md §14](SPEC_CORE.md)) to host **compiled SSIS
+PipelineComponents** in-process via a `Betl.Ssis.PipelineCompat.dll`
+shim — recompile a third-party C# component against the shim, drop the
+`.dll` into a plugins directory, run it on Linux without SSDT or SQL
+Server.
+
+## What betl-legacy ships (v0.1 + v0.2)
 
 | Kind | Component | Status | Notes |
 |---|---|---|---|
@@ -110,22 +151,22 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 | TRANSFORM | `pivot` | ✓ | Long → wide on declared `pivot_keys`; sorted-input contract |
 | TRANSFORM | `postgres.lookup` | ✓ | Cached SELECT + linear probe; on_miss error/null/drop |
 | TRANSFORM | `mssql.lookup` | ✓ | Same model over ODBC |
+| TRANSFORM | `multicast` | ✓ | 1-in-N-out fan-out via refcounted shared batches (zero-copy) |
 | TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return (synchronous, 1:1) |
 | TRANSFORM | `lua.script` | ✓ | Stateful Lua: `on_row`/`on_eof` + `emit()`; SSIS async script component (1:N, N:1, windowed) |
+| TRANSFORM | `dotnet.script` | ✓ | Stateful C# / VB.NET async script component; NativeAOT compile-on-validate; same protocol as `lua.script` |
 | TASK | `lua.task` | ✓ | Standalone Lua script with host bridges |
+| TASK | `dotnet.task` | ✓ | Standalone C# / VB.NET Script Task analogue; NativeAOT compile-on-validate; Params / Connection / Log bridges |
+| TOOL | `betl-dtsx2yaml` | ✓ | DTSX → betl YAML converter; ships in `tools/`, runs separately from `betl run` |
 | ENGINE | `literal` | ✓ | Constant expressions (built-in) |
 | ENGINE | `lua` | ✓ | Lua 5.4 (provider plugin) |
 | ENGINE | `ssisexpr` | ✓ | SSIS Expression Language — typed `(DT_*)` casts (incl. NUMERIC / GUID / dates), 3VL nulls, ~30 functions, decimal+uuid comparisons (provider plugin); see [`docs/SSISEXPR.md`](docs/SSISEXPR.md) |
 
-### Missing on purpose at v0.1
+### Missing on purpose at v0.x
 
-- No `dotnet.task` / `dotnet.script` and no DTSX→YAML converter —
-  slated for **v0.2**, the "drop-in SSIS replacement" milestone.
-  Runtime language is C# only via NativeAOT; the DTSX converter
-  translates VB.NET → C# at conversion time (the VB.NET compiler
-  rejects `[UnmanagedCallersOnly]` so it can't host a NativeAOT
-  shared library directly).
-- No `parquet.*` — slated for **v0.3**.
+- No `parquet.*` — slated for **v0.3**. Bare parquet is well-defined;
+  Delta / Iceberg landing (Snowflake / Databricks / Fabric) is a
+  separate conversation.
 - No `kafka.*`, no window functions.
 - No scheduler. Wire betl into cron / systemd / Airflow as you
   already do.
@@ -207,34 +248,42 @@ and `lua5.4`.
 ## Project layout
 
 ```
-include/betl/        Public C ABI: provider.h, version.h
-src/cli/             betl binary (run, validate)
-src/loader/          provider registry + dlopen
-src/pipeline/        YAML → in-memory pipeline AST
-src/runtime/         executor, builtins, transforms, db sinks/lookups
-src/yaml/            libyaml-backed parser
-providers/betl-lua/      Lua provider plugin (+expression engine)
-providers/betl-ssisexpr/ SSIS Expression Language engine
-tests/                   C tests; ctest harness; integration tests gated on
-                         a sibling Postgres / MSSQL
-examples/                Four runnable pipelines with fixtures
-schemas/                 JSON Schema for the YAML pipeline format
-docs/EXPR_ABI.md         Expression-engine ABI reference
-docs/SSISEXPR.md         SSIS-EL function reference (for `.dtsx` migrations)
-SPEC.md                  Full project design (text-first, types, ABI, …)
+include/betl/             Public C ABI: provider.h, version.h
+src/cli/                  betl binary (run, validate)
+src/loader/               provider registry + dlopen
+src/pipeline/             YAML → in-memory pipeline AST
+src/runtime/              executor, builtins, transforms, db sinks/lookups
+src/yaml/                 libyaml-backed parser
+providers/betl-lua/       Lua provider plugin (+expression engine)
+providers/betl-ssisexpr/  SSIS Expression Language engine
+providers/betl-dotnet/    dotnet.task / dotnet.script provider
+tools/betl-dtsx2yaml/     DTSX → betl YAML converter (C# console app)
+tests/                    C tests; ctest harness; integration tests gated on
+                          a sibling Postgres / MSSQL
+examples/                 Runnable pipelines with fixtures
+schemas/                  JSON Schema for the YAML pipeline format
+docs/EXPR_ABI.md          Expression-engine ABI reference
+docs/SSISEXPR.md          SSIS-EL function reference (for `.dtsx` migrations)
+SPEC.md                   Full betl-legacy design (text-first, types, ABI, …)
+SPEC_CORE.md              Runtime-neutral contract; what conforming
+                          implementations must honor
 ```
 
 ## Learn more
 
-- `SPEC.md` — design and rationale, including the type system
-  (Apache Arrow), the provider model, and v0.1 vs. v1 commitments.
+- [`SPEC_CORE.md`](SPEC_CORE.md) — the runtime-neutral contract: file
+  format, step types, type system, placeholder mechanism, validation
+  rules, conformance levels. What any betl implementation must honor.
+- [`SPEC.md`](SPEC.md) — full betl-legacy design and rationale,
+  including the type system (Apache Arrow), the provider model, and
+  v0.x vs. v1 commitments.
 - `include/betl/provider.h` — authoritative C ABI for components and
   expression engines.
 - `docs/EXPR_ABI.md` — companion guide for engine authors.
 - `docs/SSISEXPR.md` — SSIS Expression Language reference: supported
   casts, function set, NULL semantics, and what's deferred to v2.
-- `examples/` — four end-to-end pipelines covering CSV ingest, star
-  build, CRM migration, and SSIS-style date enrichment.
+- `examples/` — end-to-end pipelines covering CSV ingest, star build,
+  CRM migration, and SSIS-style date enrichment.
 
 ## License
 
