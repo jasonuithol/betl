@@ -44,6 +44,7 @@ declare -a SHAPES=(
     "pc-decimal|$ROWS_PC|dotnet.pipelinecomponent 5 decimal cells/row"
     "pc-async-aggregate|$ROWS_PC|dotnet.pipelinecomponent async N → 1 summary"
     "pc-vs-lua-script|$ROWS_PC|lua.script 1-col passthrough (baseline for pc)"
+    "pc-startup|1|dotnet.pipelinecomponent cold + warm start (AOT compile cost)"
 )
 
 # Each mode: env settings + label.
@@ -56,8 +57,64 @@ declare -a MODES=(
 results_file="$(mktemp)"
 trap 'rm -f "$results_file"' EXIT
 
+# The pc-startup shape gets bespoke handling — it measures end-to-end
+# cold-load + first-batch cost, not steady-state throughput. We run it
+# with --no-warmup and a single timed iteration, once with the AOT
+# compile cache pre-cleared (mode=cold) and once with the cache warm
+# (mode=warm). Parallel mode is irrelevant to startup cost so the
+# usual mode loop is skipped.
+DOTNET_CACHE_DIR="${BETL_DOTNET_CACHE_DIR:-$HOME/.cache/betl/dotnet}"
+
+run_pc_startup() {
+    local shape="$1"
+    echo "# $shape: cold + warm startup timing" >&2
+    # Cold: clear the per-source-hash compile cache so the AOT publish
+    # has to run from scratch. NuGet cache (~/.nuget) stays warm to
+    # match the user-visible second-deploy case; first-ever-deploy on
+    # a clean machine is even slower.
+    rm -rf "$DOTNET_CACHE_DIR" 2>/dev/null || true
+    set +e
+    out=$(env -i HOME="$HOME" PATH="$PATH" \
+          LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+          BETL_DOTNET_ROOT="${BETL_DOTNET_ROOT:-}" \
+          BETL_PARALLEL=off \
+          "$bin" "$shape" 1 --rows 1 --no-warmup --mode cold)
+    rc=$?
+    set -e
+    if [[ $rc -eq 77 ]]; then
+        echo "  cold: SKIPPED" >&2
+    elif [[ $rc -ne 0 ]]; then
+        echo "  cold: FAILED" >&2
+    else
+        echo "  cold: $out" >&2
+        echo "$out" >> "$results_file"
+    fi
+    # Warm: don't clear cache; the cold run above populated it. Run
+    # the same iter shape so timings are comparable.
+    set +e
+    out=$(env -i HOME="$HOME" PATH="$PATH" \
+          LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+          BETL_DOTNET_ROOT="${BETL_DOTNET_ROOT:-}" \
+          BETL_PARALLEL=off \
+          "$bin" "$shape" 5 --rows 1 --no-warmup --mode warm)
+    rc=$?
+    set -e
+    if [[ $rc -eq 77 ]]; then
+        echo "  warm: SKIPPED" >&2
+    elif [[ $rc -ne 0 ]]; then
+        echo "  warm: FAILED" >&2
+    else
+        echo "  warm: $out" >&2
+        echo "$out" >> "$results_file"
+    fi
+}
+
 for shape_entry in "${SHAPES[@]}"; do
     IFS='|' read -r shape rows description <<<"$shape_entry"
+    if [[ "$shape" == "pc-startup" ]]; then
+        run_pc_startup "$shape"
+        continue
+    fi
     echo "# $shape ($rows rows): $description" >&2
     for mode_entry in "${MODES[@]}"; do
         IFS='|' read -r mode envs <<<"$mode_entry"
@@ -128,10 +185,11 @@ mkdir -p "$(dirname "$out_md")"
     echo
     echo "The \`pc-*\` shapes exercise the NativeAOT-compiled SSIS"
     echo "PipelineComponent path. Each first-run incurs a one-time AOT"
-    echo "publish (a few seconds for a trivial component); subsequent"
-    echo "runs hit the per-source-hash compile cache and are near-zero"
-    echo "warmup. The harness's pre-timing warmup absorbs that compile,"
-    echo "so the reported numbers are steady-state per-row throughput."
+    echo "publish; see \`pc-startup\` below for the measured cold/warm"
+    echo "split (typically ~1.5 s cold for a trivial component, sub-ms"
+    echo "warm on cache hit). The per-row \`pc-*\` shapes' pre-timing"
+    echo "warmup absorbs that compile, so the reported wall_min etc."
+    echo "are steady-state per-row throughput, not cold-start."
     echo
     echo "Throughput notes:"
     echo
@@ -170,6 +228,26 @@ mkdir -p "$(dirname "$out_md")"
         IFS='|' read -r shape rows description <<<"$shape_entry"
         echo "## \`$shape\` — $description"
         echo
+        if [[ "$shape" == "pc-startup" ]]; then
+            echo "End-to-end wall time from \`bench/betl_bench\` launch to"
+            echo "process exit on a 1-row pipeline. **Cold** clears the per-"
+            echo "source-hash AOT cache (\`\$HOME/.cache/betl/dotnet\`) before"
+            echo "the run; the AOT publish runs from scratch (NuGet cache is"
+            echo "still warm). **Warm** reuses the cached .so."
+            echo
+            for mode in cold warm; do
+                line=$(grep "^$shape,$mode," "$results_file" || true)
+                if [[ -z "$line" ]]; then continue; fi
+                wmin=$(echo "$line"  | awk -F, '{print $5}')
+                wp50=$(echo "$line"  | awk -F, '{print $6}')
+                wmax=$(echo "$line"  | awk -F, '{print $7}')
+                maxrss=$(echo "$line" | awk -F, '{print $11}')
+                printf -- "- **%s**: min=%s ms · p50=%s ms · max=%s ms · maxrss=%s KB\n" \
+                    "$mode" "$wmin" "$wp50" "$wmax" "$maxrss"
+            done
+            echo
+            continue
+        fi
         echo "Rows: $rows"
         echo
         # Pull values for this shape.

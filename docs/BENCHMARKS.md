@@ -34,10 +34,11 @@ What that implies:
 
 The `pc-*` shapes exercise the NativeAOT-compiled SSIS
 PipelineComponent path. Each first-run incurs a one-time AOT
-publish (a few seconds for a trivial component); subsequent
-runs hit the per-source-hash compile cache and are near-zero
-warmup. The harness's pre-timing warmup absorbs that compile,
-so the reported numbers are steady-state per-row throughput.
+publish; see `pc-startup` below for the measured cold/warm
+split (typically ~1.5 s cold for a trivial component, sub-ms
+warm on cache hit). The per-row `pc-*` shapes' pre-timing
+warmup absorbs that compile, so the reported wall_min etc.
+are steady-state per-row throughput, not cold-start.
 
 Throughput notes:
 
@@ -76,109 +77,120 @@ Tunables: `BETL_BENCH_ITERS`, `BETL_BENCH_ROWS`,
 
 Rows: 500000
 
-- **serial**: min=3.83 ms · p50=3.89 ms · max=4.05 ms · 130456064 rows/s · maxrss=7996 KB
-- **par1**: min=4.80 ms · p50=4.86 ms · max=5.78 ms · 104146597 rows/s · maxrss=8396 KB
-- **par4**: min=3.78 ms · p50=3.92 ms · max=4.36 ms · 132398845 rows/s · maxrss=8432 KB
+- **serial**: min=3.79 ms · p50=4.13 ms · max=4.60 ms · 131962507 rows/s · maxrss=8300 KB
+- **par1**: min=4.34 ms · p50=4.73 ms · max=5.46 ms · 115101475 rows/s · maxrss=8384 KB
+- **par4**: min=3.53 ms · p50=3.64 ms · max=3.92 ms · 141490907 rows/s · maxrss=8460 KB
 
-**Speedup (serial → par4): 1.01x**
+**Speedup (serial → par4): 1.07x**
 
 ## `map-arith` — gen → ssisexpr arithmetic → count
 
 Rows: 500000
 
-- **serial**: min=21.78 ms · p50=22.37 ms · max=23.06 ms · 22961048 rows/s · maxrss=8172 KB
-- **par1**: min=22.46 ms · p50=22.71 ms · max=24.11 ms · 22266573 rows/s · maxrss=8360 KB
-- **par4**: min=21.46 ms · p50=21.63 ms · max=23.63 ms · 23295419 rows/s · maxrss=8408 KB
+- **serial**: min=21.98 ms · p50=23.25 ms · max=23.72 ms · 22752371 rows/s · maxrss=8220 KB
+- **par1**: min=22.64 ms · p50=22.85 ms · max=23.54 ms · 22079940 rows/s · maxrss=8328 KB
+- **par4**: min=21.55 ms · p50=22.45 ms · max=22.80 ms · 23202929 rows/s · maxrss=8684 KB
 
-**Speedup (serial → par4): 1.01x**
+**Speedup (serial → par4): 1.02x**
 
 ## `sort` — gen → sort desc → count (materializes)
 
 Rows: 500000
 
-- **serial**: min=37.03 ms · p50=38.16 ms · max=40.21 ms · 13501329 rows/s · maxrss=19904 KB
-- **par1**: min=37.52 ms · p50=38.14 ms · max=38.94 ms · 13325652 rows/s · maxrss=31572 KB
-- **par4**: min=36.10 ms · p50=38.15 ms · max=38.86 ms · 13850149 rows/s · maxrss=31504 KB
+- **serial**: min=36.54 ms · p50=36.71 ms · max=38.32 ms · 13684989 rows/s · maxrss=20032 KB
+- **par1**: min=36.89 ms · p50=37.92 ms · max=38.73 ms · 13554594 rows/s · maxrss=31280 KB
+- **par4**: min=36.73 ms · p50=38.05 ms · max=38.76 ms · 13614521 rows/s · maxrss=31648 KB
 
-**Speedup (serial → par4): 1.03x**
+**Speedup (serial → par4): 0.99x**
 
 ## `chain` — gen → 4× ssisexpr map → count
 
 Rows: 500000
 
-- **serial**: min=60.08 ms · p50=60.99 ms · max=61.67 ms · 8322898 rows/s · maxrss=8196 KB
-- **par1**: min=18.55 ms · p50=19.02 ms · max=20.13 ms · 26948634 rows/s · maxrss=9016 KB
-- **par4**: min=17.42 ms · p50=17.68 ms · max=18.05 ms · 28710458 rows/s · maxrss=10140 KB
+- **serial**: min=60.14 ms · p50=60.77 ms · max=63.40 ms · 8313479 rows/s · maxrss=8464 KB
+- **par1**: min=18.33 ms · p50=18.70 ms · max=24.49 ms · 27280788 rows/s · maxrss=8944 KB
+- **par4**: min=17.26 ms · p50=17.64 ms · max=18.93 ms · 28977056 rows/s · maxrss=10108 KB
 
-**Speedup (serial → par4): 3.45x**
+**Speedup (serial → par4): 3.48x**
 
 ## `csv-rt` — csv.read → ssisexpr map → csv.write
 
 Rows: 500000
 
-- **serial**: min=500.91 ms · p50=502.98 ms · max=516.29 ms · 998179 rows/s · maxrss=9204 KB
-- **par1**: min=481.03 ms · p50=496.84 ms · max=499.85 ms · 1039430 rows/s · maxrss=10356 KB
-- **par4**: min=463.64 ms · p50=479.67 ms · max=494.20 ms · 1078423 rows/s · maxrss=10552 KB
+- **serial**: min=492.08 ms · p50=493.61 ms · max=511.51 ms · 1016087 rows/s · maxrss=8924 KB
+- **par1**: min=491.34 ms · p50=496.84 ms · max=511.59 ms · 1017633 rows/s · maxrss=10356 KB
+- **par4**: min=469.58 ms · p50=482.90 ms · max=497.53 ms · 1064782 rows/s · maxrss=10176 KB
 
-**Speedup (serial → par4): 1.08x**
+**Speedup (serial → par4): 1.05x**
 
 ## `pc-passthrough-1col` — dotnet.pipelinecomponent 1-col passthrough
 
 Rows: 100000
 
-- **serial**: min=6.72 ms · p50=7.27 ms · max=15.10 ms · 14889948 rows/s · maxrss=59564 KB
-- **par1**: min=7.27 ms · p50=7.48 ms · max=16.40 ms · 13750745 rows/s · maxrss=59740 KB
-- **par4**: min=7.37 ms · p50=7.49 ms · max=16.55 ms · 13572491 rows/s · maxrss=59596 KB
+- **serial**: min=7.03 ms · p50=7.17 ms · max=14.82 ms · 14225051 rows/s · maxrss=59764 KB
+- **par1**: min=7.12 ms · p50=7.44 ms · max=16.28 ms · 14039399 rows/s · maxrss=59360 KB
+- **par4**: min=6.92 ms · p50=7.08 ms · max=15.57 ms · 14457839 rows/s · maxrss=59624 KB
 
-**Speedup (serial → par4): 0.91x**
+**Speedup (serial → par4): 1.02x**
 
 ## `pc-passthrough-10col` — dotnet.pipelinecomponent 10-col passthrough
 
 Rows: 100000
 
-- **serial**: min=23.38 ms · p50=24.46 ms · max=26.58 ms · 4277743 rows/s · maxrss=63924 KB
-- **par1**: min=23.68 ms · p50=23.95 ms · max=25.53 ms · 4222165 rows/s · maxrss=63952 KB
-- **par4**: min=22.54 ms · p50=23.72 ms · max=26.52 ms · 4437005 rows/s · maxrss=64204 KB
+- **serial**: min=23.81 ms · p50=24.29 ms · max=25.98 ms · 4200785 rows/s · maxrss=63864 KB
+- **par1**: min=23.18 ms · p50=24.20 ms · max=25.48 ms · 4313230 rows/s · maxrss=63644 KB
+- **par4**: min=23.01 ms · p50=24.78 ms · max=25.85 ms · 4346789 rows/s · maxrss=63860 KB
 
-**Speedup (serial → par4): 1.04x**
+**Speedup (serial → par4): 1.03x**
 
 ## `pc-error-route` — dotnet.pipelinecomponent error_output (10% tagged)
 
 Rows: 100000
 
-- **serial**: min=7.13 ms · p50=7.33 ms · max=15.21 ms · 14032797 rows/s · maxrss=59860 KB
-- **par1**: min=7.68 ms · p50=8.37 ms · max=16.31 ms · 13018518 rows/s · maxrss=59908 KB
-- **par4**: min=7.52 ms · p50=8.16 ms · max=15.80 ms · 13300499 rows/s · maxrss=60128 KB
+- **serial**: min=7.09 ms · p50=7.36 ms · max=14.96 ms · 14095660 rows/s · maxrss=60084 KB
+- **par1**: min=7.51 ms · p50=8.03 ms · max=16.28 ms · 13320810 rows/s · maxrss=60236 KB
+- **par4**: min=7.31 ms · p50=7.58 ms · max=15.86 ms · 13683706 rows/s · maxrss=60112 KB
 
-**Speedup (serial → par4): 0.95x**
+**Speedup (serial → par4): 0.97x**
 
 ## `pc-decimal` — dotnet.pipelinecomponent 5 decimal cells/row
 
 Rows: 100000
 
-- **serial**: min=35.47 ms · p50=36.30 ms · max=37.61 ms · 2819024 rows/s · maxrss=62896 KB
-- **par1**: min=33.65 ms · p50=34.30 ms · max=38.77 ms · 2971937 rows/s · maxrss=63260 KB
-- **par4**: min=33.99 ms · p50=35.50 ms · max=38.59 ms · 2941613 rows/s · maxrss=63264 KB
+- **serial**: min=32.19 ms · p50=34.52 ms · max=36.73 ms · 3106752 rows/s · maxrss=63548 KB
+- **par1**: min=33.31 ms · p50=34.84 ms · max=38.69 ms · 3002178 rows/s · maxrss=63256 KB
+- **par4**: min=32.47 ms · p50=34.52 ms · max=38.87 ms · 3079539 rows/s · maxrss=63056 KB
 
-**Speedup (serial → par4): 1.04x**
+**Speedup (serial → par4): 0.99x**
 
 ## `pc-async-aggregate` — dotnet.pipelinecomponent async N → 1 summary
 
 Rows: 100000
 
-- **serial**: min=3.30 ms · p50=3.49 ms · max=3.62 ms · 30301524 rows/s · maxrss=37900 KB
-- **par1**: min=3.73 ms · p50=3.86 ms · max=3.98 ms · 26840680 rows/s · maxrss=37844 KB
-- **par4**: min=3.73 ms · p50=3.84 ms · max=3.91 ms · 26830814 rows/s · maxrss=38012 KB
+- **serial**: min=3.36 ms · p50=3.41 ms · max=3.70 ms · 29794919 rows/s · maxrss=37908 KB
+- **par1**: min=3.61 ms · p50=3.68 ms · max=3.84 ms · 27693421 rows/s · maxrss=38024 KB
+- **par4**: min=3.53 ms · p50=3.72 ms · max=3.76 ms · 28345338 rows/s · maxrss=38204 KB
 
-**Speedup (serial → par4): 0.88x**
+**Speedup (serial → par4): 0.95x**
 
 ## `pc-vs-lua-script` — lua.script 1-col passthrough (baseline for pc)
 
 Rows: 100000
 
-- **serial**: min=20.27 ms · p50=20.46 ms · max=21.18 ms · 4933217 rows/s · maxrss=8136 KB
-- **par1**: min=20.23 ms · p50=20.37 ms · max=20.81 ms · 4943894 rows/s · maxrss=8732 KB
-- **par4**: min=20.33 ms · p50=20.91 ms · max=21.97 ms · 4919618 rows/s · maxrss=8968 KB
+- **serial**: min=19.81 ms · p50=20.09 ms · max=20.63 ms · 5048831 rows/s · maxrss=8364 KB
+- **par1**: min=20.25 ms · p50=20.45 ms · max=20.68 ms · 4938217 rows/s · maxrss=8860 KB
+- **par4**: min=19.71 ms · p50=20.04 ms · max=20.42 ms · 5072758 rows/s · maxrss=8384 KB
 
-**Speedup (serial → par4): 1.00x**
+**Speedup (serial → par4): 1.01x**
+
+## `pc-startup` — dotnet.pipelinecomponent cold + warm start (AOT compile cost)
+
+End-to-end wall time from `bench/betl_bench` launch to
+process exit on a 1-row pipeline. **Cold** clears the per-
+source-hash AOT cache (`$HOME/.cache/betl/dotnet`) before
+the run; the AOT publish runs from scratch (NuGet cache is
+still warm). **Warm** reuses the cached .so.
+
+- **cold**: min=1473.60 ms · p50=1473.60 ms · max=1473.60 ms · maxrss=9776 KB
+- **warm**: min=0.63 ms · p50=0.64 ms · max=2.03 ms · maxrss=9848 KB
 

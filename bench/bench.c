@@ -521,6 +521,18 @@ static void build_pc_async_aggregate(char *buf, size_t cap,
         rows, batch);
 }
 
+/* Startup-only measurement. 1-row pipeline with the same source as
+ * pc-passthrough-1col so the AOT compile cache key matches: pre-clear
+ * the cache to measure cold-start, re-run for warm-start. Used by
+ * run.sh's pc-startup mode, with --no-warmup so the timed iter
+ * captures the full cold-load lifecycle. */
+static void build_pc_startup(char *buf, size_t cap,
+                             int rows, int batch,
+                             const char *csv_in, const char *csv_out) {
+    (void)rows;
+    build_pc_passthrough_1col(buf, cap, 1, batch, csv_in, csv_out);
+}
+
 /* Same shape as pc-passthrough-1col but routed through lua.script
  * (the SSIS-equivalent async-script-component analogue). Apples-to-apples
  * comparison of per-row scripting overhead between the .NET AOT path
@@ -623,6 +635,8 @@ static const Shape SHAPES[] = {
       "gen → dotnet.pipelinecomponent async (N → 1 summary row) → count" },
     { "pc-vs-lua-script",     build_pc_vs_lua_script,     0, 0, 0,
       "gen → lua.script (1-col passthrough) → count — baseline for pc comparison" },
+    { "pc-startup",           build_pc_startup,           0, 0, 1,
+      "1-row dotnet.pipelinecomponent — for cold/warm startup timing" },
 };
 static const size_t N_SHAPES = sizeof SHAPES / sizeof SHAPES[0];
 
@@ -717,12 +731,14 @@ int main(int argc, char **argv) {
 
     int rows = 1000000;
     int batch = 4096;
+    int skip_warmup = 0;
     const char *mode_label = getenv("BETL_PARALLEL");
     if (!mode_label || !*mode_label) mode_label = "default";
     for (int i = 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--rows")  && i + 1 < argc) rows  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mode")  && i + 1 < argc) mode_label = argv[++i];
+        else if (!strcmp(argv[i], "--no-warmup")) skip_warmup = 1;
     }
 
     const Shape *sh = NULL;
@@ -763,8 +779,10 @@ int main(int argc, char **argv) {
     double total_user_ms = 0.0, total_sys_ms = 0.0;
     long   max_rss_kb = 0;
 
-    /* Warm-up pass — first run sees disk cache misses + lazy alloc. */
-    {
+    /* Warm-up pass — first run sees disk cache misses + lazy alloc.
+     * Skipped by --no-warmup, used by the startup shapes that need
+     * the cold compile cost to land in the timed iteration. */
+    if (!skip_warmup) {
         char err[1024] = {0};
         int rc = run_yaml(yaml, err, sizeof err);
         if (rc != BETL_OK) {
