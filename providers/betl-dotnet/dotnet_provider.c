@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "10"
+#define BETL_DOTNET_SHIM_ABI_VERSION "11"
 
 
 /* ============================================================== *

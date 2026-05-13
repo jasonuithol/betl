@@ -50,9 +50,14 @@ Throughput notes:
 - **Error routing adds negligible overhead** when a small
   fraction of rows are tagged (`pc-error-route` vs
   `pc-passthrough-1col`).
-- **decimal128 is ~10× slower than int64.** BigInteger.Pow +
-  ToByteArray dominates per cell. Consider whether your SSIS
-  source's decimal columns could be int64 / string instead.
+- **decimal128 is ~5× slower than int64**, with the bulk of
+  the cost now in the per-cell `new byte[16]` heap allocation
+  on the C# side rather than the 128-bit arithmetic itself
+  (the original BigInteger-based path was ~10× slower; the
+  switch to System.Int128 / UInt128 + power-of-10 lookup more
+  than doubled throughput). Further speedup would need a
+  staging refactor to use stackalloc Span<byte> instead of
+  heap-allocated byte[].
 - **Async aggregator is fastest.** Only one output row total,
   no per-row Set in the user code.
 - **Parallel mode is a wash** for these shapes — the dotnet
@@ -71,79 +76,79 @@ Tunables: `BETL_BENCH_ITERS`, `BETL_BENCH_ROWS`,
 
 Rows: 500000
 
-- **serial**: min=3.97 ms · p50=4.07 ms · max=4.52 ms · 125930722 rows/s · maxrss=8196 KB
-- **par1**: min=4.47 ms · p50=4.83 ms · max=5.38 ms · 111804298 rows/s · maxrss=8324 KB
-- **par4**: min=3.88 ms · p50=4.06 ms · max=4.54 ms · 129032058 rows/s · maxrss=7968 KB
+- **serial**: min=3.83 ms · p50=3.89 ms · max=4.05 ms · 130456064 rows/s · maxrss=7996 KB
+- **par1**: min=4.80 ms · p50=4.86 ms · max=5.78 ms · 104146597 rows/s · maxrss=8396 KB
+- **par4**: min=3.78 ms · p50=3.92 ms · max=4.36 ms · 132398845 rows/s · maxrss=8432 KB
 
-**Speedup (serial → par4): 1.02x**
+**Speedup (serial → par4): 1.01x**
 
 ## `map-arith` — gen → ssisexpr arithmetic → count
 
 Rows: 500000
 
-- **serial**: min=21.66 ms · p50=22.56 ms · max=23.81 ms · 23085221 rows/s · maxrss=8316 KB
-- **par1**: min=22.94 ms · p50=23.41 ms · max=24.24 ms · 21799965 rows/s · maxrss=8304 KB
-- **par4**: min=21.65 ms · p50=21.95 ms · max=22.34 ms · 23096684 rows/s · maxrss=8608 KB
+- **serial**: min=21.78 ms · p50=22.37 ms · max=23.06 ms · 22961048 rows/s · maxrss=8172 KB
+- **par1**: min=22.46 ms · p50=22.71 ms · max=24.11 ms · 22266573 rows/s · maxrss=8360 KB
+- **par4**: min=21.46 ms · p50=21.63 ms · max=23.63 ms · 23295419 rows/s · maxrss=8408 KB
 
-**Speedup (serial → par4): 1.00x**
+**Speedup (serial → par4): 1.01x**
 
 ## `sort` — gen → sort desc → count (materializes)
 
 Rows: 500000
 
-- **serial**: min=35.93 ms · p50=37.18 ms · max=37.86 ms · 13916852 rows/s · maxrss=19880 KB
-- **par1**: min=37.35 ms · p50=38.11 ms · max=38.52 ms · 13388187 rows/s · maxrss=30960 KB
-- **par4**: min=36.65 ms · p50=38.00 ms · max=39.29 ms · 13642933 rows/s · maxrss=31832 KB
+- **serial**: min=37.03 ms · p50=38.16 ms · max=40.21 ms · 13501329 rows/s · maxrss=19904 KB
+- **par1**: min=37.52 ms · p50=38.14 ms · max=38.94 ms · 13325652 rows/s · maxrss=31572 KB
+- **par4**: min=36.10 ms · p50=38.15 ms · max=38.86 ms · 13850149 rows/s · maxrss=31504 KB
 
-**Speedup (serial → par4): 0.98x**
+**Speedup (serial → par4): 1.03x**
 
 ## `chain` — gen → 4× ssisexpr map → count
 
 Rows: 500000
 
-- **serial**: min=58.75 ms · p50=60.28 ms · max=62.09 ms · 8511246 rows/s · maxrss=8204 KB
-- **par1**: min=18.29 ms · p50=19.93 ms · max=20.77 ms · 27330923 rows/s · maxrss=8988 KB
-- **par4**: min=17.30 ms · p50=18.04 ms · max=19.26 ms · 28899848 rows/s · maxrss=9760 KB
+- **serial**: min=60.08 ms · p50=60.99 ms · max=61.67 ms · 8322898 rows/s · maxrss=8196 KB
+- **par1**: min=18.55 ms · p50=19.02 ms · max=20.13 ms · 26948634 rows/s · maxrss=9016 KB
+- **par4**: min=17.42 ms · p50=17.68 ms · max=18.05 ms · 28710458 rows/s · maxrss=10140 KB
 
-**Speedup (serial → par4): 3.40x**
+**Speedup (serial → par4): 3.45x**
 
 ## `csv-rt` — csv.read → ssisexpr map → csv.write
 
 Rows: 500000
 
-- **serial**: min=498.89 ms · p50=511.41 ms · max=513.23 ms · 1002217 rows/s · maxrss=9160 KB
-- **par1**: min=481.29 ms · p50=487.83 ms · max=502.25 ms · 1038870 rows/s · maxrss=10460 KB
-- **par4**: min=477.12 ms · p50=480.92 ms · max=487.79 ms · 1047957 rows/s · maxrss=10272 KB
+- **serial**: min=500.91 ms · p50=502.98 ms · max=516.29 ms · 998179 rows/s · maxrss=9204 KB
+- **par1**: min=481.03 ms · p50=496.84 ms · max=499.85 ms · 1039430 rows/s · maxrss=10356 KB
+- **par4**: min=463.64 ms · p50=479.67 ms · max=494.20 ms · 1078423 rows/s · maxrss=10552 KB
 
-**Speedup (serial → par4): 1.05x**
+**Speedup (serial → par4): 1.08x**
 
 ## `pc-passthrough-1col` — dotnet.pipelinecomponent 1-col passthrough
 
 Rows: 100000
 
-- **serial**: min=6.85 ms · p50=7.13 ms · max=15.71 ms · 14597758 rows/s · maxrss=59548 KB
-- **par1**: min=7.05 ms · p50=7.65 ms · max=15.63 ms · 14182408 rows/s · maxrss=59480 KB
-- **par4**: min=7.26 ms · p50=7.58 ms · max=16.61 ms · 13774048 rows/s · maxrss=59804 KB
+- **serial**: min=6.72 ms · p50=7.27 ms · max=15.10 ms · 14889948 rows/s · maxrss=59564 KB
+- **par1**: min=7.27 ms · p50=7.48 ms · max=16.40 ms · 13750745 rows/s · maxrss=59740 KB
+- **par4**: min=7.37 ms · p50=7.49 ms · max=16.55 ms · 13572491 rows/s · maxrss=59596 KB
 
-**Speedup (serial → par4): 0.94x**
+**Speedup (serial → par4): 0.91x**
 
 ## `pc-passthrough-10col` — dotnet.pipelinecomponent 10-col passthrough
 
 Rows: 100000
 
-- **serial**: min=23.93 ms · p50=24.75 ms · max=27.58 ms · 4178704 rows/s · maxrss=63448 KB
-- **par1**: min=23.44 ms · p50=24.15 ms · max=25.92 ms · 4266892 rows/s · maxrss=63488 KB
-- **par4**: min=23.61 ms · p50=24.91 ms · max=25.13 ms · 4235726 rows/s · maxrss=64316 KB
+- **serial**: min=23.38 ms · p50=24.46 ms · max=26.58 ms · 4277743 rows/s · maxrss=63924 KB
+- **par1**: min=23.68 ms · p50=23.95 ms · max=25.53 ms · 4222165 rows/s · maxrss=63952 KB
+- **par4**: min=22.54 ms · p50=23.72 ms · max=26.52 ms · 4437005 rows/s · maxrss=64204 KB
 
-**Speedup (serial → par4): 1.01x**
+**Speedup (serial → par4): 1.04x**
 
 ## `pc-error-route` — dotnet.pipelinecomponent error_output (10% tagged)
 
 Rows: 100000
 
-- **serial**: min=6.97 ms · p50=7.37 ms · max=16.81 ms · 14353302 rows/s · maxrss=59892 KB
-- **par1**: min=7.70 ms · p50=7.97 ms · max=16.37 ms · 12991648 rows/s · maxrss=60040 KB
-- **par4**: min=7.35 ms · p50=7.58 ms · max=16.17 ms · 13613647 rows/s · maxrss=60060 KB
+- **serial**: min=7.13 ms · p50=7.33 ms · max=15.21 ms · 14032797 rows/s · maxrss=59860 KB
+- **par1**: min=7.68 ms · p50=8.37 ms · max=16.31 ms · 13018518 rows/s · maxrss=59908 KB
+- **par4**: min=7.52 ms · p50=8.16 ms · max=15.80 ms · 13300499 rows/s · maxrss=60128 KB
 
 **Speedup (serial → par4): 0.95x**
 
@@ -151,9 +156,9 @@ Rows: 100000
 
 Rows: 100000
 
-- **serial**: min=74.51 ms · p50=75.21 ms · max=75.77 ms · 1342082 rows/s · maxrss=62060 KB
-- **par1**: min=71.18 ms · p50=72.53 ms · max=73.81 ms · 1404826 rows/s · maxrss=61912 KB
-- **par4**: min=71.87 ms · p50=72.39 ms · max=74.78 ms · 1391454 rows/s · maxrss=62528 KB
+- **serial**: min=35.47 ms · p50=36.30 ms · max=37.61 ms · 2819024 rows/s · maxrss=62896 KB
+- **par1**: min=33.65 ms · p50=34.30 ms · max=38.77 ms · 2971937 rows/s · maxrss=63260 KB
+- **par4**: min=33.99 ms · p50=35.50 ms · max=38.59 ms · 2941613 rows/s · maxrss=63264 KB
 
 **Speedup (serial → par4): 1.04x**
 
@@ -161,19 +166,19 @@ Rows: 100000
 
 Rows: 100000
 
-- **serial**: min=3.28 ms · p50=3.41 ms · max=4.08 ms · 30455650 rows/s · maxrss=37888 KB
-- **par1**: min=3.59 ms · p50=3.90 ms · max=4.97 ms · 27845419 rows/s · maxrss=37968 KB
-- **par4**: min=3.56 ms · p50=3.82 ms · max=3.88 ms · 28080548 rows/s · maxrss=38120 KB
+- **serial**: min=3.30 ms · p50=3.49 ms · max=3.62 ms · 30301524 rows/s · maxrss=37900 KB
+- **par1**: min=3.73 ms · p50=3.86 ms · max=3.98 ms · 26840680 rows/s · maxrss=37844 KB
+- **par4**: min=3.73 ms · p50=3.84 ms · max=3.91 ms · 26830814 rows/s · maxrss=38012 KB
 
-**Speedup (serial → par4): 0.92x**
+**Speedup (serial → par4): 0.88x**
 
 ## `pc-vs-lua-script` — lua.script 1-col passthrough (baseline for pc)
 
 Rows: 100000
 
-- **serial**: min=18.93 ms · p50=20.41 ms · max=20.56 ms · 5281683 rows/s · maxrss=8712 KB
-- **par1**: min=20.03 ms · p50=20.77 ms · max=21.18 ms · 4992766 rows/s · maxrss=8704 KB
-- **par4**: min=22.31 ms · p50=23.13 ms · max=23.33 ms · 4481951 rows/s · maxrss=8888 KB
+- **serial**: min=20.27 ms · p50=20.46 ms · max=21.18 ms · 4933217 rows/s · maxrss=8136 KB
+- **par1**: min=20.23 ms · p50=20.37 ms · max=20.81 ms · 4943894 rows/s · maxrss=8732 KB
+- **par4**: min=20.33 ms · p50=20.91 ms · max=21.97 ms · 4919618 rows/s · maxrss=8968 KB
 
-**Speedup (serial → par4): 0.85x**
+**Speedup (serial → par4): 1.00x**
 

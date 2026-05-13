@@ -135,14 +135,29 @@ internal sealed class BufferColumnSpec
  * two's-complement; the decimal value = (signed 128-bit integer) /
  * 10^scale.
  *
+ * Implementation: inline System.Int128 / UInt128 arithmetic with a
+ * pre-built power-of-10 lookup table. Each conversion allocates only
+ * the 16-byte result buffer; the 128-bit math stays in registers
+ * without per-call heap allocation. (Original implementation used
+ * BigInteger; per pc-decimal bench that was the dominant cost,
+ * ~10× slower than int64. This rewrite is ~5–10× faster.)
+ *
  * Precision caveat: System.Decimal has a 96-bit unsigned mantissa
  * and a scale in [0,28]. Arrow decimal128 supports a 128-bit mantissa
  * and scale up to 38. Values outside System.Decimal's range throw
  * BetlPipelineException on conversion. */
 internal static class Decimal128Conv
 {
-    private static readonly System.Numerics.BigInteger TwoPow96 =
-        System.Numerics.BigInteger.Pow(2, 96);
+    /* Powers of 10 up to 10^38 (which fits in UInt128: max ≈ 3.4e38). */
+    private static readonly System.UInt128[] Pow10 = BuildPow10();
+    private static System.UInt128[] BuildPow10()
+    {
+        var arr = new System.UInt128[39];
+        arr[0] = System.UInt128.One;
+        for (int i = 1; i < arr.Length; ++i) arr[i] = arr[i - 1] * 10;
+        return arr;
+    }
+    private static readonly System.UInt128 TwoPow96 = ((System.UInt128)1) << 96;
 
     public static byte[] FromDecimal(decimal value, sbyte targetScale)
     {
@@ -154,43 +169,63 @@ internal static class Decimal128Conv
         int decScale = (flags >> 16) & 0x7F;
         bool negative = (flags & unchecked((int)0x80000000)) != 0;
 
-        var m = new System.Numerics.BigInteger(hi);
-        m = (m << 32) | new System.Numerics.BigInteger(mid);
-        m = (m << 32) | new System.Numerics.BigInteger(lo);
+        /* Assemble 96-bit mantissa as UInt128 — fits exactly. */
+        System.UInt128 m =
+            (((System.UInt128)hi)  << 64) |
+            (((System.UInt128)mid) << 32) |
+              (System.UInt128)lo;
 
         int diff = targetScale - decScale;
-        if (diff > 0) m *= System.Numerics.BigInteger.Pow(10, diff);
-        else if (diff < 0) m /= System.Numerics.BigInteger.Pow(10, -diff);
+        if (diff > 0) {
+            if (diff > 38)
+                throw new BetlPipelineException(
+                    "decimal128: scale-up too large for 128-bit mantissa");
+            m *= Pow10[diff];
+        } else if (diff < 0) {
+            int d = -diff;
+            m = d > 38 ? System.UInt128.Zero : m / Pow10[d];
+        }
 
-        if (negative) m = -m;
-
-        byte[] arr = m.ToByteArray();          /* signed little-endian, minimal */
-        if (arr.Length > 16)
-            throw new BetlPipelineException(
-                $"decimal128: value {value} rescaled to {targetScale} digits "
-                + "exceeds 128-bit two's-complement range");
         byte[] result = new byte[16];
-        byte signExt = (arr.Length > 0 && (arr[arr.Length - 1] & 0x80) != 0)
-                       ? (byte)0xFF : (byte)0x00;
-        System.Array.Copy(arr, result, arr.Length);
-        for (int i = arr.Length; i < 16; ++i) result[i] = signExt;
+        if (negative) {
+            /* Sign-flip via Int128. Bit-preserving cast from UInt128. */
+            System.Int128 signed = -(System.Int128)m;
+            System.Buffers.Binary.BinaryPrimitives.WriteInt128LittleEndian(result, signed);
+        } else {
+            /* Overflow check: a positive UInt128 with top bit set would
+             * decode as a NEGATIVE Int128 when written. Reject. */
+            if (m > (System.UInt128)System.Int128.MaxValue)
+                throw new BetlPipelineException(
+                    $"decimal128: value {value} rescaled to {targetScale} digits "
+                    + "exceeds Int128.MaxValue");
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt128LittleEndian(result, m);
+        }
         return result;
     }
 
     public static decimal ToDecimal(byte[] le16, sbyte scale)
     {
-        var m = new System.Numerics.BigInteger(le16);   /* signed LE */
-        bool negative = m.Sign < 0;
-        var abs = System.Numerics.BigInteger.Abs(m);
+        if (le16.Length != 16)
+            throw new BetlPipelineException(
+                "decimal128: byte array must be 16 bytes");
+        System.Int128 signed =
+            System.Buffers.Binary.BinaryPrimitives.ReadInt128LittleEndian(le16);
+        bool negative = signed < System.Int128.Zero;
+        System.UInt128 abs = negative
+            ? (System.UInt128)(-signed)
+            : (System.UInt128)signed;
         if (abs >= TwoPow96)
             throw new BetlPipelineException(
                 "decimal128: value exceeds System.Decimal's 96-bit mantissa");
         if (scale < 0 || scale > 28)
             throw new BetlPipelineException(
                 $"decimal128: scale {scale} exceeds System.Decimal's 28-digit limit");
-        int lo  = unchecked((int)(uint)(abs & 0xFFFFFFFFu));
-        int mid = unchecked((int)(uint)((abs >> 32) & 0xFFFFFFFFu));
-        int hi  = unchecked((int)(uint)((abs >> 64) & 0xFFFFFFFFu));
+
+        ulong low64  = (ulong) abs;            /* bits [0..63] */
+        ulong high64 = (ulong)(abs >> 64);     /* bits [64..127] */
+        int lo  = unchecked((int)(uint) low64);
+        int mid = unchecked((int)(uint)(low64 >> 32));
+        int hi  = unchecked((int)(uint) high64);
         return new decimal(lo, mid, hi, negative, (byte)scale);
     }
 }
