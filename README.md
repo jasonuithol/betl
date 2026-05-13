@@ -99,7 +99,7 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 ## Migrating from SSIS
 
 SSIS migration is one supported use case, not the headline. betl-legacy
-ships three pieces aimed at it:
+ships four pieces aimed at it:
 
 - **`betl-dtsx2yaml`** (in `tools/`) — a C# console converter that reads
   `.dtsx` packages and emits betl YAML. Handles OLEDB / Flat File sources
@@ -118,11 +118,20 @@ ships three pieces aimed at it:
 - **`dotnet.task` / `dotnet.script`** — C# / VB.NET Script Task and
   Script Component analogues, with NativeAOT compile-on-validate. The
   designer-free runtime side of SSIS scripting.
+- **`dotnet.pipelinecomponent`** — hosts user-written
+  `Microsoft.SqlServer.Dts.Pipeline.PipelineComponent` subclasses via
+  a NativeAOT-compiled `Betl.Ssis.PipelineCompat` shim. Source you'd
+  drop into a custom SSIS PipelineComponent compiles, with the same
+  SSIS-faithful API surface: `ProcessInput(int, PipelineBuffer)`,
+  `BufferManager.FindColumnByLineageID`, `DirectErrorRow`, sync + async
+  modes, error-row routing via a `error_out` port, Connection Manager
+  lookup, the full SSIS DataType set (DT_I1..DT_NUMERIC including
+  GUID + decimal128). See [`docs/PIPELINECOMPONENT.md`](docs/PIPELINECOMPONENT.md).
 
 The longer-term plan is for `betl.dotnet` (planned, see
 [SPEC_CORE.md §14](SPEC_CORE.md)) to host **compiled SSIS
-PipelineComponents** in-process via a `Betl.Ssis.PipelineCompat.dll`
-shim — recompile a third-party C# component against the shim, drop the
+PipelineComponents** in-process via the same shim assembly —
+recompile a third-party C# component against the shim, drop the
 `.dll` into a plugins directory, run it on Linux without SSDT or SQL
 Server.
 
@@ -155,6 +164,7 @@ Server.
 | TRANSFORM | `lua.map` | ✓ | Per-row Lua script; mutate `row` and return (synchronous, 1:1) |
 | TRANSFORM | `lua.script` | ✓ | Stateful Lua: `on_row`/`on_eof` + `emit()`; SSIS async script component (1:N, N:1, windowed) |
 | TRANSFORM | `dotnet.script` | ✓ | Stateful C# / VB.NET async script component; NativeAOT compile-on-validate; same protocol as `lua.script` |
+| TRANSFORM | `dotnet.pipelinecomponent` | ✓ | Hosts user-written `PipelineComponent` source with the SSIS lifecycle; sync + async modes, error-row routing, full DataType set incl. decimal128 / GUID / timestamps. See [`docs/PIPELINECOMPONENT.md`](docs/PIPELINECOMPONENT.md) |
 | TASK | `lua.task` | ✓ | Standalone Lua script with host bridges |
 | TASK | `dotnet.task` | ✓ | Standalone C# / VB.NET Script Task analogue; NativeAOT compile-on-validate; Params / Connection / Log bridges |
 | TOOL | `betl-dtsx2yaml` | ✓ | DTSX → betl YAML converter; ships in `tools/`, runs separately from `betl run` |
@@ -256,7 +266,8 @@ src/runtime/              executor, builtins, transforms, db sinks/lookups
 src/yaml/                 libyaml-backed parser
 providers/betl-lua/       Lua provider plugin (+expression engine)
 providers/betl-ssisexpr/  SSIS Expression Language engine
-providers/betl-dotnet/    dotnet.task / dotnet.script provider
+providers/betl-dotnet/    dotnet.task / dotnet.script / dotnet.pipelinecomponent
+                          provider + Betl.Ssis.PipelineCompat shim
 tools/betl-dtsx2yaml/     DTSX → betl YAML converter (C# console app)
 tests/                    C tests; ctest harness; integration tests gated on
                           a sibling Postgres / MSSQL
@@ -264,6 +275,7 @@ examples/                 Runnable pipelines with fixtures
 schemas/                  JSON Schema for the YAML pipeline format
 docs/EXPR_ABI.md          Expression-engine ABI reference
 docs/SSISEXPR.md          SSIS-EL function reference (for `.dtsx` migrations)
+docs/PIPELINECOMPONENT.md `dotnet.pipelinecomponent` API + porting guide
 SPEC.md                   Full betl-legacy design (text-first, types, ABI, …)
 SPEC_CORE.md              Runtime-neutral contract; what conforming
                           implementations must honor
@@ -282,6 +294,9 @@ SPEC_CORE.md              Runtime-neutral contract; what conforming
 - `docs/EXPR_ABI.md` — companion guide for engine authors.
 - `docs/SSISEXPR.md` — SSIS Expression Language reference: supported
   casts, function set, NULL semantics, and what's deferred to v2.
+- [`docs/PIPELINECOMPONENT.md`](docs/PIPELINECOMPONENT.md) —
+  `dotnet.pipelinecomponent` shim API, sync/async/error modes,
+  type set, and the porting recipe for SSIS source.
 - `examples/` — end-to-end pipelines covering CSV ingest, star build,
   CRM migration, and SSIS-style date enrichment.
 

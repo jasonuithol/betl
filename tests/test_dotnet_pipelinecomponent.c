@@ -571,6 +571,110 @@ static const char PL_TZ_DTO_TIMESPAN[] =
     "        from: t\n"
     "        expect: 2\n";
 
+/* --- Phase 2 coverage closure A: assert error stream's schema by
+ *     reading it from a downstream component that validates the
+ *     ErrorCode + ErrorColumn columns are present. Throws (and fails
+ *     the run) if the schema isn't right. ------------------------ */
+static const char PL_ERROR_SCHEMA_VALIDATES[] =
+    "betl: 1\n"
+    "name: dotnet-pc-error-schema\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        error_output: true\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow())\n"
+    "                if ((buffer.GetInt64(0) & 1) == 1)\n"
+    "                  buffer.DirectErrorRow(0, 999, 0);\n"
+    "            }\n"
+    "          }\n"
+    "      - id: err_check\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: t:error_out\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "          - { name: ErrorCode,   type: i }\n"
+    "          - { name: ErrorColumn, type: i }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline.Wrapper;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void PreExecute() {\n"
+    "              base.PreExecute();\n"
+    "              var input = ComponentMetaData.InputCollection[(object)0];\n"
+    "              bool foundCode = false, foundCol = false;\n"
+    "              foreach (IDTSInputColumn100 c in input.InputColumnCollection) {\n"
+    "                if (c.Name == \"ErrorCode\")   foundCode = true;\n"
+    "                if (c.Name == \"ErrorColumn\") foundCol  = true;\n"
+    "              }\n"
+    "              if (!foundCode || !foundCol)\n"
+    "                throw new System.Exception(\n"
+    "                  \"error stream missing ErrorCode/ErrorColumn cols\");\n"
+    "            }\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) { /* passthrough */ }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: main_sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 2\n"
+    "      - id: err_sink\n"
+    "        type: betl.count_rows\n"
+    "        from: err_check\n"
+    "        expect: 2\n";
+
+/* --- Phase 2 coverage closure B: error_output enabled but no downstream
+ *     wires t:error_out. Rows tagged via DirectErrorRow are dropped
+ *     silently; main port still gets the unflagged rows. -------- */
+static const char PL_ERROR_UNWIRED[] =
+    "betl: 1\n"
+    "name: dotnet-pc-error-unwired\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 4\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        error_output: true\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow())\n"
+    "                if ((buffer.GetInt64(0) & 1) == 1)\n"
+    "                  buffer.DirectErrorRow(0, 999, 0);   /* dropped: nothing wired */\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 2\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -645,6 +749,16 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_TZ_DTO_TIMESPAN, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "tz-dto-timespan: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_ERROR_SCHEMA_VALIDATES, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "error-schema-validates: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_ERROR_UNWIRED, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "error-unwired: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {
