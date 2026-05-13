@@ -19,7 +19,7 @@ What that implies:
 
 - **Long chains of CPU-bound steps** speed up the most.
   Each stage's work overlaps with its neighbours' work.
-  See `chain` below — **~3.5× speedup** at depth=4.
+  See `chain` below.
 - **Trivial pipelines** are flat or slightly slower.
   The ring-buffer handoff adds ~µs of overhead per batch.
   See `filter-count` and `map-arith` below.
@@ -28,59 +28,152 @@ What that implies:
   See `sort` below.
 - **I/O-bound pipelines** benefit modestly; the I/O step's
   syscall time overlaps with the CPU step's compute.
-  See `csv-rt` below — **~12% speedup**.
+  See `csv-rt` below.
+
+### dotnet.pipelinecomponent shapes (`pc-*`)
+
+The `pc-*` shapes exercise the NativeAOT-compiled SSIS
+PipelineComponent path. Each first-run incurs a one-time AOT
+publish (a few seconds for a trivial component); subsequent
+runs hit the per-source-hash compile cache and are near-zero
+warmup. The harness's pre-timing warmup absorbs that compile,
+so the reported numbers are steady-state per-row throughput.
+
+Throughput notes:
+
+- **Single-cell I/O is cheap.** `pc-passthrough-1col` and
+  `pc-async-aggregate` show >10M rows/s — the C↔C# crossings
+  per cell aren't the bottleneck for narrow rows.
+- **Throughput scales linearly with column count.** 10-col
+  passthrough is ~3× slower than 1-col — each Get/Set is its
+  own function-pointer call.
+- **Error routing adds negligible overhead** when a small
+  fraction of rows are tagged (`pc-error-route` vs
+  `pc-passthrough-1col`).
+- **decimal128 is ~10× slower than int64.** BigInteger.Pow +
+  ToByteArray dominates per cell. Consider whether your SSIS
+  source's decimal columns could be int64 / string instead.
+- **Async aggregator is fastest.** Only one output row total,
+  no per-row Set in the user code.
+- **Parallel mode is a wash** for these shapes — the dotnet
+  component is the single hot stage, with little for the
+  pipeline-parallel executor to overlap.
+- **Comparison vs lua.script:** `pc-vs-lua-script` runs the
+  same 1-col passthrough through Lua's VM. dotnet (NativeAOT)
+  is roughly 2.5–3× faster than Lua here. The trade-off is
+  startup: lua.script has no AOT compile.
 
 Reproduce: `make bench` (or `bench/run.sh` directly).
 Tunables: `BETL_BENCH_ITERS`, `BETL_BENCH_ROWS`,
-`BETL_BENCH_CSV_ROWS`.
+`BETL_BENCH_CSV_ROWS`, `BETL_BENCH_PC_ROWS`.
 
 ## `filter-count` — gen → filter(true) → count
 
-Rows: 1000000
+Rows: 500000
 
-- **serial**: min=7.35 ms · p50=7.72 ms · max=8.07 ms · 135986077 rows/s · maxrss=7900 KB
-- **par1**: min=8.70 ms · p50=9.42 ms · max=10.14 ms · 114923335 rows/s · maxrss=8332 KB
-- **par4**: min=7.30 ms · p50=7.36 ms · max=7.71 ms · 137061516 rows/s · maxrss=8428 KB
+- **serial**: min=3.97 ms · p50=4.07 ms · max=4.52 ms · 125930722 rows/s · maxrss=8196 KB
+- **par1**: min=4.47 ms · p50=4.83 ms · max=5.38 ms · 111804298 rows/s · maxrss=8324 KB
+- **par4**: min=3.88 ms · p50=4.06 ms · max=4.54 ms · 129032058 rows/s · maxrss=7968 KB
 
-**Speedup (serial → par4): 1.01x**
+**Speedup (serial → par4): 1.02x**
 
 ## `map-arith` — gen → ssisexpr arithmetic → count
 
-Rows: 1000000
+Rows: 500000
 
-- **serial**: min=41.85 ms · p50=42.23 ms · max=44.47 ms · 23894215 rows/s · maxrss=8160 KB
-- **par1**: min=44.19 ms · p50=44.46 ms · max=45.46 ms · 22632068 rows/s · maxrss=8304 KB
-- **par4**: min=41.64 ms · p50=42.29 ms · max=42.99 ms · 24016313 rows/s · maxrss=8468 KB
+- **serial**: min=21.66 ms · p50=22.56 ms · max=23.81 ms · 23085221 rows/s · maxrss=8316 KB
+- **par1**: min=22.94 ms · p50=23.41 ms · max=24.24 ms · 21799965 rows/s · maxrss=8304 KB
+- **par4**: min=21.65 ms · p50=21.95 ms · max=22.34 ms · 23096684 rows/s · maxrss=8608 KB
 
-**Speedup (serial → par4): 1.01x**
+**Speedup (serial → par4): 1.00x**
 
 ## `sort` — gen → sort desc → count (materializes)
 
-Rows: 1000000
+Rows: 500000
 
-- **serial**: min=73.31 ms · p50=74.83 ms · max=75.64 ms · 13640710 rows/s · maxrss=31476 KB
-- **par1**: min=73.31 ms · p50=75.81 ms · max=76.03 ms · 13640563 rows/s · maxrss=39520 KB
-- **par4**: min=74.18 ms · p50=75.24 ms · max=80.99 ms · 13479945 rows/s · maxrss=39156 KB
+- **serial**: min=35.93 ms · p50=37.18 ms · max=37.86 ms · 13916852 rows/s · maxrss=19880 KB
+- **par1**: min=37.35 ms · p50=38.11 ms · max=38.52 ms · 13388187 rows/s · maxrss=30960 KB
+- **par4**: min=36.65 ms · p50=38.00 ms · max=39.29 ms · 13642933 rows/s · maxrss=31832 KB
 
-**Speedup (serial → par4): 0.99x**
+**Speedup (serial → par4): 0.98x**
 
 ## `chain` — gen → 4× ssisexpr map → count
 
-Rows: 1000000
+Rows: 500000
 
-- **serial**: min=116.03 ms · p50=117.94 ms · max=120.43 ms · 8618406 rows/s · maxrss=8164 KB
-- **par1**: min=35.40 ms · p50=36.24 ms · max=39.48 ms · 28248053 rows/s · maxrss=8940 KB
-- **par4**: min=33.33 ms · p50=33.51 ms · max=34.31 ms · 29998823 rows/s · maxrss=9292 KB
+- **serial**: min=58.75 ms · p50=60.28 ms · max=62.09 ms · 8511246 rows/s · maxrss=8204 KB
+- **par1**: min=18.29 ms · p50=19.93 ms · max=20.77 ms · 27330923 rows/s · maxrss=8988 KB
+- **par4**: min=17.30 ms · p50=18.04 ms · max=19.26 ms · 28899848 rows/s · maxrss=9760 KB
 
-**Speedup (serial → par4): 3.48x**
+**Speedup (serial → par4): 3.40x**
 
 ## `csv-rt` — csv.read → ssisexpr map → csv.write
 
-Rows: 1000000
+Rows: 500000
 
-- **serial**: min=1016.31 ms · p50=1031.42 ms · max=1041.44 ms · 983947 rows/s · maxrss=8996 KB
-- **par1**: min=915.17 ms · p50=925.20 ms · max=949.78 ms · 1092691 rows/s · maxrss=10120 KB
-- **par4**: min=910.34 ms · p50=942.51 ms · max=1011.24 ms · 1098493 rows/s · maxrss=10484 KB
+- **serial**: min=498.89 ms · p50=511.41 ms · max=513.23 ms · 1002217 rows/s · maxrss=9160 KB
+- **par1**: min=481.29 ms · p50=487.83 ms · max=502.25 ms · 1038870 rows/s · maxrss=10460 KB
+- **par4**: min=477.12 ms · p50=480.92 ms · max=487.79 ms · 1047957 rows/s · maxrss=10272 KB
 
-**Speedup (serial → par4): 1.12x**
+**Speedup (serial → par4): 1.05x**
+
+## `pc-passthrough-1col` — dotnet.pipelinecomponent 1-col passthrough
+
+Rows: 100000
+
+- **serial**: min=6.85 ms · p50=7.13 ms · max=15.71 ms · 14597758 rows/s · maxrss=59548 KB
+- **par1**: min=7.05 ms · p50=7.65 ms · max=15.63 ms · 14182408 rows/s · maxrss=59480 KB
+- **par4**: min=7.26 ms · p50=7.58 ms · max=16.61 ms · 13774048 rows/s · maxrss=59804 KB
+
+**Speedup (serial → par4): 0.94x**
+
+## `pc-passthrough-10col` — dotnet.pipelinecomponent 10-col passthrough
+
+Rows: 100000
+
+- **serial**: min=23.93 ms · p50=24.75 ms · max=27.58 ms · 4178704 rows/s · maxrss=63448 KB
+- **par1**: min=23.44 ms · p50=24.15 ms · max=25.92 ms · 4266892 rows/s · maxrss=63488 KB
+- **par4**: min=23.61 ms · p50=24.91 ms · max=25.13 ms · 4235726 rows/s · maxrss=64316 KB
+
+**Speedup (serial → par4): 1.01x**
+
+## `pc-error-route` — dotnet.pipelinecomponent error_output (10% tagged)
+
+Rows: 100000
+
+- **serial**: min=6.97 ms · p50=7.37 ms · max=16.81 ms · 14353302 rows/s · maxrss=59892 KB
+- **par1**: min=7.70 ms · p50=7.97 ms · max=16.37 ms · 12991648 rows/s · maxrss=60040 KB
+- **par4**: min=7.35 ms · p50=7.58 ms · max=16.17 ms · 13613647 rows/s · maxrss=60060 KB
+
+**Speedup (serial → par4): 0.95x**
+
+## `pc-decimal` — dotnet.pipelinecomponent 5 decimal cells/row
+
+Rows: 100000
+
+- **serial**: min=74.51 ms · p50=75.21 ms · max=75.77 ms · 1342082 rows/s · maxrss=62060 KB
+- **par1**: min=71.18 ms · p50=72.53 ms · max=73.81 ms · 1404826 rows/s · maxrss=61912 KB
+- **par4**: min=71.87 ms · p50=72.39 ms · max=74.78 ms · 1391454 rows/s · maxrss=62528 KB
+
+**Speedup (serial → par4): 1.04x**
+
+## `pc-async-aggregate` — dotnet.pipelinecomponent async N → 1 summary
+
+Rows: 100000
+
+- **serial**: min=3.28 ms · p50=3.41 ms · max=4.08 ms · 30455650 rows/s · maxrss=37888 KB
+- **par1**: min=3.59 ms · p50=3.90 ms · max=4.97 ms · 27845419 rows/s · maxrss=37968 KB
+- **par4**: min=3.56 ms · p50=3.82 ms · max=3.88 ms · 28080548 rows/s · maxrss=38120 KB
+
+**Speedup (serial → par4): 0.92x**
+
+## `pc-vs-lua-script` — lua.script 1-col passthrough (baseline for pc)
+
+Rows: 100000
+
+- **serial**: min=18.93 ms · p50=20.41 ms · max=20.56 ms · 5281683 rows/s · maxrss=8712 KB
+- **par1**: min=20.03 ms · p50=20.77 ms · max=21.18 ms · 4992766 rows/s · maxrss=8704 KB
+- **par4**: min=22.31 ms · p50=23.13 ms · max=23.33 ms · 4481951 rows/s · maxrss=8888 KB
+
+**Speedup (serial → par4): 0.85x**
 

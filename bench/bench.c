@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -276,6 +277,283 @@ static void build_chain(char *buf, size_t cap,
         rows, batch, rows);
 }
 
+/* ----- dotnet.pipelinecomponent shapes --------------------------- *
+ *
+ *  pc-passthrough-1col   sync, single int64 cell — baseline FFI cost
+ *  pc-passthrough-10col  sync, 10 int64 cells per row — col-count scaling
+ *  pc-error-route        sync, error_output, ~10% rows tagged
+ *  pc-decimal            5 decimal cells per row — BigInteger cost
+ *  pc-async-aggregate    N → 1 summary row via PostExecute (async mode)
+ *  pc-vs-lua-script      same shape as pc-passthrough-1col but lua.script,
+ *                        for cross-language baseline
+ *
+ * Source class is always `Betl.UserComponent`. The first run of any
+ * given source incurs the AOT publish cost (~10-30s); subsequent runs
+ * hit the per-hash compile cache and are near-instant. The bench
+ * harness's warm-up pass amortises the compile out of the timed runs. */
+
+static void build_pc_passthrough_1col(char *buf, size_t cap,
+                                      int rows, int batch,
+                                      const char *csv_in, const char *csv_out) {
+    (void)csv_in; (void)csv_out;
+    snprintf(buf, cap,
+        "betl: 1\n"
+        "name: bench-pc-passthrough-1col\n"
+        "pipeline:\n"
+        "  - id: stage\n"
+        "    type: dataflow\n"
+        "    steps:\n"
+        "      - id: source\n"
+        "        type: betl.gen_int64\n"
+        "        row_count: %d\n"
+        "        batch_size: %d\n"
+        "      - id: t\n"
+        "        type: dotnet.pipelinecomponent\n"
+        "        from: source\n"
+        "        lang: csharp\n"
+        "        output_schema:\n"
+        "          - { name: id, type: l }\n"
+        "        source: |\n"
+        "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+        "          namespace Betl;\n"
+        "          public class UserComponent : PipelineComponent {\n"
+        "            public override void ProcessInput(int i, PipelineBuffer b) {\n"
+        "              while (b.NextRow()) b.SetInt64(0, b.GetInt64(0));\n"
+        "            }\n"
+        "          }\n"
+        "      - id: sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t\n"
+        "        expect: %d\n",
+        rows, batch, rows);
+}
+
+static void build_pc_passthrough_10col(char *buf, size_t cap,
+                                       int rows, int batch,
+                                       const char *csv_in, const char *csv_out) {
+    (void)csv_in; (void)csv_out;
+    snprintf(buf, cap,
+        "betl: 1\n"
+        "name: bench-pc-passthrough-10col\n"
+        "pipeline:\n"
+        "  - id: stage\n"
+        "    type: dataflow\n"
+        "    steps:\n"
+        "      - id: source\n"
+        "        type: betl.gen_int64\n"
+        "        row_count: %d\n"
+        "        batch_size: %d\n"
+        "      - id: t\n"
+        "        type: dotnet.pipelinecomponent\n"
+        "        from: source\n"
+        "        lang: csharp\n"
+        "        output_schema:\n"
+        "          - { name: id, type: l }\n"
+        "          - { name: c1, type: l }\n"
+        "          - { name: c2, type: l }\n"
+        "          - { name: c3, type: l }\n"
+        "          - { name: c4, type: l }\n"
+        "          - { name: c5, type: l }\n"
+        "          - { name: c6, type: l }\n"
+        "          - { name: c7, type: l }\n"
+        "          - { name: c8, type: l }\n"
+        "          - { name: c9, type: l }\n"
+        "        source: |\n"
+        "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+        "          namespace Betl;\n"
+        "          public class UserComponent : PipelineComponent {\n"
+        "            public override void ProcessInput(int i, PipelineBuffer b) {\n"
+        "              while (b.NextRow()) {\n"
+        "                long v = b.GetInt64(0);\n"
+        "                b.SetInt64(1,v); b.SetInt64(2,v); b.SetInt64(3,v);\n"
+        "                b.SetInt64(4,v); b.SetInt64(5,v); b.SetInt64(6,v);\n"
+        "                b.SetInt64(7,v); b.SetInt64(8,v); b.SetInt64(9,v);\n"
+        "              }\n"
+        "            }\n"
+        "          }\n"
+        "      - id: sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t\n"
+        "        expect: %d\n",
+        rows, batch, rows);
+}
+
+/* error_output enabled; tags ~10% of rows for the error stream.
+ * Both ports flow into separate count_rows sinks. */
+static void build_pc_error_route(char *buf, size_t cap,
+                                 int rows, int batch,
+                                 const char *csv_in, const char *csv_out) {
+    (void)csv_in; (void)csv_out;
+    /* 10% rounded to nearest integer; both sinks expect derived counts. */
+    int errs = rows / 10;
+    int oks  = rows - errs;
+    snprintf(buf, cap,
+        "betl: 1\n"
+        "name: bench-pc-error-route\n"
+        "pipeline:\n"
+        "  - id: stage\n"
+        "    type: dataflow\n"
+        "    steps:\n"
+        "      - id: source\n"
+        "        type: betl.gen_int64\n"
+        "        row_count: %d\n"
+        "        batch_size: %d\n"
+        "      - id: t\n"
+        "        type: dotnet.pipelinecomponent\n"
+        "        from: source\n"
+        "        lang: csharp\n"
+        "        error_output: true\n"
+        "        output_schema:\n"
+        "          - { name: id, type: l }\n"
+        "        source: |\n"
+        "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+        "          namespace Betl;\n"
+        "          public class UserComponent : PipelineComponent {\n"
+        "            public override void ProcessInput(int i, PipelineBuffer b) {\n"
+        "              while (b.NextRow())\n"
+        "                if (b.GetInt64(0) %% 10 == 0) b.DirectErrorRow(0, 1, 0);\n"
+        "            }\n"
+        "          }\n"
+        "      - id: main_sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t\n"
+        "        expect: %d\n"
+        "      - id: err_sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t:error_out\n"
+        "        expect: %d\n",
+        rows, batch, oks, errs);
+}
+
+/* Decimal-heavy: 5 decimal(38,4) cells per row. Each SetDecimal hits
+ * BigInteger.Pow(10, diff) + ToByteArray. Expected to be the slowest
+ * shape per-row. */
+static void build_pc_decimal(char *buf, size_t cap,
+                             int rows, int batch,
+                             const char *csv_in, const char *csv_out) {
+    (void)csv_in; (void)csv_out;
+    snprintf(buf, cap,
+        "betl: 1\n"
+        "name: bench-pc-decimal\n"
+        "pipeline:\n"
+        "  - id: stage\n"
+        "    type: dataflow\n"
+        "    steps:\n"
+        "      - id: source\n"
+        "        type: betl.gen_int64\n"
+        "        row_count: %d\n"
+        "        batch_size: %d\n"
+        "      - id: t\n"
+        "        type: dotnet.pipelinecomponent\n"
+        "        from: source\n"
+        "        lang: csharp\n"
+        "        output_schema:\n"
+        "          - { name: id, type: l }\n"
+        "          - { name: d1, type: E, scale: 4 }\n"
+        "          - { name: d2, type: E, scale: 4 }\n"
+        "          - { name: d3, type: E, scale: 4 }\n"
+        "          - { name: d4, type: E, scale: 4 }\n"
+        "          - { name: d5, type: E, scale: 4 }\n"
+        "        source: |\n"
+        "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+        "          namespace Betl;\n"
+        "          public class UserComponent : PipelineComponent {\n"
+        "            public override void ProcessInput(int i, PipelineBuffer b) {\n"
+        "              while (b.NextRow()) {\n"
+        "                decimal v = (decimal)b.GetInt64(0) / 100m;\n"
+        "                b.SetDecimal(1,v); b.SetDecimal(2,v); b.SetDecimal(3,v);\n"
+        "                b.SetDecimal(4,v); b.SetDecimal(5,v);\n"
+        "              }\n"
+        "            }\n"
+        "          }\n"
+        "      - id: sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t\n"
+        "        expect: %d\n",
+        rows, batch, rows);
+}
+
+/* Async aggregator: N rows → 1 summary row from PostExecute. */
+static void build_pc_async_aggregate(char *buf, size_t cap,
+                                     int rows, int batch,
+                                     const char *csv_in, const char *csv_out) {
+    (void)csv_in; (void)csv_out;
+    snprintf(buf, cap,
+        "betl: 1\n"
+        "name: bench-pc-async-aggregate\n"
+        "pipeline:\n"
+        "  - id: stage\n"
+        "    type: dataflow\n"
+        "    steps:\n"
+        "      - id: source\n"
+        "        type: betl.gen_int64\n"
+        "        row_count: %d\n"
+        "        batch_size: %d\n"
+        "      - id: t\n"
+        "        type: dotnet.pipelinecomponent\n"
+        "        from: source\n"
+        "        lang: csharp\n"
+        "        async: true\n"
+        "        output_schema:\n"
+        "          - { name: total, type: l }\n"
+        "          - { name: count, type: l }\n"
+        "        source: |\n"
+        "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+        "          namespace Betl;\n"
+        "          public class UserComponent : PipelineComponent {\n"
+        "            PipelineBuffer? outBuf;\n"
+        "            long sum = 0; long count = 0;\n"
+        "            public override void PrimeOutput(int outs, int[] ids, PipelineBuffer[] bufs) {\n"
+        "              outBuf = bufs[0];\n"
+        "            }\n"
+        "            public override void ProcessInput(int i, PipelineBuffer b) {\n"
+        "              while (b.NextRow()) { sum += b.GetInt64(0); count++; }\n"
+        "            }\n"
+        "            public override void PostExecute() {\n"
+        "              outBuf!.AddRow();\n"
+        "              outBuf.SetInt64(0, sum); outBuf.SetInt64(1, count);\n"
+        "            }\n"
+        "          }\n"
+        "      - id: sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t\n"
+        "        expect: 1\n",
+        rows, batch);
+}
+
+/* Same shape as pc-passthrough-1col but routed through lua.script
+ * (the SSIS-equivalent async-script-component analogue). Apples-to-apples
+ * comparison of per-row scripting overhead between the .NET AOT path
+ * and the Lua VM path. */
+static void build_pc_vs_lua_script(char *buf, size_t cap,
+                                   int rows, int batch,
+                                   const char *csv_in, const char *csv_out) {
+    (void)csv_in; (void)csv_out;
+    snprintf(buf, cap,
+        "betl: 1\n"
+        "name: bench-pc-vs-lua-script\n"
+        "pipeline:\n"
+        "  - id: stage\n"
+        "    type: dataflow\n"
+        "    steps:\n"
+        "      - id: source\n"
+        "        type: betl.gen_int64\n"
+        "        row_count: %d\n"
+        "        batch_size: %d\n"
+        "      - id: t\n"
+        "        type: lua.script\n"
+        "        from: source\n"
+        "        output_schema:\n"
+        "          - { name: id, type: l }\n"
+        "        script: |\n"
+        "          function on_row(row) emit({ id = row.id }) end\n"
+        "      - id: sink\n"
+        "        type: betl.count_rows\n"
+        "        from: t\n"
+        "        expect: %d\n",
+        rows, batch, rows);
+}
+
 /* shape = "csv-rt" — csv.read → map → csv.write */
 static void build_csv_rt(char *buf, size_t cap,
                          int rows, int batch, const char *csv_in,
@@ -317,22 +595,86 @@ typedef struct {
     build_fn    build;
     int         needs_csv_in;
     int         writes_csv_out;
+    int         needs_dotnet;        /* skip with SKIP_RC if SDK absent */
     const char *description;
 } Shape;
 
 static const Shape SHAPES[] = {
-    { "filter-count", build_filter_count, 0, 0,
+    { "filter-count", build_filter_count, 0, 0, 0,
       "gen → filter(true) → count" },
-    { "map-arith",    build_map_arith,    0, 0,
+    { "map-arith",    build_map_arith,    0, 0, 0,
       "gen → ssisexpr arithmetic → count" },
-    { "sort",         build_sort,         0, 0,
+    { "sort",         build_sort,         0, 0, 0,
       "gen → sort desc → count (materializes)" },
-    { "chain",        build_chain,        0, 0,
+    { "chain",        build_chain,        0, 0, 0,
       "gen → 4× ssisexpr map → count" },
-    { "csv-rt",       build_csv_rt,       1, 1,
+    { "csv-rt",       build_csv_rt,       1, 1, 0,
       "csv.read → ssisexpr map → csv.write" },
+    /* dotnet.pipelinecomponent shapes — see comment block above. */
+    { "pc-passthrough-1col",  build_pc_passthrough_1col,  0, 0, 1,
+      "gen → dotnet.pipelinecomponent (1-col passthrough) → count" },
+    { "pc-passthrough-10col", build_pc_passthrough_10col, 0, 0, 1,
+      "gen → dotnet.pipelinecomponent (10-col passthrough) → count" },
+    { "pc-error-route",       build_pc_error_route,       0, 0, 1,
+      "gen → dotnet.pipelinecomponent with error_output (10% tagged) → 2 sinks" },
+    { "pc-decimal",           build_pc_decimal,           0, 0, 1,
+      "gen → dotnet.pipelinecomponent (5 decimal cells/row) → count" },
+    { "pc-async-aggregate",   build_pc_async_aggregate,   0, 0, 1,
+      "gen → dotnet.pipelinecomponent async (N → 1 summary row) → count" },
+    { "pc-vs-lua-script",     build_pc_vs_lua_script,     0, 0, 0,
+      "gen → lua.script (1-col passthrough) → count — baseline for pc comparison" },
 };
 static const size_t N_SHAPES = sizeof SHAPES / sizeof SHAPES[0];
+
+#define BENCH_SKIP_RC 77
+
+/* SDK + AOT toolchain checks — mirrors the dotnet test files. The
+ * dotnet shapes need both the .NET SDK reachable and a working
+ * clang/gcc + libz for NativeAOT linking. We bail with SKIP_RC if
+ * either is missing rather than failing the iteration. */
+static int dotnet_sdk_available(void) {
+    const char *paths[] = {
+        "deps/dotnet/dotnet",
+        "/workspace/betl/deps/dotnet/dotnet",
+        "/opt/projects/betl/deps/dotnet/dotnet",
+        NULL
+    };
+    const char *env = getenv("BETL_DOTNET_ROOT");
+    if (env && *env) {
+        char p[1024];
+        snprintf(p, sizeof p, "%s/dotnet", env);
+        if (access(p, X_OK) == 0) return 1;
+    }
+    for (int i = 0; paths[i]; ++i)
+        if (access(paths[i], X_OK) == 0) return 1;
+    return 0;
+}
+static int prog_on_path_bench(const char *name) {
+    const char *path = getenv("PATH");
+    if (!path) return 0;
+    char *copy = strdup(path);
+    if (!copy) return 0;
+    int found = 0;
+    for (char *tok = strtok(copy, ":"); tok; tok = strtok(NULL, ":")) {
+        char p[1024];
+        snprintf(p, sizeof p, "%s/%s", tok, name);
+        if (access(p, X_OK) == 0) { found = 1; break; }
+    }
+    free(copy);
+    return found;
+}
+static int dotnet_aot_link_available(void) {
+    if (!prog_on_path_bench("clang") && !prog_on_path_bench("gcc")) return 0;
+    const char *libz[] = {
+        "/usr/lib/x86_64-linux-gnu/libz.so",
+        "/usr/lib/x86_64-linux-gnu/libz.a",
+        "/usr/lib/libz.so",
+        NULL
+    };
+    for (int i = 0; libz[i]; ++i)
+        if (access(libz[i], R_OK) == 0) return 1;
+    return 0;
+}
 
 /* ----- CSV prep -------------------------------------------------- */
 
@@ -390,6 +732,17 @@ int main(int argc, char **argv) {
     if (!sh) {
         fprintf(stderr, "unknown shape '%s'\n", shape_name);
         return 2;
+    }
+
+    if (sh->needs_dotnet) {
+        if (!dotnet_sdk_available()) {
+            fprintf(stderr, "[skip] .NET SDK not reachable for shape '%s'\n", sh->name);
+            return BENCH_SKIP_RC;
+        }
+        if (!dotnet_aot_link_available()) {
+            fprintf(stderr, "[skip] NativeAOT toolchain unavailable for shape '%s'\n", sh->name);
+            return BENCH_SKIP_RC;
+        }
     }
 
     char csv_in[128] = {0}, csv_out[128] = {0};
