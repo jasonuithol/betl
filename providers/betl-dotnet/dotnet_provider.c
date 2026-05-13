@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "9"
+#define BETL_DOTNET_SHIM_ABI_VERSION "10"
 
 
 /* ============================================================== *
@@ -859,8 +859,8 @@ typedef enum {
      * Internal arrow_fmt char (NOT a real Arrow format string; converted
      * to/from real Arrow format strings at the boundary):
      *   DS_DATE32     → 'D'  ⇄  "tdD"
-     *   DS_TIMESTAMP_US → 'T' ⇄  "tsu:"
-     *   DS_TIME_US    → 'M'  ⇄  "ttu:"
+     *   DS_TIMESTAMP_US → 'T' ⇄  "tsu:[<tz>]"  (colon is the tz separator)
+     *   DS_TIME_US    → 'M'  ⇄  "ttu"          (no colon — Arrow time spec)
      *   DS_BINARY     → 'z'  ⇄  "z"     (same single-char) */
     DS_DATE32,
     DS_TIMESTAMP_US,
@@ -951,7 +951,7 @@ static int ds_arrow_fmt_str_to_char(const char *fmt, char *out) {
     if (fmt[1] == '\0') { *out = fmt[0]; return 0; }     /* single-char already */
     if (strcmp(fmt, "tdD") == 0)          { *out = 'D'; return 0; }
     if (strncmp(fmt, "tsu:", 4) == 0)     { *out = 'T'; return 0; }
-    if (strncmp(fmt, "ttu:", 4) == 0)     { *out = 'M'; return 0; }
+    if (strcmp(fmt, "ttu") == 0)          { *out = 'M'; return 0; }   /* no colon */
     if (strcmp(fmt, "w:16") == 0)         { *out = 'G'; return 0; }
     if (fmt[0] == 'd' && fmt[1] == ':')   { *out = 'E'; return 0; }   /* decimal */
     return -1;
@@ -975,7 +975,7 @@ static const char *ds_type_to_arrow_fmt_str(DsType t) {
         case DS_FLOAT32:      return "f";
         case DS_DATE32:       return "tdD";
         case DS_TIMESTAMP_US: return "tsu:";    /* no timezone */
-        case DS_TIME_US:      return "ttu:";
+        case DS_TIME_US:      return "ttu";     /* no colon — time formats are bare */
         case DS_BINARY:       return "z";
         case DS_GUID:         return "w:16";    /* fixed-size 16-byte */
         case DS_DECIMAL128:   return "d:38,0";  /* fallback if no col context; per-col impl uses scale */
