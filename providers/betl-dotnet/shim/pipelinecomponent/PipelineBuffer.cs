@@ -41,6 +41,14 @@ public abstract class PipelineBuffer
     public virtual void  AddRow()                   => throw NotSupported("AddRow");
     public virtual void  SetEndOfRowset()           { }    /* tolerated as a hint */
 
+    /* Phase 2 error-row routing. Marks the current row for the error
+     * output stream. rowIdx is ignored (the cursor's current row is
+     * always the one being processed); the parameter is here for SSIS
+     * API parity. Only meaningful on a sync buffer; throws on input
+     * and output (async) views. */
+    public virtual void DirectErrorRow(int rowIdx, int errorCode, int errorColumn)
+        => throw NotSupported("DirectErrorRow");
+
     public virtual bool  IsNull   (int c)           => throw NotSupported("IsNull");
     public virtual void  SetNull  (int c)           => throw NotSupported("SetNull");
 
@@ -109,6 +117,10 @@ internal sealed class StagingRow
     public bool[]    Bool;
     public string?[] Utf8;
     public bool[]    IsNull;
+    /* Phase 2: row-level error tagging for sync transforms. */
+    public bool      IsError;
+    public int       ErrorCode;
+    public int       ErrorColumn;
 
     public StagingRow(int n)
     {
@@ -327,6 +339,14 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
         return _currentRow < _rows.LongLength;
     }
 
+    public override void DirectErrorRow(int rowIdx, int errorCode, int errorColumn)
+    {
+        var r = Cur();
+        r.IsError     = true;
+        r.ErrorCode   = errorCode;
+        r.ErrorColumn = errorColumn;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private StagingRow Cur()
     {
@@ -406,7 +426,10 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
     }
 
     /* Internal: flush all rows to the host emit context using the
-     * dispatch setters. Called once per batch at end of ProcessInput. */
+     * dispatch setters. Called once per batch at end of ProcessInput.
+     * Rows tagged via DirectErrorRow get an additional SetErrorFn
+     * call before commit so the host can demux them to the error
+     * staging. */
     internal void FlushTo(IntPtr emitCtx)
     {
         for (long r = 0; r < _rows.LongLength; ++r)
@@ -436,6 +459,8 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
                     }
                 }
             }
+            if (row.IsError && Betl.Pipeline.PcDispatch.SetErrorFn != null)
+                Betl.Pipeline.PcDispatch.SetErrorFn(emitCtx, row.ErrorCode, row.ErrorColumn);
             Betl.Pipeline.PcDispatch.CommitRowFn(emitCtx);
         }
     }

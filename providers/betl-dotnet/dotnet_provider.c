@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "4"
+#define BETL_DOTNET_SHIM_ABI_VERSION "5"
 
 
 /* ============================================================== *
@@ -929,11 +929,25 @@ typedef struct {
  * captures the current out_staging / pending_set pointers + n_out.
  * Letting both dotnet.script and dotnet.pipelinecomponent route
  * through the same setters; the per-kind structs hold the same
- * fields as top-level members and the emitter is just a shim. */
+ * fields as top-level members and the emitter is just a shim.
+ *
+ * Phase 2 error-row routing: pipelinecomponent populates err_staging,
+ * err_pending_set, n_err_out, err_attached. The user-driven
+ * DirectErrorRow API on the C# side calls emit_set_error which
+ * sets pending_err_*; emit_commit_row reads those and demuxes the
+ * just-built row into err_staging if applicable. */
 typedef struct {
     DsOutCol *out_staging;
     int      *pending_set;
     size_t    n_out;
+    DsOutCol *err_staging;       /* NULL when error tracking disabled */
+    int      *err_pending_set;
+    size_t    n_err_out;          /* = n_out + 2 (ErrorCode + ErrorColumn) */
+    int       err_attached;       /* 1 when port 1 has a downstream */
+    /* Transient — applied to the current in-flight row at commit_row. */
+    int32_t   pending_err_code;
+    int32_t   pending_err_col;
+    int       pending_err_set;
 } DsEmitter;
 
 typedef int (*ds_init_fn)(BetlContext *ctx,
@@ -1363,9 +1377,53 @@ static void emit_set_null(void *ctx, int idx) {
     if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
     e->pending_set[idx] = 1;
 }
+/* Phase 2 error tagging: user code calls DirectErrorRow which routes
+ * here. We cache the code+column on the emitter; emit_commit_row picks
+ * them up to demux the row to err_staging. No-op when error tracking
+ * isn't enabled. */
+static void emit_set_error(void *ctx, int32_t code, int32_t col) {
+    DsEmitter *e = ctx;
+    if (e->err_staging == NULL) return;     /* disabled */
+    e->pending_err_code = code;
+    e->pending_err_col  = col;
+    e->pending_err_set  = 1;
+}
+
+/* Copy one cell from a source DsOutCol[src_idx] into a destination
+ * DsOutCol[dst_idx]. Cells share types between out_staging[i] and
+ * err_staging[i] for i in [0, n_out) so the same switch covers both
+ * sides. Returns -1 on OOM. */
+static int dpc_copy_cell(DsOutCol *src, size_t src_idx,
+                         DsOutCol *dst, size_t dst_idx) {
+    if (ds_out_reserve(dst, dst_idx + 1) != 0) return -1;
+    dst->nulls[dst_idx] = src->nulls[src_idx];
+    if (ds_type_is_int64_stored(src->type)) {
+        dst->i64_vals[dst_idx] = src->i64_vals[src_idx];
+    } else if (ds_type_is_f64_stored(src->type)) {
+        dst->f64_vals[dst_idx] = src->f64_vals[src_idx];
+    } else if (src->type == DS_BOOL) {
+        dst->b_vals[dst_idx] = src->b_vals[src_idx];
+    } else if (src->type == DS_UTF8) {
+        int32_t s = src->u8_offsets[src_idx];
+        int32_t e = src->u8_offsets[src_idx + 1];
+        size_t  ln = (size_t)(e - s);
+        if (dst->u8_len + ln + 1 > dst->u8_cap) {
+            size_t nc = dst->u8_cap ? dst->u8_cap : 128;
+            while (nc < dst->u8_len + ln + 1) nc *= 2;
+            char *nd = realloc(dst->u8_data, nc);
+            if (!nd) return -1;
+            dst->u8_data = nd; dst->u8_cap = nc;
+        }
+        if (ln > 0) memcpy(dst->u8_data + dst->u8_len, src->u8_data + s, ln);
+        dst->u8_len += ln;
+        dst->u8_offsets[dst_idx + 1] = (int32_t)dst->u8_len;
+    }
+    return 0;
+}
+
 static void emit_commit_row(void *ctx) {
     DsEmitter *e = ctx;
-    /* Any column the script didn't set falls back to NULL. */
+    /* Fill NULL defaults for any column the user didn't set. */
     for (size_t i = 0; i < e->n_out; ++i) {
         if (!e->pending_set[i]) {
             DsOutCol *c = &e->out_staging[i];
@@ -1374,8 +1432,50 @@ static void emit_commit_row(void *ctx) {
             if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
         }
         e->pending_set[i] = 0;
-        ++e->out_staging[i].n;
     }
+
+    /* Demux: if the user marked this row as an error AND the error
+     * stream is wired, copy its cells to err_staging (plus the
+     * ErrorCode + ErrorColumn extras) and DON'T advance the main
+     * staging's row count — so the next row overwrites in place.
+     *
+     * If marked as an error but the error stream isn't wired, the
+     * row is dropped (same: don't advance main).
+     *
+     * Otherwise (the common case): advance main as before. */
+    if (e->pending_err_set && e->err_staging && e->err_attached) {
+        size_t src_idx = e->out_staging[0].n;
+        size_t dst_idx = e->err_staging[0].n;
+        int ok = 1;
+        for (size_t i = 0; i < e->n_out; ++i) {
+            if (dpc_copy_cell(&e->out_staging[i], src_idx,
+                              &e->err_staging[i], dst_idx) != 0) {
+                ok = 0; break;
+            }
+        }
+        /* ErrorCode + ErrorColumn columns at indices n_out, n_out+1. */
+        DsOutCol *cec  = &e->err_staging[e->n_out];
+        DsOutCol *ccol = &e->err_staging[e->n_out + 1];
+        if (ok && ds_out_reserve(cec, dst_idx + 1) == 0) {
+            cec->i64_vals[dst_idx] = e->pending_err_code;
+            cec->nulls[dst_idx]    = 0;
+        }
+        if (ok && ds_out_reserve(ccol, dst_idx + 1) == 0) {
+            ccol->i64_vals[dst_idx] = e->pending_err_col;
+            ccol->nulls[dst_idx]    = 0;
+        }
+        if (ok) {
+            for (size_t i = 0; i < e->n_err_out; ++i) ++e->err_staging[i].n;
+            if (e->err_pending_set)
+                for (size_t i = 0; i < e->n_err_out; ++i) e->err_pending_set[i] = 0;
+        }
+    } else if (e->pending_err_set) {
+        /* error_output enabled but no downstream wired — drop the row. */
+    } else {
+        /* Normal main-output commit. */
+        for (size_t i = 0; i < e->n_out; ++i) ++e->out_staging[i].n;
+    }
+    e->pending_err_set = 0;
 }
 
 /* Helper to build a transient DsEmitter from a DotnetScript or
@@ -1385,6 +1485,17 @@ static void emit_commit_row(void *ctx) {
     (DsEmitter){ .out_staging = (self)->out_staging, \
                  .pending_set = (self)->pending_set, \
                  .n_out       = (self)->n_out }
+
+#define DS_EMITTER_OF_PC(p) \
+    (DsEmitter){ \
+        .out_staging     = (p)->out_staging, \
+        .pending_set     = (p)->pending_set, \
+        .n_out           = (p)->n_out, \
+        .err_staging     = (p)->err_staging, \
+        .err_pending_set = (p)->err_pending_set, \
+        .n_err_out       = (p)->n_err_out, \
+        .err_attached    = (p)->error_attached, \
+    }
 
 /* --- finalize output batch ------------------------------------ */
 
@@ -1861,7 +1972,8 @@ typedef int (*dpc_register_emit_fn)(
     void (*set_bool)   (void *, int, uint8_t),
     void (*set_utf8)   (void *, int, const uint8_t *, int),
     void (*set_null)   (void *, int),
-    void (*commit_row) (void *));
+    void (*commit_row) (void *),
+    void (*set_error)  (void *, int32_t, int32_t));   /* Phase 2 */
 typedef int (*dpc_register_schema_fn)(
     const char **input_names,  const char *input_fmts,  int n_input,
     const char **output_names, const char *output_fmts, int n_output,
@@ -1870,11 +1982,20 @@ typedef int (*dpc_lifecycle0_fn)(void);
 typedef int (*dpc_process_batch_fn)(struct ArrowArray *batch, void *emit_ctx);
 typedef int (*dpc_post_execute_fn)(void *emit_ctx);
 
+/* Per-port stream wrapper. attach_output stores one of these in
+ * stream->private_data so the shared get_schema / get_next callbacks
+ * can branch on which port they're serving. */
+typedef struct DotnetPipelineComponent DotnetPipelineComponent;
 typedef struct {
+    DotnetPipelineComponent *parent;
+    int                      port_idx; /* 0 = main, 1 = error_out */
+} DpcPortHandle;
+
+struct DotnetPipelineComponent {
     BetlContext             *ctx;
     char                    *source;
     char                    *lang;
-    /* output_schema parsed from YAML */
+    /* output_schema parsed from YAML (= main port's columns) */
     DsCol                   *out_cols;
     size_t                   n_out;
     /* input_schema cached from upstream on first get_next */
@@ -1883,6 +2004,16 @@ typedef struct {
 
     /* Async (PrimeOutput-driven) vs sync (output_schema-populated). */
     int                      async;
+
+    /* Phase 2 error-row routing config. Enabled by YAML
+     * `error_output: true`. When set: the user may call
+     * DirectErrorRow during ProcessInput; rows tagged that way are
+     * demuxed to err_staging at commit_row. */
+    int                      error_output_enabled;
+    /* Set to 1 by attach_output(port=1) — i.e. when a downstream
+     * step actually wires the error stream. When 0, error rows are
+     * dropped (still consumed but never staged for emit). */
+    int                      error_attached;
 
     /* dlopen / function pointers */
     char                    *so_path;
@@ -1905,8 +2036,20 @@ typedef struct {
 
     DsOutCol                *out_staging;
     int                     *pending_set;
+    /* Error staging: same shape as out_staging for cols 0..n_out-1,
+     * plus two i32 cols ErrorCode + ErrorColumn at n_out and n_out+1.
+     * Total n_err_out columns = n_out + 2. NULL when
+     * error_output_enabled is 0. */
+    DsOutCol                *err_staging;
+    int                     *err_pending_set;
+    size_t                   n_err_out;
+
+    /* Per-port stream handles, stashed in stream->private_data. */
+    DpcPortHandle            main_handle;
+    DpcPortHandle            error_handle;
+
     char                     last_err[1024];
-} DotnetPipelineComponent;
+};
 
 static void dpc_set_err(DotnetPipelineComponent *p, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -2096,7 +2239,8 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
         return -1;
     }
     if (p->register_emit_fn(emit_set_int64, emit_set_float64, emit_set_bool,
-                            emit_set_utf8, emit_set_null, emit_commit_row) != 0) {
+                            emit_set_utf8, emit_set_null, emit_commit_row,
+                            emit_set_error) != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: register_emit returned non-zero");
         return -1;
     }
@@ -2145,7 +2289,7 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
         return -1;
     }
 
-    /* Allocate output staging. */
+    /* Allocate main output staging. */
     p->out_staging = calloc(p->n_out, sizeof *p->out_staging);
     p->pending_set = calloc(p->n_out, sizeof *p->pending_set);
     if (!p->out_staging || !p->pending_set) {
@@ -2155,20 +2299,73 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
     for (size_t i = 0; i < p->n_out; ++i)
         p->out_staging[i].type = p->out_cols[i].type;
 
+    /* Error output staging: same shape as out_staging for cols
+     * 0..n_out-1, plus two i32 cols ErrorCode + ErrorColumn at
+     * positions n_out and n_out+1. Allocated whether or not the
+     * error port is wired; if not wired, never touched and the
+     * pending_err flag in commit_row drops the row instead. */
+    if (p->error_output_enabled) {
+        p->n_err_out = p->n_out + 2;
+        p->err_staging = calloc(p->n_err_out, sizeof *p->err_staging);
+        p->err_pending_set = calloc(p->n_err_out, sizeof *p->err_pending_set);
+        if (!p->err_staging || !p->err_pending_set) {
+            dpc_set_err(p, "dotnet.pipelinecomponent: OOM");
+            return -1;
+        }
+        for (size_t i = 0; i < p->n_out; ++i)
+            p->err_staging[i].type = p->out_cols[i].type;
+        p->err_staging[p->n_out    ].type = DS_INT32;
+        p->err_staging[p->n_out + 1].type = DS_INT32;
+    }
+
     p->compiled = 1;
     return 0;
 }
 
 /* ---- Arrow stream callbacks ----------------------------------------- */
 
+/* Per-port schema and flush. The error port appends two i32 cols
+ * (ErrorCode + ErrorColumn) after the main output cols. */
+
+static const char *dpc_arrow_fmt(DsType t) {
+    switch (t) {
+        case DS_INT64:   return "l";
+        case DS_FLOAT64: return "g";
+        case DS_BOOL:    return "b";
+        case DS_UTF8:    return "u";
+        case DS_INT8:    return "c";
+        case DS_INT16:   return "s";
+        case DS_INT32:   return "i";
+        case DS_UINT8:   return "C";
+        case DS_UINT16:  return "S";
+        case DS_UINT32:  return "I";
+        case DS_UINT64:  return "L";
+        case DS_FLOAT32: return "f";
+    }
+    return "?";
+}
+
 static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
-    DotnetPipelineComponent *p = st->private_data;
+    DpcPortHandle *h = st->private_data;
+    DotnetPipelineComponent *p = h->parent;
     memset(out, 0, sizeof *out);
-    struct ArrowSchema **kids = calloc(p->n_out, sizeof *kids);
+    /* Schema shape: main port has out_cols; error port adds two
+     * trailing i32 cols. */
+    size_t n_cols = (h->port_idx == 0) ? p->n_out : p->n_out + 2;
+    struct ArrowSchema **kids = calloc(n_cols, sizeof *kids);
     if (!kids) return ENOMEM;
-    for (size_t i = 0; i < p->n_out; ++i) {
+    for (size_t i = 0; i < n_cols; ++i) {
         struct ArrowSchema *c = calloc(1, sizeof *c);
-        char *nm = strdup(p->out_cols[i].name);
+        const char *src_name; DsType src_type;
+        if (i < p->n_out) {
+            src_name = p->out_cols[i].name;
+            src_type = p->out_cols[i].type;
+        } else if (i == p->n_out) {
+            src_name = "ErrorCode";   src_type = DS_INT32;
+        } else {
+            src_name = "ErrorColumn"; src_type = DS_INT32;
+        }
+        char *nm = strdup(src_name);
         if (!c || !nm) {
             free(c); free(nm);
             for (size_t k = 0; k < i; ++k) {
@@ -2178,43 +2375,32 @@ static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
             free(kids); return ENOMEM;
         }
         c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
-        switch (p->out_cols[i].type) {
-            case DS_INT64:   c->format = "l"; break;
-            case DS_FLOAT64: c->format = "g"; break;
-            case DS_BOOL:    c->format = "b"; break;
-            case DS_UTF8:    c->format = "u"; break;
-            case DS_INT8:    c->format = "c"; break;
-            case DS_INT16:   c->format = "s"; break;
-            case DS_INT32:   c->format = "i"; break;
-            case DS_UINT8:   c->format = "C"; break;
-            case DS_UINT16:  c->format = "S"; break;
-            case DS_UINT32:  c->format = "I"; break;
-            case DS_UINT64:  c->format = "L"; break;
-            case DS_FLOAT32: c->format = "f"; break;
-        }
+        c->format = dpc_arrow_fmt(src_type);
         c->release = ds_release_schema_named;
         kids[i] = c;
     }
-    out->format = "+s"; out->n_children = (int64_t)p->n_out;
+    out->format = "+s"; out->n_children = (int64_t)n_cols;
     out->children = kids; out->release = ds_release_schema_struct;
     return 0;
 }
 
-static int dpc_flush_batch(DotnetPipelineComponent *p, struct ArrowArray *out) {
-    size_t n = p->out_staging[0].n;
-    for (size_t i = 1; i < p->n_out; ++i) {
-        if (p->out_staging[i].n != n) {
+static int dpc_flush_staging(DotnetPipelineComponent *p,
+                             DsOutCol *staging, size_t n_cols,
+                             struct ArrowArray *out) {
+    size_t n = staging[0].n;
+    for (size_t i = 1; i < n_cols; ++i) {
+        if (staging[i].n != n) {
             dpc_set_err(p, "dotnet.pipelinecomponent: output column row count mismatch "
                            "(col 0 = %zu, col %zu = %zu)",
-                        n, i, p->out_staging[i].n);
+                        n, i, staging[i].n);
             return -1;
         }
     }
-    struct ArrowArray **kids = calloc(p->n_out, sizeof *kids);
+    struct ArrowArray **kids = calloc(n_cols, sizeof *kids);
     if (!kids) return -1;
-    for (size_t i = 0; i < p->n_out; ++i) {
+    for (size_t i = 0; i < n_cols; ++i) {
         kids[i] = calloc(1, sizeof **kids);
-        if (!kids[i] || ds_finalize_col(&p->out_staging[i], kids[i]) != 0) {
+        if (!kids[i] || ds_finalize_col(&staging[i], kids[i]) != 0) {
             for (size_t k = 0; k <= i; ++k) {
                 if (kids[k]) {
                     if (kids[k]->release) kids[k]->release(kids[k]);
@@ -2226,7 +2412,7 @@ static int dpc_flush_batch(DotnetPipelineComponent *p, struct ArrowArray *out) {
     }
     const void **outer = malloc(sizeof *outer);
     if (!outer) {
-        for (size_t i = 0; i < p->n_out; ++i) {
+        for (size_t i = 0; i < n_cols; ++i) {
             if (kids[i]->release) kids[i]->release(kids[i]);
             free(kids[i]);
         }
@@ -2234,24 +2420,31 @@ static int dpc_flush_batch(DotnetPipelineComponent *p, struct ArrowArray *out) {
     }
     outer[0] = NULL;
     out->length = (int64_t)n; out->null_count = 0;
-    out->n_buffers = 1; out->n_children = (int64_t)p->n_out;
+    out->n_buffers = 1; out->n_children = (int64_t)n_cols;
     out->buffers = outer; out->children = kids;
     out->release = ds_release_struct;
-    for (size_t i = 0; i < p->n_out; ++i) {
-        ds_out_free(&p->out_staging[i]);
-        p->out_staging[i].type = p->out_cols[i].type;
+    /* Reset staging so the next batch can grow it again. */
+    for (size_t i = 0; i < n_cols; ++i) {
+        DsType t = staging[i].type;
+        ds_out_free(&staging[i]);
+        staging[i].type = t;
     }
     return 0;
 }
 
 static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
-    DotnetPipelineComponent *p = st->private_data;
+    DpcPortHandle *h = st->private_data;
+    DotnetPipelineComponent *p = h->parent;
+    int port = h->port_idx;
     memset(out, 0, sizeof *out);
     if (dpc_cache_input_schema(p) != 0) return EIO;
     if (dpc_compile_and_load(p) != 0)   return EIO;
-    DsEmitter em = DS_EMITTER_OF(p);
+    DsEmitter em = DS_EMITTER_OF_PC(p);
 
-    while (p->out_staging[0].n == 0) {
+    DsOutCol *my_staging  = (port == 0) ? p->out_staging : p->err_staging;
+    size_t    my_n_cols   = (port == 0) ? p->n_out       : p->n_err_out;
+
+    while (my_staging[0].n == 0) {
         if (p->eof_seen) {
             if (!p->post_executed) {
                 p->post_executed = 1;
@@ -2269,9 +2462,9 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
                                    "(see [ERROR] log above)");
                     return EIO;
                 }
-                /* PostExecute might have staged rows; if so, fall
-                 * through to flush_batch. Otherwise return EOF. */
-                if (p->out_staging[0].n > 0) break;
+                /* PostExecute might have staged rows on either port;
+                 * if our port has any, fall through to flush. */
+                if (my_staging[0].n > 0) break;
             }
             return 0;
         }
@@ -2292,7 +2485,7 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         }
         in_arr.release(&in_arr);
     }
-    if (dpc_flush_batch(p, out) != 0) {
+    if (dpc_flush_staging(p, my_staging, my_n_cols, out) != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: flush failed");
         return EIO;
     }
@@ -2300,7 +2493,8 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
 }
 
 static const char *dpc_get_last_error(struct ArrowArrayStream *st) {
-    DotnetPipelineComponent *p = st->private_data;
+    DpcPortHandle *h = st->private_data;
+    DotnetPipelineComponent *p = h ? h->parent : NULL;
     return (p && p->last_err[0]) ? p->last_err : NULL;
 }
 static void dpc_release(struct ArrowArrayStream *st) {
@@ -2329,11 +2523,16 @@ static int dotnet_pc_init(BetlContext *ctx, const char *cfg, void **state) {
      * Default sync. The JSON config value is a bareword from YAML so
      * we accept "true" / "1" / "yes" as truthy. */
     {
-        char *av = NULL;
         const char *q = json_value_after(cfg, "async");
         if (q && (*q == 't' || *q == 'T' || *q == '1' || *q == 'y' || *q == 'Y'))
             p->async = 1;
-        (void)av;
+    }
+    /* error_output: true|false  — opens a second output port "error_out"
+     * (Phase 2). Default false. */
+    {
+        const char *q = json_value_after(cfg, "error_output");
+        if (q && (*q == 't' || *q == 'T' || *q == '1' || *q == 'y' || *q == 'Y'))
+            p->error_output_enabled = 1;
     }
     if (dpc_parse_output_schema(p, cfg) != 0) {
         for (size_t i = 0; i < p->n_out; ++i) free(p->out_cols[i].name);
@@ -2356,13 +2555,25 @@ static int dotnet_pc_attach_input(void *state, int port,
 
 static int dotnet_pc_attach_output(void *state, int port,
                                    struct ArrowArrayStream *out) {
-    (void)port;
     DotnetPipelineComponent *p = state;
+    if (port < 0 || port > 1) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: invalid output port %d", port);
+        return BETL_ERR_INVALID;
+    }
+    if (port == 1 && !p->error_output_enabled) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: error_out port wired but "
+                       "`error_output: true` not set in YAML");
+        return BETL_ERR_INVALID;
+    }
+    DpcPortHandle *handle = (port == 0) ? &p->main_handle : &p->error_handle;
+    handle->parent   = p;
+    handle->port_idx = port;
+    if (port == 1) p->error_attached = 1;
     out->get_schema     = dpc_get_schema;
     out->get_next       = dpc_get_next;
     out->get_last_error = dpc_get_last_error;
     out->release        = dpc_release;
-    out->private_data   = p;
+    out->private_data   = handle;
     return BETL_OK;
 }
 
@@ -2381,6 +2592,11 @@ static void dotnet_pc_destroy(void *state) {
         free(p->out_staging);
     }
     free(p->pending_set);
+    if (p->err_staging) {
+        for (size_t i = 0; i < p->n_err_out; ++i) ds_out_free(&p->err_staging[i]);
+        free(p->err_staging);
+    }
+    free(p->err_pending_set);
     free(p);
 }
 
@@ -2388,9 +2604,22 @@ static const BetlPortDef dpc_inputs[]  = {
     { .name = "in",  .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "rows to process" },
 };
 static const BetlPortDef dpc_outputs[] = {
-    { .name = "out", .schema_mode = BETL_SCHEMA_DYNAMIC,
-      .doc = "rows emitted by ProcessInput (Phase 1a: output_schema-defined)" },
+    { .name = "out",       .schema_mode = BETL_SCHEMA_DYNAMIC,
+      .doc = "main output: rows emitted by ProcessInput" },
+    { .name = "error_out", .schema_mode = BETL_SCHEMA_DYNAMIC,
+      .doc = "error output: rows tagged via DirectErrorRow "
+             "(only if error_output:true)" },
 };
+
+/* Resolve `from: t:<name>` to a port index. The default exec-side
+ * resolver only matches outputs[0].name; we need both names handled. */
+static int dotnet_pc_output_port_index(void *state, const char *name) {
+    (void)state;
+    if (!name) return 0;
+    if (strcmp(name, "out") == 0)       return 0;
+    if (strcmp(name, "error_out") == 0) return 1;
+    return -1;
+}
 
 
 /* ============================================================== *
@@ -2431,11 +2660,12 @@ static const BetlComponentDef components[] = {
       .inputs             = dpc_inputs,
       .input_count        = 1,
       .outputs            = dpc_outputs,
-      .output_count       = 1,
+      .output_count       = 2,
       .init               = dotnet_pc_init,
       .destroy            = dotnet_pc_destroy,
       .attach_input       = dotnet_pc_attach_input,
-      .attach_output      = dotnet_pc_attach_output },
+      .attach_output      = dotnet_pc_attach_output,
+      .output_port_index  = dotnet_pc_output_port_index },
 };
 
 static const BetlProvider dotnet_provider = {

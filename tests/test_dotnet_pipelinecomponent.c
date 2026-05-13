@@ -376,6 +376,44 @@ static const char PL_CONN_MGR[] =
     "        from: t\n"
     "        expect: 2\n";
 
+/* --- Phase 2: error-row routing via DirectErrorRow + error_out port */
+static const char PL_ERROR_ROUTE[] =
+    "betl: 1\n"
+    "name: dotnet-pc-error-route\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 6\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        error_output: true\n"
+    "        output_schema:\n"
+    "          - { name: id, type: l }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                if ((id & 1) == 1) buffer.DirectErrorRow(0, 42, 0);\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: main_sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 3\n"
+    "      - id: err_sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t:error_out\n"
+    "        expect: 3\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -425,6 +463,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_CONN_MGR, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "conn-mgr: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_ERROR_ROUTE, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "error-route: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

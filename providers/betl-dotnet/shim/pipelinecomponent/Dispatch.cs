@@ -60,6 +60,8 @@ internal static unsafe class PcDispatch
     internal static delegate* unmanaged<IntPtr, int, byte*, int,      void> SetUtf8Fn;
     internal static delegate* unmanaged<IntPtr, int,                  void> SetNullFn;
     internal static delegate* unmanaged<IntPtr,                       void> CommitRowFn;
+    /* Phase 2 — flags the current in-flight row for the error stream. */
+    internal static delegate* unmanaged<IntPtr, int, int,             void> SetErrorFn;
 
     /* ----- entry points ------------------------------------------------ */
 
@@ -70,7 +72,8 @@ internal static unsafe class PcDispatch
         delegate* unmanaged<IntPtr, int, byte,        void> setBool,
         delegate* unmanaged<IntPtr, int, byte*, int,  void> setUtf8,
         delegate* unmanaged<IntPtr, int,              void> setNull,
-        delegate* unmanaged<IntPtr,                   void> commitRow)
+        delegate* unmanaged<IntPtr,                   void> commitRow,
+        delegate* unmanaged<IntPtr, int, int,         void> setError)
     {
         SetInt64Fn   = setInt64;
         SetFloat64Fn = setFloat64;
@@ -78,6 +81,7 @@ internal static unsafe class PcDispatch
         SetUtf8Fn    = setUtf8;
         SetNullFn    = setNull;
         CommitRowFn  = commitRow;
+        SetErrorFn   = setError;
         return 0;
     }
 
