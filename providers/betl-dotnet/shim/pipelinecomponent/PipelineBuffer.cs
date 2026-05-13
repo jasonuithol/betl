@@ -60,6 +60,10 @@ public abstract class PipelineBuffer
     public virtual void      SetBoolean(int c, bool v)      => throw NotSupported("SetBoolean");
     public virtual string    GetString(int c)               => throw NotSupported("GetString");
     public virtual void      SetString(int c, string v)     => throw NotSupported("SetString");
+    public virtual byte[]    GetBytes(int c)                => throw NotSupported("GetBytes");
+    public virtual void      SetBytes(int c, byte[] v)      => throw NotSupported("SetBytes");
+    public virtual System.DateTime GetDate(int c)           => throw NotSupported("GetDate");
+    public virtual void      SetDate(int c, System.DateTime v) => throw NotSupported("SetDate");
 
     /* Narrow accessors route through the widened ones. */
     public int    GetInt32 (int c) => (int)   GetInt64(c);
@@ -92,6 +96,7 @@ internal enum CellType : byte
     Float64 = 2,
     Bool    = 3,
     Utf8    = 4,
+    Binary  = 5,    /* Phase 1b.2 — variable-length raw bytes */
 }
 
 internal sealed class BufferColumnSpec
@@ -99,7 +104,8 @@ internal sealed class BufferColumnSpec
     public string   Name = "";
     public CellType Type;
     public int      InputIndex = -1; /* -1 = no same-named input column */
-    public char     InputFmt   = '?'; /* Arrow format of the paired input column */
+    public char     InputFmt   = '?'; /* betl-internal format char of paired input col */
+    public char     OutputFmt  = '?'; /* betl-internal format char of this output col */
 }
 
 /* Internal staging row representation. Built once per batch from
@@ -116,6 +122,7 @@ internal sealed class StagingRow
     public double[]  F64;
     public bool[]    Bool;
     public string?[] Utf8;
+    public byte[]?[] Bytes;        /* Phase 1b.2 — binary cells */
     public bool[]    IsNull;
     /* Phase 2: row-level error tagging for sync transforms. */
     public bool      IsError;
@@ -128,6 +135,7 @@ internal sealed class StagingRow
         F64    = new double[n];
         Bool   = new bool  [n];
         Utf8   = new string?[n];
+        Bytes  = new byte[]?[n];
         IsNull = new bool  [n];
         for (int i = 0; i < n; ++i) IsNull[i] = true;
     }
@@ -209,6 +217,19 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
             case 'u':
                 ReadUtf8(colIdx, (int*)child->Buffers[1], (byte*)child->Buffers[2],
                          off, n, validity);
+                break;
+            case 'D':
+                /* date32: int32 days since epoch, widened into I64 */
+                ReadNarrowInt32(colIdx, (int*)child->Buffers[1], off, n, validity);
+                break;
+            case 'T':
+            case 'M':
+                /* timestamp_us / time_us: int64 microseconds */
+                ReadWideInt(colIdx, (long*)child->Buffers[1], off, n, validity);
+                break;
+            case 'z':
+                ReadBinary(colIdx, (int*)child->Buffers[1], (byte*)child->Buffers[2],
+                           off, n, validity);
                 break;
             default:
                 throw new BetlPipelineException(
@@ -332,6 +353,21 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
             }
         }
     }
+    private void ReadBinary(int colIdx, int* offs, byte* data, long off, long n, byte* validity)
+    {
+        for (long r = 0; r < n; ++r) {
+            long ix = off + r;
+            if (!IsNull(validity, ix)) {
+                int s = offs[ix], e = offs[ix + 1];
+                int ln = e - s;
+                byte[] buf = new byte[ln];
+                if (ln > 0) System.Runtime.InteropServices.Marshal.Copy(
+                    (System.IntPtr)(data + s), buf, 0, ln);
+                _rows[r].Bytes[colIdx] = buf;
+                _rows[r].IsNull[colIdx] = false;
+            }
+        }
+    }
 
     public override bool NextRow()
     {
@@ -424,6 +460,63 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
         r.Utf8[columnIndex] = value ?? "";
         r.IsNull[columnIndex] = false;
     }
+    public override byte[] GetBytes(int columnIndex)
+    {
+        RequireType(columnIndex, CellType.Binary);
+        return Cur().Bytes[columnIndex] ?? System.Array.Empty<byte>();
+    }
+    public override void SetBytes(int columnIndex, byte[] value)
+    {
+        RequireType(columnIndex, CellType.Binary);
+        var r = Cur();
+        r.Bytes[columnIndex] = value ?? System.Array.Empty<byte>();
+        r.IsNull[columnIndex] = false;
+    }
+    /* Date / timestamp cells store an integer:
+     *   - date32 columns store INT32 days since 1970-01-01
+     *   - timestamp_us columns store INT64 microseconds since epoch
+     * GetDate / SetDate convert to/from DateTime for SSIS-faithful
+     * API. The actual storage type is determined by the column's
+     * declared format. */
+    public override System.DateTime GetDate(int columnIndex)
+    {
+        long raw = GetInt64(columnIndex);   /* widened from i64_vals */
+        /* Heuristic: date32-sized values (days) are tiny; timestamp_us
+         * are huge. Distinguish via declared column format. */
+        char fmt = (columnIndex >= 0 && columnIndex < _cols.Length)
+            ? GetDeclaredFmt(columnIndex) : 'l';
+        if (fmt == 'D')
+            return System.DateTime.UnixEpoch.AddDays(raw);
+        if (fmt == 'T')
+            return System.DateTime.UnixEpoch.AddTicks(raw * 10L);   /* 1 us = 10 ticks */
+        throw new BetlPipelineException(
+            $"PipelineBuffer.GetDate: column {columnIndex} is not a date/timestamp");
+    }
+    public override void SetDate(int columnIndex, System.DateTime value)
+    {
+        char fmt = (columnIndex >= 0 && columnIndex < _cols.Length)
+            ? GetDeclaredFmt(columnIndex) : 'l';
+        if (fmt == 'D')
+        {
+            int days = (int)(value.Date - System.DateTime.UnixEpoch.Date).TotalDays;
+            SetInt64(columnIndex, days);
+            return;
+        }
+        if (fmt == 'T')
+        {
+            long us = (value.Ticks - System.DateTime.UnixEpoch.Ticks) / 10L;
+            SetInt64(columnIndex, us);
+            return;
+        }
+        throw new BetlPipelineException(
+            $"PipelineBuffer.SetDate: column {columnIndex} is not a date/timestamp");
+    }
+
+    /* Map column index back to its declared format char (extra field
+     * tucked onto BufferColumnSpec). Used by GetDate / SetDate to
+     * choose between date32 and timestamp_us conversions without
+     * tracking a separate per-column type tag. */
+    private char GetDeclaredFmt(int columnIndex) => _cols[columnIndex].OutputFmt;
 
     /* Internal: flush all rows to the host emit context using the
      * dispatch setters. Called once per batch at end of ProcessInput.
@@ -453,6 +546,13 @@ internal sealed unsafe class BetlSyncPipelineBuffer : PipelineBuffer
                     case CellType.Utf8:
                     {
                         var bytes = System.Text.Encoding.UTF8.GetBytes(row.Utf8[c] ?? "");
+                        fixed (byte* p = bytes)
+                            Betl.Pipeline.PcDispatch.SetUtf8Fn(emitCtx, c, p, bytes.Length);
+                        break;
+                    }
+                    case CellType.Binary:
+                    {
+                        var bytes = row.Bytes[c] ?? System.Array.Empty<byte>();
                         fixed (byte* p = bytes)
                             Betl.Pipeline.PcDispatch.SetUtf8Fn(emitCtx, c, p, bytes.Length);
                         break;
@@ -530,7 +630,7 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
 
     public override long GetInt64(int colIdx)
     {
-        RequireFmt(colIdx, 'l', 'L', 'i', 'I', 's', 'S', 'c', 'C');
+        RequireFmt(colIdx, 'l', 'L', 'i', 'I', 's', 'S', 'c', 'C', 'D', 'T', 'M');
         long ix = CurIx(colIdx);
         ArrowArray* child = _batch->Children[colIdx];
         void* buf = child->Buffers[1];
@@ -544,6 +644,9 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
             'S' => ((ushort*)buf)[ix],
             'c' => ((sbyte*)buf)[ix],
             'C' => ((byte*)buf)[ix],
+            'D' => ((int*)buf)[ix],         /* date32: int32 days */
+            'T' => ((long*)buf)[ix],        /* timestamp_us: int64 micros */
+            'M' => ((long*)buf)[ix],        /* time_us: int64 micros */
             _   => throw new BetlPipelineException("unreachable"),
         };
     }
@@ -575,6 +678,31 @@ internal sealed unsafe class BetlInputPipelineBuffer : PipelineBuffer
         byte* data = (byte*)child->Buffers[2];
         int s = offs[ix], e = offs[ix + 1];
         return System.Text.Encoding.UTF8.GetString(data + s, e - s);
+    }
+
+    public override byte[] GetBytes(int colIdx)
+    {
+        RequireFmt(colIdx, 'z');
+        long ix = CurIx(colIdx);
+        ArrowArray* child = _batch->Children[colIdx];
+        int*  offs = (int*) child->Buffers[1];
+        byte* data = (byte*)child->Buffers[2];
+        int s = offs[ix], e = offs[ix + 1];
+        int ln = e - s;
+        byte[] buf = new byte[ln];
+        if (ln > 0) System.Runtime.InteropServices.Marshal.Copy(
+            (System.IntPtr)(data + s), buf, 0, ln);
+        return buf;
+    }
+
+    public override System.DateTime GetDate(int colIdx)
+    {
+        char f = _fmts[colIdx];
+        long raw = GetInt64(colIdx);   /* GetInt64 already accepts D/T */
+        if (f == 'D') return System.DateTime.UnixEpoch.AddDays(raw);
+        if (f == 'T') return System.DateTime.UnixEpoch.AddTicks(raw * 10L);
+        throw new BetlPipelineException(
+            $"PipelineBuffer.GetDate: input column {colIdx} ('{f}') is not a date/timestamp");
     }
 }
 
@@ -651,6 +779,27 @@ internal sealed unsafe class BetlOutputPipelineBuffer : PipelineBuffer
         r.Utf8[colIdx] = value ?? "";
         r.IsNull[colIdx] = false;
     }
+    public override void SetBytes(int colIdx, byte[] value)
+    {
+        RequireType(colIdx, CellType.Binary);
+        var r = Cur();
+        r.Bytes[colIdx] = value ?? System.Array.Empty<byte>();
+        r.IsNull[colIdx] = false;
+    }
+    public override void SetDate(int colIdx, System.DateTime value)
+    {
+        char fmt = _cols[colIdx].OutputFmt;
+        if (fmt == 'D') {
+            int days = (int)(value.Date - System.DateTime.UnixEpoch.Date).TotalDays;
+            SetInt64(colIdx, days);
+        } else if (fmt == 'T') {
+            long us = (value.Ticks - System.DateTime.UnixEpoch.Ticks) / 10L;
+            SetInt64(colIdx, us);
+        } else {
+            throw new BetlPipelineException(
+                $"PipelineBuffer.SetDate: output column {colIdx} is not a date/timestamp");
+        }
+    }
 
     /* Flush staged rows to the host via the same setter ABI sync
      * mode uses; clear the staging for the next batch. */
@@ -677,6 +826,13 @@ internal sealed unsafe class BetlOutputPipelineBuffer : PipelineBuffer
                     case CellType.Utf8:
                     {
                         var bytes = System.Text.Encoding.UTF8.GetBytes(row.Utf8[c] ?? "");
+                        fixed (byte* p = bytes)
+                            Betl.Pipeline.PcDispatch.SetUtf8Fn(emitCtx, c, p, bytes.Length);
+                        break;
+                    }
+                    case CellType.Binary:
+                    {
+                        var bytes = row.Bytes[c] ?? System.Array.Empty<byte>();
                         fixed (byte* p = bytes)
                             Betl.Pipeline.PcDispatch.SetUtf8Fn(emitCtx, c, p, bytes.Length);
                         break;

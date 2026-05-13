@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "5"
+#define BETL_DOTNET_SHIM_ABI_VERSION "6"
 
 
 /* ============================================================== *
@@ -848,6 +848,24 @@ typedef enum {
     DS_UINT32,
     DS_UINT64,
     DS_FLOAT32,
+    /* Phase 1b.2 temporal + binary. The internal storage type matches
+     * the underlying int / bytes layout; the SSIS DataType and Arrow
+     * format string carry the semantic interpretation. Storage:
+     *   DS_DATE32      — int32 (days since 1970-01-01) via i64_vals
+     *   DS_TIMESTAMP_US — int64 (microseconds since epoch) via i64_vals
+     *   DS_TIME_US     — int64 (microseconds since midnight) via i64_vals
+     *   DS_BINARY      — variable-length bytes via u8_offsets / u8_data
+     *
+     * Internal arrow_fmt char (NOT a real Arrow format string; converted
+     * to/from real Arrow format strings at the boundary):
+     *   DS_DATE32     → 'D'  ⇄  "tdD"
+     *   DS_TIMESTAMP_US → 'T' ⇄  "tsu:"
+     *   DS_TIME_US    → 'M'  ⇄  "ttu:"
+     *   DS_BINARY     → 'z'  ⇄  "z"     (same single-char) */
+    DS_DATE32,
+    DS_TIMESTAMP_US,
+    DS_TIME_US,
+    DS_BINARY,
 } DsType;
 
 typedef struct {
@@ -856,52 +874,105 @@ typedef struct {
     char   arrow_fmt;     /* 'l' / 'g' / 'b' / 'u' / 'c' / 'C' / 's' / 'S' / 'i' / 'I' / 'L' / 'f' */
 } DsCol;
 
-/* Map an Arrow format char to a DsType, or DS_INT64 + return -1 on
- * unsupported. Single source of truth for the supported set. */
+/* Map a betl-internal format char to a DsType. Returns 0 + sets out,
+ * or returns -1 with out = DS_INT64. Single source of truth for the
+ * supported set. The chars are mostly Arrow's single-char codes; the
+ * temporal ones ('D'/'T'/'M') are betl-internal abbreviations that
+ * convert to/from real Arrow strings at the boundary. */
 static int ds_fmt_to_type(char fmt, DsType *out) {
     switch (fmt) {
-        case 'l': *out = DS_INT64;   return 0;
-        case 'g': *out = DS_FLOAT64; return 0;
-        case 'b': *out = DS_BOOL;    return 0;
-        case 'u': *out = DS_UTF8;    return 0;
-        case 'c': *out = DS_INT8;    return 0;
-        case 's': *out = DS_INT16;   return 0;
-        case 'i': *out = DS_INT32;   return 0;
-        case 'C': *out = DS_UINT8;   return 0;
-        case 'S': *out = DS_UINT16;  return 0;
-        case 'I': *out = DS_UINT32;  return 0;
-        case 'L': *out = DS_UINT64;  return 0;
-        case 'f': *out = DS_FLOAT32; return 0;
-        default:  *out = DS_INT64;   return -1;
+        case 'l': *out = DS_INT64;       return 0;
+        case 'g': *out = DS_FLOAT64;     return 0;
+        case 'b': *out = DS_BOOL;        return 0;
+        case 'u': *out = DS_UTF8;        return 0;
+        case 'c': *out = DS_INT8;        return 0;
+        case 's': *out = DS_INT16;       return 0;
+        case 'i': *out = DS_INT32;       return 0;
+        case 'C': *out = DS_UINT8;       return 0;
+        case 'S': *out = DS_UINT16;      return 0;
+        case 'I': *out = DS_UINT32;      return 0;
+        case 'L': *out = DS_UINT64;      return 0;
+        case 'f': *out = DS_FLOAT32;     return 0;
+        case 'D': *out = DS_DATE32;      return 0;
+        case 'T': *out = DS_TIMESTAMP_US;return 0;
+        case 'M': *out = DS_TIME_US;     return 0;
+        case 'z': *out = DS_BINARY;      return 0;
+        default:  *out = DS_INT64;       return -1;
     }
 }
 
 static char ds_type_to_fmt(DsType t) {
     switch (t) {
-        case DS_INT64:   return 'l';
-        case DS_FLOAT64: return 'g';
-        case DS_BOOL:    return 'b';
-        case DS_UTF8:    return 'u';
-        case DS_INT8:    return 'c';
-        case DS_INT16:   return 's';
-        case DS_INT32:   return 'i';
-        case DS_UINT8:   return 'C';
-        case DS_UINT16:  return 'S';
-        case DS_UINT32:  return 'I';
-        case DS_UINT64:  return 'L';
-        case DS_FLOAT32: return 'f';
+        case DS_INT64:        return 'l';
+        case DS_FLOAT64:      return 'g';
+        case DS_BOOL:         return 'b';
+        case DS_UTF8:         return 'u';
+        case DS_INT8:         return 'c';
+        case DS_INT16:        return 's';
+        case DS_INT32:        return 'i';
+        case DS_UINT8:        return 'C';
+        case DS_UINT16:       return 'S';
+        case DS_UINT32:       return 'I';
+        case DS_UINT64:       return 'L';
+        case DS_FLOAT32:      return 'f';
+        case DS_DATE32:       return 'D';
+        case DS_TIMESTAMP_US: return 'T';
+        case DS_TIME_US:      return 'M';
+        case DS_BINARY:       return 'z';
     }
     return '?';
+}
+
+/* Convert an upstream Arrow format string into a betl-internal char.
+ * Returns 0 on success. Temporal Arrow strings have variable suffixes
+ * (e.g. "tsu:UTC" or "tsu:" without timezone); we match the canonical
+ * prefix and ignore the rest. */
+static int ds_arrow_fmt_str_to_char(const char *fmt, char *out) {
+    if (!fmt || !*fmt) return -1;
+    if (fmt[1] == '\0') { *out = fmt[0]; return 0; }     /* single-char already */
+    if (strcmp(fmt, "tdD") == 0)          { *out = 'D'; return 0; }
+    if (strncmp(fmt, "tsu:", 4) == 0)     { *out = 'T'; return 0; }
+    if (strncmp(fmt, "ttu:", 4) == 0)     { *out = 'M'; return 0; }
+    return -1;
+}
+
+/* Real Arrow format string emitted in get_schema. Distinct from
+ * ds_type_to_fmt (which returns the internal char). */
+static const char *ds_type_to_arrow_fmt_str(DsType t) {
+    switch (t) {
+        case DS_INT64:        return "l";
+        case DS_FLOAT64:      return "g";
+        case DS_BOOL:         return "b";
+        case DS_UTF8:         return "u";
+        case DS_INT8:         return "c";
+        case DS_INT16:        return "s";
+        case DS_INT32:        return "i";
+        case DS_UINT8:        return "C";
+        case DS_UINT16:       return "S";
+        case DS_UINT32:       return "I";
+        case DS_UINT64:       return "L";
+        case DS_FLOAT32:      return "f";
+        case DS_DATE32:       return "tdD";
+        case DS_TIMESTAMP_US: return "tsu:";    /* no timezone */
+        case DS_TIME_US:      return "ttu:";
+        case DS_BINARY:       return "z";
+    }
+    return "?";
 }
 
 /* Group test: does this type use the i64_vals storage vector? */
 static int ds_type_is_int64_stored(DsType t) {
     return t == DS_INT64 || t == DS_INT8 || t == DS_INT16 || t == DS_INT32
-        || t == DS_UINT8 || t == DS_UINT16 || t == DS_UINT32 || t == DS_UINT64;
+        || t == DS_UINT8 || t == DS_UINT16 || t == DS_UINT32 || t == DS_UINT64
+        || t == DS_DATE32 || t == DS_TIMESTAMP_US || t == DS_TIME_US;
 }
 /* Does this type use the f64_vals storage vector? */
 static int ds_type_is_f64_stored(DsType t) {
     return t == DS_FLOAT64 || t == DS_FLOAT32;
+}
+/* Does this type use the u8_offsets + u8_data storage? */
+static int ds_type_is_bytes_stored(DsType t) {
+    return t == DS_UTF8 || t == DS_BINARY;
 }
 
 /* Per-output-column growable staging — populated by Emit setter
@@ -1044,9 +1115,14 @@ static int parse_output_schema(DotnetScript *s, const char *cfg) {
             free(name); free(type); return -1;
         }
         DsType t;
-        if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0) {
+        if (strlen(type) != 1 || ds_fmt_to_type(type[0], &t) != 0
+            || t == DS_DATE32 || t == DS_TIMESTAMP_US
+            || t == DS_TIME_US || t == DS_BINARY) {
             ds_set_err(s, "dotnet.script: output column '%s' type '%s' "
-                          "not supported (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)",
+                          "not supported (Phase 1b script types: "
+                          "l/g/b/u + c/C/s/S/i/I/L/f). Temporal and "
+                          "binary types are dotnet.pipelinecomponent-only "
+                          "in Phase 1b.2.",
                        name, type);
             free(name); free(type); return -1;
         }
@@ -1086,17 +1162,22 @@ static int cache_input_schema(DotnetScript *s) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = up.children[i];
         const char *fmt = c && c->format ? c->format : "";
+        char fmt_ch;
         DsType t;
-        if (strlen(fmt) != 1 || ds_fmt_to_type(fmt[0], &t) != 0) {
+        if (ds_arrow_fmt_str_to_char(fmt, &fmt_ch) != 0
+            || ds_fmt_to_type(fmt_ch, &t) != 0
+            || t == DS_DATE32 || t == DS_TIMESTAMP_US
+            || t == DS_TIME_US || t == DS_BINARY) {
             ds_set_err(s, "dotnet.script: input column '%s' has unsupported "
-                          "Arrow format '%s' (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)",
+                          "Arrow format '%s' (temporal / binary types are "
+                          "dotnet.pipelinecomponent-only in Phase 1b.2)",
                        c && c->name ? c->name : "?", fmt);
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
         }
         cols[i].name = strdup(c && c->name ? c->name : "");
         cols[i].type = t;
-        cols[i].arrow_fmt = fmt[0];
+        cols[i].arrow_fmt = fmt_ch;
         if (!cols[i].name) {
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -1138,21 +1219,27 @@ static int sb_appendf(Sbuf *s, const char *fmt, ...) {
 }
 
 /* C# property type for a DsType (already nullable for value types,
- * naturally nullable for reference types). */
+ * naturally nullable for reference types). Temporal/binary types
+ * are rejected by parse_output_schema in script mode, but the cases
+ * are listed here to keep the compiler happy. */
 static const char *ds_cs_type(DsType t) {
     switch (t) {
-        case DS_INT64:   return "long?";
-        case DS_FLOAT64: return "double?";
-        case DS_BOOL:    return "bool?";
-        case DS_UTF8:    return "string?";
-        case DS_INT8:    return "sbyte?";
-        case DS_INT16:   return "short?";
-        case DS_INT32:   return "int?";
-        case DS_UINT8:   return "byte?";
-        case DS_UINT16:  return "ushort?";
-        case DS_UINT32:  return "uint?";
-        case DS_UINT64:  return "ulong?";
-        case DS_FLOAT32: return "float?";
+        case DS_INT64:        return "long?";
+        case DS_FLOAT64:      return "double?";
+        case DS_BOOL:         return "bool?";
+        case DS_UTF8:         return "string?";
+        case DS_INT8:         return "sbyte?";
+        case DS_INT16:        return "short?";
+        case DS_INT32:        return "int?";
+        case DS_UINT8:        return "byte?";
+        case DS_UINT16:       return "ushort?";
+        case DS_UINT32:       return "uint?";
+        case DS_UINT64:       return "ulong?";
+        case DS_FLOAT32:      return "float?";
+        case DS_DATE32:       return "long?";       /* not reachable in script */
+        case DS_TIMESTAMP_US: return "long?";
+        case DS_TIME_US:      return "long?";
+        case DS_BINARY:       return "byte[]?";
     }
     return "object?";
 }
@@ -1161,17 +1248,21 @@ static const char *ds_cs_type(DsType t) {
  * given DsType — used in generated input-extraction code. */
 static const char *ds_cs_buffer_ptr_type(DsType t) {
     switch (t) {
-        case DS_INT64:   return "long";
-        case DS_FLOAT64: return "double";
-        case DS_INT8:    return "sbyte";
-        case DS_INT16:   return "short";
-        case DS_INT32:   return "int";
-        case DS_UINT8:   return "byte";
-        case DS_UINT16:  return "ushort";
-        case DS_UINT32:  return "uint";
-        case DS_UINT64:  return "ulong";
-        case DS_FLOAT32: return "float";
-        default:         return "byte"; /* unused */
+        case DS_INT64:        return "long";
+        case DS_FLOAT64:      return "double";
+        case DS_INT8:         return "sbyte";
+        case DS_INT16:        return "short";
+        case DS_INT32:        return "int";
+        case DS_UINT8:        return "byte";
+        case DS_UINT16:       return "ushort";
+        case DS_UINT32:       return "uint";
+        case DS_UINT64:       return "ulong";
+        case DS_FLOAT32:      return "float";
+        case DS_DATE32:       return "int";
+        case DS_TIMESTAMP_US: return "long";
+        case DS_TIME_US:      return "long";
+        case DS_BINARY:       return "byte"; /* not reachable */
+        default:              return "byte";
     }
 }
 
@@ -1302,7 +1393,7 @@ static int ds_out_reserve(DsOutCol *c, size_t want) {
         uint8_t *p = realloc(c->b_vals, nc);
         if (!p) return -1;
         c->b_vals = p;
-    } else if (c->type == DS_UTF8) {
+    } else if (ds_type_is_bytes_stored(c->type)) {
         int32_t *po = realloc(c->u8_offsets, (nc + 1) * sizeof *po);
         if (!po) return -1;
         c->u8_offsets = po;
@@ -1539,7 +1630,7 @@ static void *ds_narrow_int(int64_t *src, size_t n, DsType t) {
             for (size_t i = 0; i < n; ++i) p[i] = (uint16_t)src[i];
             return p;
         }
-        case DS_INT32: case DS_UINT32: {
+        case DS_INT32: case DS_UINT32: case DS_DATE32: {
             uint32_t *p = malloc((n ? n : 1) * sizeof *p);
             if (!p) return NULL;
             for (size_t i = 0; i < n; ++i) p[i] = (uint32_t)src[i];
@@ -1571,10 +1662,12 @@ static int ds_finalize_col(DsOutCol *c, struct ArrowArray *out) {
         }
     }
     free(c->nulls); c->nulls = NULL;
-    /* Wide passthrough: int64 / uint64 / float64 own the wide buffer
-     * and hand it straight to Arrow (DS_UINT64 is bit-identical to
-     * DS_INT64 here — i64_vals already holds the right 64 bits). */
-    if (c->type == DS_INT64 || c->type == DS_UINT64 || c->type == DS_FLOAT64) {
+    /* Wide passthrough: int64 / uint64 / float64 / timestamp_us /
+     * time_us own the wide buffer and hand it straight to Arrow.
+     * All five share an 8-byte stride and read from i64_vals (or
+     * f64_vals for the float). */
+    if (c->type == DS_INT64 || c->type == DS_UINT64 || c->type == DS_FLOAT64
+        || c->type == DS_TIMESTAMP_US || c->type == DS_TIME_US) {
         const void **bufs = malloc(2 * sizeof *bufs);
         if (!bufs) { free(vmap); return -1; }
         bufs[0] = vmap;
@@ -1762,20 +1855,7 @@ static int ds_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
             free(kids); return ENOMEM;
         }
         c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
-        switch (s->out_cols[i].type) {
-            case DS_INT64:   c->format = "l"; break;
-            case DS_FLOAT64: c->format = "g"; break;
-            case DS_BOOL:    c->format = "b"; break;
-            case DS_UTF8:    c->format = "u"; break;
-            case DS_INT8:    c->format = "c"; break;
-            case DS_INT16:   c->format = "s"; break;
-            case DS_INT32:   c->format = "i"; break;
-            case DS_UINT8:   c->format = "C"; break;
-            case DS_UINT16:  c->format = "S"; break;
-            case DS_UINT32:  c->format = "I"; break;
-            case DS_UINT64:  c->format = "L"; break;
-            case DS_FLOAT32: c->format = "f"; break;
-        }
+        c->format = ds_type_to_arrow_fmt_str(s->out_cols[i].type);
         c->release = ds_release_schema_named;
         kids[i] = c;
     }
@@ -2149,18 +2229,20 @@ static int dpc_cache_input_schema(DotnetPipelineComponent *p) {
     for (size_t i = 0; i < n; ++i) {
         struct ArrowSchema *c = up.children[i];
         const char *fmt = c && c->format ? c->format : "";
+        char fmt_ch;
         DsType t;
-        if (strlen(fmt) != 1 || ds_fmt_to_type(fmt[0], &t) != 0) {
+        if (ds_arrow_fmt_str_to_char(fmt, &fmt_ch) != 0
+            || ds_fmt_to_type(fmt_ch, &t) != 0) {
             dpc_set_err(p,
                 "dotnet.pipelinecomponent: input column '%s' has unsupported "
-                "Arrow format '%s' (Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)",
+                "Arrow format '%s'",
                 c && c->name ? c->name : "?", fmt);
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
         }
         cols[i].name = strdup(c && c->name ? c->name : "");
         cols[i].type = t;
-        cols[i].arrow_fmt = fmt[0];
+        cols[i].arrow_fmt = fmt_ch;
         if (!cols[i].name) {
             for (size_t k = 0; k < i; ++k) free(cols[k].name);
             free(cols); goto done;
@@ -2327,24 +2409,6 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
 /* Per-port schema and flush. The error port appends two i32 cols
  * (ErrorCode + ErrorColumn) after the main output cols. */
 
-static const char *dpc_arrow_fmt(DsType t) {
-    switch (t) {
-        case DS_INT64:   return "l";
-        case DS_FLOAT64: return "g";
-        case DS_BOOL:    return "b";
-        case DS_UTF8:    return "u";
-        case DS_INT8:    return "c";
-        case DS_INT16:   return "s";
-        case DS_INT32:   return "i";
-        case DS_UINT8:   return "C";
-        case DS_UINT16:  return "S";
-        case DS_UINT32:  return "I";
-        case DS_UINT64:  return "L";
-        case DS_FLOAT32: return "f";
-    }
-    return "?";
-}
-
 static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
     DpcPortHandle *h = st->private_data;
     DotnetPipelineComponent *p = h->parent;
@@ -2375,7 +2439,7 @@ static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) 
             free(kids); return ENOMEM;
         }
         c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
-        c->format = dpc_arrow_fmt(src_type);
+        c->format = ds_type_to_arrow_fmt_str(src_type);
         c->release = ds_release_schema_named;
         kids[i] = c;
     }

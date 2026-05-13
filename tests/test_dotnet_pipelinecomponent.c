@@ -414,6 +414,53 @@ static const char PL_ERROR_ROUTE[] =
     "        from: t:error_out\n"
     "        expect: 3\n";
 
+/* --- Phase 1b.2: temporal + binary types (date32 / timestamp_us /
+ *                 time_us / binary). Source emits int64; the
+ *                 component writes derived date/timestamp/time/binary
+ *                 cells using SSIS-style accessors. -------------- */
+static const char PL_TEMPORAL_BINARY[] =
+    "betl: 1\n"
+    "name: dotnet-pc-temporal-binary\n"
+    "pipeline:\n"
+    "  - id: stage\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 3\n"
+    "      - id: t\n"
+    "        type: dotnet.pipelinecomponent\n"
+    "        from: source\n"
+    "        lang: csharp\n"
+    "        output_schema:\n"
+    "          - { name: id,       type: l }\n"
+    "          - { name: day,      type: D }\n"
+    "          - { name: when_us,  type: T }\n"
+    "          - { name: time_us,  type: M }\n"
+    "          - { name: payload,  type: z }\n"
+    "        source: |\n"
+    "          using Microsoft.SqlServer.Dts.Pipeline;\n"
+    "          namespace Betl;\n"
+    "          public class UserComponent : PipelineComponent {\n"
+    "            public override void ProcessInput(int inputID, PipelineBuffer buffer) {\n"
+    "              while (buffer.NextRow()) {\n"
+    "                long id = buffer.GetInt64(0);\n"
+    "                /* day = id-th day after epoch via SetDate sugar */\n"
+    "                buffer.SetDate(1, System.DateTime.UnixEpoch.AddDays(id));\n"
+    "                /* timestamp_us: id microseconds after epoch */\n"
+    "                buffer.SetInt64(2, id);\n"
+    "                /* time_us: id microseconds since midnight */\n"
+    "                buffer.SetInt64(3, id);\n"
+    "                /* payload: 4 bytes encoding id */\n"
+    "                buffer.SetBytes(4, System.BitConverter.GetBytes((int)id));\n"
+    "              }\n"
+    "            }\n"
+    "          }\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: t\n"
+    "        expect: 3\n";
+
 int main(int argc, char **argv) {
     if (!sdk_available()) {
         fprintf(stderr, "[skip] .NET SDK not installed\n"); return SKIP_RC;
@@ -468,6 +515,11 @@ int main(int argc, char **argv) {
     err[0] = 0;
     rc = run_yaml(plugin_path, PL_ERROR_ROUTE, err, sizeof err);
     if (rc != BETL_OK) fprintf(stderr, "error-route: %s\n", err);
+    CHECK(rc == BETL_OK);
+
+    err[0] = 0;
+    rc = run_yaml(plugin_path, PL_TEMPORAL_BINARY, err, sizeof err);
+    if (rc != BETL_OK) fprintf(stderr, "temporal-binary: %s\n", err);
     CHECK(rc == BETL_OK);
 
     if (failures > 0) {

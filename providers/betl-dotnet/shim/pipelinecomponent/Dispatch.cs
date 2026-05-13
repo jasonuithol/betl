@@ -133,6 +133,7 @@ internal static unsafe class PcDispatch
                     Type = ArrowFmtToCellType(fmt),
                     InputIndex = -1,
                     InputFmt   = '?',
+                    OutputFmt  = fmt,
                 };
             }
 
@@ -322,22 +323,26 @@ internal static unsafe class PcDispatch
         'I' => DataType.DT_UI4,
         'L' => DataType.DT_UI8,
         'f' => DataType.DT_R4,
+        'D' => DataType.DT_DBDATE,
+        'T' => DataType.DT_DBTIMESTAMP2,
+        'M' => DataType.DT_DBTIME2,
+        'z' => DataType.DT_BYTES,
         _   => throw new BetlPipelineException(
-                   $"dotnet.pipelinecomponent: unsupported Arrow format '{fmt}' "
-                   + "(Phase 1b: l/g/b/u + c/C/s/S/i/I/L/f)"),
+                   $"dotnet.pipelinecomponent: unsupported format '{fmt}'"),
     };
 
-    /* Narrow integer + float Arrow formats fold to the widened
-     * storage (CellType.Int64 / CellType.Float64). The DataType is
-     * preserved separately via ArrowFmtToDataType so the user can
-     * still inspect column metadata accurately. */
+    /* Format chars fold to a small storage tag. Date/timestamp/time
+     * all share Int64 storage; the OutputFmt char on the column spec
+     * preserves the semantic type for GetDate/SetDate dispatching. */
     private static CellType ArrowFmtToCellType(char fmt) => fmt switch
     {
-        'l' or 'L' or 'i' or 'I' or 's' or 'S' or 'c' or 'C' => CellType.Int64,
+        'l' or 'L' or 'i' or 'I' or 's' or 'S' or 'c' or 'C'
+        or 'D' or 'T' or 'M'                                 => CellType.Int64,
         'g' or 'f'                                           => CellType.Float64,
         'b'                                                  => CellType.Bool,
         'u'                                                  => CellType.Utf8,
+        'z'                                                  => CellType.Binary,
         _ => throw new BetlPipelineException(
-                $"dotnet.pipelinecomponent: unsupported Arrow format '{fmt}'"),
+                $"dotnet.pipelinecomponent: unsupported format '{fmt}'"),
     };
 }
