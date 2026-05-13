@@ -73,6 +73,46 @@ Reproduce: `make bench` (or `bench/run.sh` directly).
 Tunables: `BETL_BENCH_ITERS`, `BETL_BENCH_ROWS`,
 `BETL_BENCH_CSV_ROWS`, `BETL_BENCH_PC_ROWS`.
 
+## TODO: Windows-side SSIS comparison
+
+The `pc-*` shapes give us numbers for
+`dotnet.pipelinecomponent`'s throughput on a Linux box.
+We have an architectural argument that we should be faster
+than real SSIS on the component hot path — SSIS's
+`PipelineBuffer` is implemented in native C++ and managed
+code reaches it through COM RCWs, paying a marshalling tax
+per cell. Our shim's `BetlPipelineBuffer` is pure managed
+code with array-backed storage.
+
+**We have not actually measured real SSIS.** Until we do,
+the "5–30× faster per component" claim in
+`docs/PIPELINECOMPONENT.md` is structural reasoning, not
+data. To turn it into a defensible number:
+
+1. Windows box with SQL Server Developer Edition + SSDT
+   (Visual Studio extension). Both free.
+2. Pick a workload — same shape as one of our `pc-*` shapes.
+   The 10-col passthrough or the decimal-heavy variant
+   are the most informative because they amplify per-cell
+   crossing cost.
+3. Compile the same C# source two ways:
+   - Against the real Microsoft.SqlServer.Dts.Pipeline
+     assemblies via SSDT, deployed as a real SSIS package
+     and run under `dtexec`.
+   - Against our `Betl.Ssis.PipelineCompat` shim and
+     run via `betl run`.
+4. Same hardware, same input data, same row count, fair
+   source/sink setup.
+5. Publish the numbers here as a new section.
+
+The shim's API surface was made faithful to the SSIS one
+specifically so this A/B is possible without rewriting the
+user code. The runtime is the only variable.
+
+Estimated effort: half a day once the Windows box is set up.
+Until then, treat the per-component speedup claim as a
+hypothesis, not a benchmark.
+
 ## `filter-count` — gen → filter(true) → count
 
 Rows: 500000
