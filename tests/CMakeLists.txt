@@ -256,6 +256,23 @@ if(BETL_LUA_FOUND)
             PASS_REGULAR_EXPRESSION "ok: dotnet.script test passed"
             TIMEOUT 300
         )
+
+        # End-to-end: dotnet.pipelinecomponent sync transform (Phase 1a).
+        add_executable(test_dotnet_pipelinecomponent test_dotnet_pipelinecomponent.c)
+        target_link_libraries(test_dotnet_pipelinecomponent PRIVATE betl_core)
+        set_target_properties(test_dotnet_pipelinecomponent PROPERTIES ENABLE_EXPORTS ON)
+        target_compile_definitions(test_dotnet_pipelinecomponent PRIVATE
+            BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_DOTNET_TARGET}>"
+        )
+        add_dependencies(test_dotnet_pipelinecomponent ${BETL_DOTNET_TARGET})
+        add_test(NAME dotnet_pipelinecomponent
+            COMMAND test_dotnet_pipelinecomponent $<TARGET_FILE:${BETL_DOTNET_TARGET}>
+        )
+        set_tests_properties(dotnet_pipelinecomponent PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "ok: dotnet.pipelinecomponent test passed"
+            TIMEOUT 300
+        )
     endif()
 
     # End-to-end: lua.script — the SSIS async script component analogue.

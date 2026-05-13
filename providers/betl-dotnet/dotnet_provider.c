@@ -44,7 +44,7 @@
 
 /* Bump when the C↔C# ABI in shim/ changes. Cached artifacts compiled
  * against an older ABI become invalid (the hash flips). */
-#define BETL_DOTNET_SHIM_ABI_VERSION "1"
+#define BETL_DOTNET_SHIM_ABI_VERSION "2"
 
 
 /* ============================================================== *
@@ -1686,6 +1686,582 @@ static const BetlPortDef ds_outputs[] = {
 
 
 /* ============================================================== *
+ *  dotnet.pipelinecomponent — Phase 1a (sync transforms, types    *
+ *  l/g/b/u, single column space = output_schema)                  *
+ *                                                                  *
+ *  Parallel to dotnet.script but with the SSIS PipelineComponent  *
+ *  lifecycle (PreExecute / ProcessInput / PostExecute / Cleanup). *
+ *  Reuses the script's DsCol / DsOutCol staging machinery via the *
+ *  generic ds_* helpers; only the setters, the C# entry-point    *
+ *  function pointers, and the per-step lifecycle loop differ.    *
+ *  A separate struct keeps the two flows decoupled.               *
+ * ============================================================== */
+
+typedef int (*dpc_register_emit_fn)(
+    void (*set_int64)  (void *, int, int64_t),
+    void (*set_float64)(void *, int, double),
+    void (*set_bool)   (void *, int, uint8_t),
+    void (*set_utf8)   (void *, int, const uint8_t *, int),
+    void (*set_null)   (void *, int),
+    void (*commit_row) (void *));
+typedef int (*dpc_register_schema_fn)(
+    const char **input_names,  const char *input_fmts,  int n_input,
+    const char **output_names, const char *output_fmts, int n_output);
+typedef int (*dpc_lifecycle0_fn)(void);
+typedef int (*dpc_process_batch_fn)(struct ArrowArray *batch, void *emit_ctx);
+
+typedef struct {
+    BetlContext             *ctx;
+    char                    *source;
+    char                    *lang;
+    /* output_schema parsed from YAML */
+    DsCol                   *out_cols;
+    size_t                   n_out;
+    /* input_schema cached from upstream on first get_next */
+    DsCol                   *in_cols;
+    size_t                   n_in;
+
+    /* dlopen / function pointers */
+    char                    *so_path;
+    void                    *handle;
+    ds_init_fn               init_fn;
+    dpc_register_emit_fn     register_emit_fn;
+    dpc_register_schema_fn   register_schema_fn;
+    dpc_lifecycle0_fn        pc_init_fn;
+    dpc_lifecycle0_fn        pre_execute_fn;
+    dpc_process_batch_fn     process_batch_fn;
+    dpc_lifecycle0_fn        post_execute_fn;
+    dpc_lifecycle0_fn        cleanup_fn;
+
+    struct ArrowArrayStream  input;
+    int                      have_input;
+    int                      compiled;
+    int                      eof_seen;
+    int                      post_executed;
+
+    DsOutCol                *out_staging;
+    int                     *pending_set;
+    char                     last_err[1024];
+} DotnetPipelineComponent;
+
+static void dpc_set_err(DotnetPipelineComponent *p, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(p->last_err, sizeof p->last_err, fmt, ap); va_end(ap);
+    betl_set_error(p->ctx, "%s", p->last_err);
+}
+
+/* ---- output_schema parsing (mirrors parse_output_schema for script) -- */
+
+static int dpc_parse_output_schema(DotnetPipelineComponent *p, const char *cfg) {
+    const char *q = json_value_after(cfg, "output_schema");
+    if (!q || *q != '[') {
+        dpc_set_err(p, "dotnet.pipelinecomponent: 'output_schema' is required (array)");
+        return -1;
+    }
+    ++q;
+    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') ++q;
+    if (*q == ']') {
+        dpc_set_err(p, "dotnet.pipelinecomponent: 'output_schema' is empty");
+        return -1;
+    }
+    for (;;) {
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') ++q;
+        if (*q != '{') {
+            dpc_set_err(p, "dotnet.pipelinecomponent: output_schema entry must be an object");
+            return -1;
+        }
+        const char *start = q;
+        int depth = 0;
+        for (; *q; ++q) {
+            if (*q == '"') {
+                ++q;
+                while (*q && *q != '"') { if (*q == '\\' && q[1]) ++q; ++q; }
+                if (!*q) {
+                    dpc_set_err(p, "dotnet.pipelinecomponent: malformed output_schema");
+                    return -1;
+                }
+                continue;
+            }
+            if (*q == '{') ++depth;
+            else if (*q == '}') { --depth; if (depth == 0) { ++q; break; } }
+        }
+        size_t len = (size_t)(q - start);
+        char *buf = malloc(len + 1);
+        if (!buf) return -1;
+        memcpy(buf, start, len); buf[len] = '\0';
+
+        char *name = NULL, *type = NULL;
+        json_get_string(buf, "name", &name);
+        json_get_string(buf, "type", &type);
+        free(buf);
+        if (!name || !type) {
+            dpc_set_err(p, "dotnet.pipelinecomponent: output column needs name + type");
+            free(name); free(type); return -1;
+        }
+        DsType t;
+        if      (!strcmp(type, "l")) t = DS_INT64;
+        else if (!strcmp(type, "g")) t = DS_FLOAT64;
+        else if (!strcmp(type, "b")) t = DS_BOOL;
+        else if (!strcmp(type, "u")) t = DS_UTF8;
+        else {
+            dpc_set_err(p,
+                "dotnet.pipelinecomponent: output column '%s' type '%s' "
+                "not yet supported (Phase 1a: l, g, b, u)", name, type);
+            free(name); free(type); return -1;
+        }
+        free(type);
+        DsCol *grow = realloc(p->out_cols, (p->n_out + 1) * sizeof *grow);
+        if (!grow) { free(name); return -1; }
+        p->out_cols = grow;
+        p->out_cols[p->n_out].name = name;
+        p->out_cols[p->n_out].type = t;
+        p->out_cols[p->n_out].arrow_fmt =
+            (t == DS_INT64 ? 'l' : t == DS_FLOAT64 ? 'g' :
+             t == DS_BOOL  ? 'b' : 'u');
+        ++p->n_out;
+
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') ++q;
+        if (*q == ',') { ++q; continue; }
+        if (*q == ']') return 0;
+        dpc_set_err(p, "dotnet.pipelinecomponent: malformed output_schema array");
+        return -1;
+    }
+}
+
+/* ---- input schema caching (parallels cache_input_schema) ------------- */
+
+static int dpc_cache_input_schema(DotnetPipelineComponent *p) {
+    if (p->in_cols) return 0;
+    struct ArrowSchema up = {0};
+    if (p->input.get_schema(&p->input, &up) != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: upstream get_schema failed");
+        return -1;
+    }
+    int rc = -1;
+    if (!up.format || strcmp(up.format, "+s") != 0 || up.n_children <= 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: input must be a struct");
+        goto done;
+    }
+    size_t n = (size_t)up.n_children;
+    DsCol *cols = calloc(n, sizeof *cols);
+    if (!cols) { dpc_set_err(p, "dotnet.pipelinecomponent: OOM"); goto done; }
+    for (size_t i = 0; i < n; ++i) {
+        struct ArrowSchema *c = up.children[i];
+        const char *fmt = c && c->format ? c->format : "";
+        DsType t;
+        if      (!strcmp(fmt, "l")) t = DS_INT64;
+        else if (!strcmp(fmt, "g")) t = DS_FLOAT64;
+        else if (!strcmp(fmt, "b")) t = DS_BOOL;
+        else if (!strcmp(fmt, "u")) t = DS_UTF8;
+        else {
+            dpc_set_err(p,
+                "dotnet.pipelinecomponent: input column '%s' has unsupported "
+                "Arrow format '%s' (Phase 1a: l, g, b, u)",
+                c && c->name ? c->name : "?", fmt);
+            for (size_t k = 0; k < i; ++k) free(cols[k].name);
+            free(cols); goto done;
+        }
+        cols[i].name = strdup(c && c->name ? c->name : "");
+        cols[i].type = t;
+        cols[i].arrow_fmt = fmt[0];
+        if (!cols[i].name) {
+            for (size_t k = 0; k < i; ++k) free(cols[k].name);
+            free(cols); goto done;
+        }
+    }
+    p->in_cols = cols;
+    p->n_in = n;
+    rc = 0;
+done:
+    if (up.release) up.release(&up);
+    return rc;
+}
+
+/* ---- emit setters (cast emit_ctx to DotnetPipelineComponent*) -------- */
+
+static void dpc_emit_set_int64(void *ctx, int idx, int64_t v) {
+    DotnetPipelineComponent *p = ctx;
+    DsOutCol *c = &p->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->i64_vals[c->n] = v;
+    p->pending_set[idx] = 1;
+}
+static void dpc_emit_set_float64(void *ctx, int idx, double v) {
+    DotnetPipelineComponent *p = ctx;
+    DsOutCol *c = &p->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->f64_vals[c->n] = v;
+    p->pending_set[idx] = 1;
+}
+static void dpc_emit_set_bool(void *ctx, int idx, uint8_t v) {
+    DotnetPipelineComponent *p = ctx;
+    DsOutCol *c = &p->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->b_vals[c->n] = v ? 1 : 0;
+    p->pending_set[idx] = 1;
+}
+static void dpc_emit_set_utf8(void *ctx, int idx, const uint8_t *bytes, int n_bytes) {
+    DotnetPipelineComponent *p = ctx;
+    DsOutCol *c = &p->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    if ((size_t)c->u8_offsets[c->n] + (size_t)n_bytes >= c->u8_cap) {
+        size_t nc = c->u8_cap ? c->u8_cap : 128;
+        while (nc < (size_t)c->u8_offsets[c->n] + (size_t)n_bytes + 1) nc *= 2;
+        char *nd = realloc(c->u8_data, nc);
+        if (!nd) return;
+        c->u8_data = nd; c->u8_cap = nc;
+    }
+    memcpy(c->u8_data + c->u8_offsets[c->n], bytes, (size_t)n_bytes);
+    c->u8_offsets[c->n + 1] = c->u8_offsets[c->n] + n_bytes;
+    p->pending_set[idx] = 1;
+}
+static void dpc_emit_set_null(void *ctx, int idx) {
+    DotnetPipelineComponent *p = ctx;
+    DsOutCol *c = &p->out_staging[idx];
+    if (ds_out_reserve(c, c->n + 1) != 0) return;
+    c->nulls[c->n] = 1;
+    p->pending_set[idx] = 1;
+}
+static void dpc_emit_commit_row(void *ctx) {
+    DotnetPipelineComponent *p = ctx;
+    /* For any column that wasn't set during this row, write NULL. */
+    for (size_t i = 0; i < p->n_out; ++i) {
+        DsOutCol *c = &p->out_staging[i];
+        if (!p->pending_set[i]) {
+            if (ds_out_reserve(c, c->n + 1) != 0) return;
+            c->nulls[c->n] = 1;
+            if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = c->u8_offsets[c->n];
+        }
+        ++c->n;
+        p->pending_set[i] = 0;
+    }
+}
+
+/* ---- compile + load ------------------------------------------------- */
+
+static char *dpc_build_schema_hash_input(DotnetPipelineComponent *p, size_t *out_len) {
+    Sbuf sb = {0};
+    for (size_t i = 0; i < p->n_in; ++i)
+        sb_appendf(&sb, "in:%s:%c\n", p->in_cols[i].name, p->in_cols[i].arrow_fmt);
+    for (size_t i = 0; i < p->n_out; ++i)
+        sb_appendf(&sb, "out:%s:%c\n", p->out_cols[i].name, p->out_cols[i].arrow_fmt);
+    *out_len = sb.len;
+    return sb.p;
+}
+
+static int dpc_compile_and_load(DotnetPipelineComponent *p) {
+    if (p->compiled) return 0;
+
+    size_t hash_len = 0;
+    char *hash_in = dpc_build_schema_hash_input(p, &hash_len);
+
+    compile_request_t creq = {
+        .user_source    = p->source,
+        .lang           = p->lang,
+        .kind           = "pc",
+        .extra_files    = NULL,
+        .n_extra        = 0,
+        .shim_subdir    = "pipelinecomponent",
+        .extra_hash_in  = hash_in,
+        .extra_hash_len = hash_len,
+    };
+    char err[8192] = {0};
+    if (compile_to_cache(p->ctx, &creq, &p->so_path, err, sizeof err) != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: compile failed: %s", err);
+        free(hash_in);
+        return -1;
+    }
+    free(hash_in);
+
+    p->handle = dlopen(p->so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!p->handle) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: dlopen(%s) failed: %s",
+                    p->so_path, dlerror());
+        return -1;
+    }
+    *(void **)&p->init_fn            = dlsym(p->handle, "betl_dotnet_init");
+    *(void **)&p->register_emit_fn   = dlsym(p->handle, "betl_dotnet_pc_register_emit");
+    *(void **)&p->register_schema_fn = dlsym(p->handle, "betl_dotnet_pc_register_schema");
+    *(void **)&p->pc_init_fn         = dlsym(p->handle, "betl_dotnet_pc_init");
+    *(void **)&p->pre_execute_fn     = dlsym(p->handle, "betl_dotnet_pc_pre_execute");
+    *(void **)&p->process_batch_fn   = dlsym(p->handle, "betl_dotnet_pc_process_batch");
+    *(void **)&p->post_execute_fn    = dlsym(p->handle, "betl_dotnet_pc_post_execute");
+    *(void **)&p->cleanup_fn         = dlsym(p->handle, "betl_dotnet_pc_cleanup");
+    if (!p->init_fn || !p->register_emit_fn || !p->register_schema_fn
+        || !p->pc_init_fn || !p->pre_execute_fn || !p->process_batch_fn
+        || !p->post_execute_fn || !p->cleanup_fn) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: AOT'd .so is missing required entry points");
+        return -1;
+    }
+    if (p->init_fn(p->ctx, host_log_wrapper, host_get_param_wrapper,
+                   host_get_connection_wrapper) != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: managed init returned non-zero");
+        return -1;
+    }
+    if (p->register_emit_fn(dpc_emit_set_int64, dpc_emit_set_float64, dpc_emit_set_bool,
+                            dpc_emit_set_utf8, dpc_emit_set_null, dpc_emit_commit_row) != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: register_emit returned non-zero");
+        return -1;
+    }
+    /* Hand input + output schema descriptors to the shim. */
+    const char **in_names  = calloc(p->n_in,  sizeof *in_names);
+    const char **out_names = calloc(p->n_out, sizeof *out_names);
+    char *in_fmts  = calloc(p->n_in  + 1, 1);
+    char *out_fmts = calloc(p->n_out + 1, 1);
+    if (!in_names || !out_names || !in_fmts || !out_fmts) {
+        free(in_names); free(out_names); free(in_fmts); free(out_fmts);
+        dpc_set_err(p, "dotnet.pipelinecomponent: OOM");
+        return -1;
+    }
+    for (size_t i = 0; i < p->n_in;  ++i) {
+        in_names[i]  = p->in_cols[i].name;
+        in_fmts[i]   = p->in_cols[i].arrow_fmt;
+    }
+    for (size_t i = 0; i < p->n_out; ++i) {
+        out_names[i] = p->out_cols[i].name;
+        out_fmts[i]  = p->out_cols[i].arrow_fmt;
+    }
+    int rs = p->register_schema_fn(in_names, in_fmts, (int)p->n_in,
+                                   out_names, out_fmts, (int)p->n_out);
+    free(in_names); free(out_names); free(in_fmts); free(out_fmts);
+    if (rs != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: register_schema returned non-zero "
+                       "(see [ERROR] log above)");
+        return -1;
+    }
+    if (p->pc_init_fn() != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: UserComponent constructor threw");
+        return -1;
+    }
+    if (p->pre_execute_fn() != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: PreExecute threw "
+                       "(see [ERROR] log above)");
+        return -1;
+    }
+
+    /* Allocate output staging. */
+    p->out_staging = calloc(p->n_out, sizeof *p->out_staging);
+    p->pending_set = calloc(p->n_out, sizeof *p->pending_set);
+    if (!p->out_staging || !p->pending_set) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: OOM");
+        return -1;
+    }
+    for (size_t i = 0; i < p->n_out; ++i)
+        p->out_staging[i].type = p->out_cols[i].type;
+
+    p->compiled = 1;
+    return 0;
+}
+
+/* ---- Arrow stream callbacks ----------------------------------------- */
+
+static int dpc_get_schema(struct ArrowArrayStream *st, struct ArrowSchema *out) {
+    DotnetPipelineComponent *p = st->private_data;
+    memset(out, 0, sizeof *out);
+    struct ArrowSchema **kids = calloc(p->n_out, sizeof *kids);
+    if (!kids) return ENOMEM;
+    for (size_t i = 0; i < p->n_out; ++i) {
+        struct ArrowSchema *c = calloc(1, sizeof *c);
+        char *nm = strdup(p->out_cols[i].name);
+        if (!c || !nm) {
+            free(c); free(nm);
+            for (size_t k = 0; k < i; ++k) {
+                if (kids[k]->release) kids[k]->release(kids[k]);
+                free(kids[k]);
+            }
+            free(kids); return ENOMEM;
+        }
+        c->name = nm; c->flags = ARROW_FLAG_NULLABLE;
+        switch (p->out_cols[i].type) {
+            case DS_INT64:   c->format = "l"; break;
+            case DS_FLOAT64: c->format = "g"; break;
+            case DS_BOOL:    c->format = "b"; break;
+            case DS_UTF8:    c->format = "u"; break;
+        }
+        c->release = ds_release_schema_named;
+        kids[i] = c;
+    }
+    out->format = "+s"; out->n_children = (int64_t)p->n_out;
+    out->children = kids; out->release = ds_release_schema_struct;
+    return 0;
+}
+
+static int dpc_flush_batch(DotnetPipelineComponent *p, struct ArrowArray *out) {
+    size_t n = p->out_staging[0].n;
+    for (size_t i = 1; i < p->n_out; ++i) {
+        if (p->out_staging[i].n != n) {
+            dpc_set_err(p, "dotnet.pipelinecomponent: output column row count mismatch "
+                           "(col 0 = %zu, col %zu = %zu)",
+                        n, i, p->out_staging[i].n);
+            return -1;
+        }
+    }
+    struct ArrowArray **kids = calloc(p->n_out, sizeof *kids);
+    if (!kids) return -1;
+    for (size_t i = 0; i < p->n_out; ++i) {
+        kids[i] = calloc(1, sizeof **kids);
+        if (!kids[i] || ds_finalize_col(&p->out_staging[i], kids[i]) != 0) {
+            for (size_t k = 0; k <= i; ++k) {
+                if (kids[k]) {
+                    if (kids[k]->release) kids[k]->release(kids[k]);
+                    free(kids[k]);
+                }
+            }
+            free(kids); return -1;
+        }
+    }
+    const void **outer = malloc(sizeof *outer);
+    if (!outer) {
+        for (size_t i = 0; i < p->n_out; ++i) {
+            if (kids[i]->release) kids[i]->release(kids[i]);
+            free(kids[i]);
+        }
+        free(kids); return -1;
+    }
+    outer[0] = NULL;
+    out->length = (int64_t)n; out->null_count = 0;
+    out->n_buffers = 1; out->n_children = (int64_t)p->n_out;
+    out->buffers = outer; out->children = kids;
+    out->release = ds_release_struct;
+    for (size_t i = 0; i < p->n_out; ++i) {
+        ds_out_free(&p->out_staging[i]);
+        p->out_staging[i].type = p->out_cols[i].type;
+    }
+    return 0;
+}
+
+static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
+    DotnetPipelineComponent *p = st->private_data;
+    memset(out, 0, sizeof *out);
+    if (dpc_cache_input_schema(p) != 0) return EIO;
+    if (dpc_compile_and_load(p) != 0)   return EIO;
+
+    while (p->out_staging[0].n == 0) {
+        if (p->eof_seen) {
+            if (!p->post_executed) {
+                p->post_executed = 1;
+                if (p->post_execute_fn() != 0) {
+                    dpc_set_err(p, "dotnet.pipelinecomponent: PostExecute threw "
+                                   "(see [ERROR] log above)");
+                    return EIO;
+                }
+                if (p->cleanup_fn() != 0) {
+                    dpc_set_err(p, "dotnet.pipelinecomponent: Cleanup threw "
+                                   "(see [ERROR] log above)");
+                    return EIO;
+                }
+            }
+            return 0;
+        }
+        struct ArrowArray in_arr = {0};
+        if (p->input.get_next(&p->input, &in_arr) != 0) {
+            dpc_set_err(p, "dotnet.pipelinecomponent: upstream get_next failed");
+            return EIO;
+        }
+        if (!in_arr.release) {
+            p->eof_seen = 1;
+            continue; /* fall through to PostExecute on next loop turn */
+        }
+        if (p->process_batch_fn(&in_arr, p) != 0) {
+            in_arr.release(&in_arr);
+            dpc_set_err(p, "dotnet.pipelinecomponent: ProcessInput returned non-zero "
+                           "(see [ERROR] log above)");
+            return EIO;
+        }
+        in_arr.release(&in_arr);
+    }
+    if (dpc_flush_batch(p, out) != 0) {
+        dpc_set_err(p, "dotnet.pipelinecomponent: flush failed");
+        return EIO;
+    }
+    return 0;
+}
+
+static const char *dpc_get_last_error(struct ArrowArrayStream *st) {
+    DotnetPipelineComponent *p = st->private_data;
+    return (p && p->last_err[0]) ? p->last_err : NULL;
+}
+static void dpc_release(struct ArrowArrayStream *st) {
+    st->private_data = NULL; st->release = NULL;
+}
+
+static int dotnet_pc_init(BetlContext *ctx, const char *cfg, void **state) {
+    DotnetPipelineComponent *p = calloc(1, sizeof *p);
+    if (!p) return BETL_ERR_INTERNAL;
+    p->ctx = ctx;
+    if (json_get_string(cfg, "source", &p->source) != 0 || !p->source) {
+        betl_set_error(ctx, "dotnet.pipelinecomponent: 'source' is required");
+        free(p); return BETL_ERR_INVALID;
+    }
+    if (json_get_string(cfg, "lang", &p->lang) != 0 || !p->lang) {
+        p->lang = strdup("csharp");
+    }
+    if (strcmp(p->lang, "csharp") != 0) {
+        betl_set_error(ctx,
+            "dotnet.pipelinecomponent: lang '%s' is not supported; "
+            "Phase 1a is C# only", p->lang);
+        free(p->source); free(p->lang); free(p);
+        return BETL_ERR_UNSUPPORTED;
+    }
+    if (dpc_parse_output_schema(p, cfg) != 0) {
+        for (size_t i = 0; i < p->n_out; ++i) free(p->out_cols[i].name);
+        free(p->out_cols); free(p->source); free(p->lang); free(p);
+        return BETL_ERR_INVALID;
+    }
+    *state = p;
+    return BETL_OK;
+}
+
+static int dotnet_pc_attach_input(void *state, int port,
+                                  struct ArrowArrayStream *in) {
+    (void)port;
+    DotnetPipelineComponent *p = state;
+    p->input = *in;
+    p->have_input = 1;
+    memset(in, 0, sizeof *in);
+    return BETL_OK;
+}
+
+static int dotnet_pc_attach_output(void *state, int port,
+                                   struct ArrowArrayStream *out) {
+    (void)port;
+    DotnetPipelineComponent *p = state;
+    out->get_schema     = dpc_get_schema;
+    out->get_next       = dpc_get_next;
+    out->get_last_error = dpc_get_last_error;
+    out->release        = dpc_release;
+    out->private_data   = p;
+    return BETL_OK;
+}
+
+static void dotnet_pc_destroy(void *state) {
+    if (!state) return;
+    DotnetPipelineComponent *p = state;
+    if (p->have_input && p->input.release) p->input.release(&p->input);
+    free(p->so_path);
+    free(p->source); free(p->lang);
+    for (size_t i = 0; i < p->n_out; ++i) free(p->out_cols[i].name);
+    free(p->out_cols);
+    for (size_t i = 0; i < p->n_in; ++i) free(p->in_cols[i].name);
+    free(p->in_cols);
+    if (p->out_staging) {
+        for (size_t i = 0; i < p->n_out; ++i) ds_out_free(&p->out_staging[i]);
+        free(p->out_staging);
+    }
+    free(p->pending_set);
+    free(p);
+}
+
+static const BetlPortDef dpc_inputs[]  = {
+    { .name = "in",  .schema_mode = BETL_SCHEMA_DYNAMIC, .doc = "rows to process" },
+};
+static const BetlPortDef dpc_outputs[] = {
+    { .name = "out", .schema_mode = BETL_SCHEMA_DYNAMIC,
+      .doc = "rows emitted by ProcessInput (Phase 1a: output_schema-defined)" },
+};
+
+
+/* ============================================================== *
  *  Provider entry                                                  *
  * ============================================================== */
 
@@ -1715,6 +2291,19 @@ static const BetlComponentDef components[] = {
       .destroy            = dotnet_script_destroy,
       .attach_input       = dotnet_script_attach_input,
       .attach_output      = dotnet_script_attach_output },
+
+    { .name               = "dotnet.pipelinecomponent",
+      .kind               = BETL_KIND_TRANSFORM,
+      .config_schema_json = "{}",
+      .flags              = 0,
+      .inputs             = dpc_inputs,
+      .input_count        = 1,
+      .outputs            = dpc_outputs,
+      .output_count       = 1,
+      .init               = dotnet_pc_init,
+      .destroy            = dotnet_pc_destroy,
+      .attach_input       = dotnet_pc_attach_input,
+      .attach_output      = dotnet_pc_attach_output },
 };
 
 static const BetlProvider dotnet_provider = {
