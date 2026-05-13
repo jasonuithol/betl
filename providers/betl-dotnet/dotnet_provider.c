@@ -865,6 +865,18 @@ typedef struct {
     uint8_t  pending_null[1];   /* placeholder; really one bool per col */
 } DsOutCol;
 
+/* Shared emit context — what the C# setters receive back via the
+ * opaque emit_ctx pointer. Stack-built in each get_next loop so it
+ * captures the current out_staging / pending_set pointers + n_out.
+ * Letting both dotnet.script and dotnet.pipelinecomponent route
+ * through the same setters; the per-kind structs hold the same
+ * fields as top-level members and the emitter is just a shim. */
+typedef struct {
+    DsOutCol *out_staging;
+    int      *pending_set;
+    size_t    n_out;
+} DsEmitter;
+
 typedef int (*ds_init_fn)(BetlContext *ctx,
                           void (*log)(BetlContext *, int, const char *),
                           const char *(*get_param)(BetlContext *, const char *),
@@ -1234,32 +1246,36 @@ static void ds_out_free(DsOutCol *c) {
     memset(c, 0, sizeof *c);
 }
 
-/* --- Per-cell setter callbacks (called from C#) ---------------- */
+/* --- Per-cell setter callbacks (called from C# via emit_ctx) ----
+ *
+ * The opaque ctx is a DsEmitter* — stack-built by the C caller at
+ * each process_batch / on_eof call so the same setters can serve
+ * any kind (script, pipelinecomponent, …) without per-kind casts. */
 
 static void emit_set_int64(void *ctx, int idx, int64_t v) {
-    DotnetScript *s = ctx;
-    DsOutCol *c = &s->out_staging[idx];
+    DsEmitter *e = ctx;
+    DsOutCol *c = &e->out_staging[idx];
     if (ds_out_reserve(c, c->n + 1) != 0) return;
     c->i64_vals[c->n] = v;
-    s->pending_set[idx] = 1;
+    e->pending_set[idx] = 1;
 }
 static void emit_set_float64(void *ctx, int idx, double v) {
-    DotnetScript *s = ctx;
-    DsOutCol *c = &s->out_staging[idx];
+    DsEmitter *e = ctx;
+    DsOutCol *c = &e->out_staging[idx];
     if (ds_out_reserve(c, c->n + 1) != 0) return;
     c->f64_vals[c->n] = v;
-    s->pending_set[idx] = 1;
+    e->pending_set[idx] = 1;
 }
 static void emit_set_bool(void *ctx, int idx, uint8_t v) {
-    DotnetScript *s = ctx;
-    DsOutCol *c = &s->out_staging[idx];
+    DsEmitter *e = ctx;
+    DsOutCol *c = &e->out_staging[idx];
     if (ds_out_reserve(c, c->n + 1) != 0) return;
     c->b_vals[c->n] = v ? 1 : 0;
-    s->pending_set[idx] = 1;
+    e->pending_set[idx] = 1;
 }
 static void emit_set_utf8(void *ctx, int idx, const uint8_t *str, int len) {
-    DotnetScript *s = ctx;
-    DsOutCol *c = &s->out_staging[idx];
+    DsEmitter *e = ctx;
+    DsOutCol *c = &e->out_staging[idx];
     if (ds_out_reserve(c, c->n + 1) != 0) return;
     size_t need = c->u8_len + (size_t)len;
     if (need > c->u8_cap) {
@@ -1272,32 +1288,40 @@ static void emit_set_utf8(void *ctx, int idx, const uint8_t *str, int len) {
     if (len > 0) memcpy(c->u8_data + c->u8_len, str, (size_t)len);
     c->u8_len += (size_t)len;
     c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
-    s->pending_set[idx] = 1;
+    e->pending_set[idx] = 1;
 }
 static void emit_set_null(void *ctx, int idx) {
-    DotnetScript *s = ctx;
-    DsOutCol *c = &s->out_staging[idx];
+    DsEmitter *e = ctx;
+    DsOutCol *c = &e->out_staging[idx];
     if (ds_out_reserve(c, c->n + 1) != 0) return;
     c->nulls[c->n] = 1;
     /* For utf8 we still need to advance the offset entry across NULL
      * rows so finalize doesn't end up with a discontinuity. */
     if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
-    s->pending_set[idx] = 1;
+    e->pending_set[idx] = 1;
 }
 static void emit_commit_row(void *ctx) {
-    DotnetScript *s = ctx;
+    DsEmitter *e = ctx;
     /* Any column the script didn't set falls back to NULL. */
-    for (size_t i = 0; i < s->n_out; ++i) {
-        if (!s->pending_set[i]) {
-            DsOutCol *c = &s->out_staging[i];
+    for (size_t i = 0; i < e->n_out; ++i) {
+        if (!e->pending_set[i]) {
+            DsOutCol *c = &e->out_staging[i];
             if (ds_out_reserve(c, c->n + 1) != 0) continue;
             c->nulls[c->n] = 1;
             if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = (int32_t)c->u8_len;
         }
-        s->pending_set[i] = 0;
-        ++s->out_staging[i].n;
+        e->pending_set[i] = 0;
+        ++e->out_staging[i].n;
     }
 }
+
+/* Helper to build a transient DsEmitter from a DotnetScript or
+ * DotnetPipelineComponent. Caller stack-allocates, fills in via
+ * the macro, passes its address as emit_ctx. */
+#define DS_EMITTER_OF(self) \
+    (DsEmitter){ .out_staging = (self)->out_staging, \
+                 .pending_set = (self)->pending_set, \
+                 .n_out       = (self)->n_out }
 
 /* --- finalize output batch ------------------------------------ */
 
@@ -1567,6 +1591,7 @@ static int ds_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
     memset(out, 0, sizeof *out);
     if (cache_input_schema(s) != 0) return EIO;
     if (compile_and_load(s) != 0)   return EIO;
+    DsEmitter em = DS_EMITTER_OF(s);
 
     /* Pull batches until at least one output row is buffered, or EOF
      * (then run on_eof and emit whatever it produces). */
@@ -1579,7 +1604,7 @@ static int ds_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         }
         if (!in_arr.release) {
             s->eof_seen = 1;
-            if (s->on_eof_fn(s) != 0) {
+            if (s->on_eof_fn(&em) != 0) {
                 ds_set_err(s, "dotnet.script: on_eof returned non-zero "
                               "(see [ERROR] log above)");
                 return EIO;
@@ -1587,7 +1612,7 @@ static int ds_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
             if (s->out_staging[0].n == 0) return 0;
             break;
         }
-        if (s->process_batch_fn(&in_arr, s) != 0) {
+        if (s->process_batch_fn(&in_arr, &em) != 0) {
             in_arr.release(&in_arr);
             ds_set_err(s, "dotnet.script: process_batch returned non-zero");
             return EIO;
@@ -1877,65 +1902,7 @@ done:
     return rc;
 }
 
-/* ---- emit setters (cast emit_ctx to DotnetPipelineComponent*) -------- */
-
-static void dpc_emit_set_int64(void *ctx, int idx, int64_t v) {
-    DotnetPipelineComponent *p = ctx;
-    DsOutCol *c = &p->out_staging[idx];
-    if (ds_out_reserve(c, c->n + 1) != 0) return;
-    c->i64_vals[c->n] = v;
-    p->pending_set[idx] = 1;
-}
-static void dpc_emit_set_float64(void *ctx, int idx, double v) {
-    DotnetPipelineComponent *p = ctx;
-    DsOutCol *c = &p->out_staging[idx];
-    if (ds_out_reserve(c, c->n + 1) != 0) return;
-    c->f64_vals[c->n] = v;
-    p->pending_set[idx] = 1;
-}
-static void dpc_emit_set_bool(void *ctx, int idx, uint8_t v) {
-    DotnetPipelineComponent *p = ctx;
-    DsOutCol *c = &p->out_staging[idx];
-    if (ds_out_reserve(c, c->n + 1) != 0) return;
-    c->b_vals[c->n] = v ? 1 : 0;
-    p->pending_set[idx] = 1;
-}
-static void dpc_emit_set_utf8(void *ctx, int idx, const uint8_t *bytes, int n_bytes) {
-    DotnetPipelineComponent *p = ctx;
-    DsOutCol *c = &p->out_staging[idx];
-    if (ds_out_reserve(c, c->n + 1) != 0) return;
-    if ((size_t)c->u8_offsets[c->n] + (size_t)n_bytes >= c->u8_cap) {
-        size_t nc = c->u8_cap ? c->u8_cap : 128;
-        while (nc < (size_t)c->u8_offsets[c->n] + (size_t)n_bytes + 1) nc *= 2;
-        char *nd = realloc(c->u8_data, nc);
-        if (!nd) return;
-        c->u8_data = nd; c->u8_cap = nc;
-    }
-    memcpy(c->u8_data + c->u8_offsets[c->n], bytes, (size_t)n_bytes);
-    c->u8_offsets[c->n + 1] = c->u8_offsets[c->n] + n_bytes;
-    p->pending_set[idx] = 1;
-}
-static void dpc_emit_set_null(void *ctx, int idx) {
-    DotnetPipelineComponent *p = ctx;
-    DsOutCol *c = &p->out_staging[idx];
-    if (ds_out_reserve(c, c->n + 1) != 0) return;
-    c->nulls[c->n] = 1;
-    p->pending_set[idx] = 1;
-}
-static void dpc_emit_commit_row(void *ctx) {
-    DotnetPipelineComponent *p = ctx;
-    /* For any column that wasn't set during this row, write NULL. */
-    for (size_t i = 0; i < p->n_out; ++i) {
-        DsOutCol *c = &p->out_staging[i];
-        if (!p->pending_set[i]) {
-            if (ds_out_reserve(c, c->n + 1) != 0) return;
-            c->nulls[c->n] = 1;
-            if (c->type == DS_UTF8) c->u8_offsets[c->n + 1] = c->u8_offsets[c->n];
-        }
-        ++c->n;
-        p->pending_set[i] = 0;
-    }
-}
+/* Emit setters: shared with dotnet.script via DsEmitter. */
 
 /* ---- compile + load ------------------------------------------------- */
 
@@ -1998,8 +1965,8 @@ static int dpc_compile_and_load(DotnetPipelineComponent *p) {
         dpc_set_err(p, "dotnet.pipelinecomponent: managed init returned non-zero");
         return -1;
     }
-    if (p->register_emit_fn(dpc_emit_set_int64, dpc_emit_set_float64, dpc_emit_set_bool,
-                            dpc_emit_set_utf8, dpc_emit_set_null, dpc_emit_commit_row) != 0) {
+    if (p->register_emit_fn(emit_set_int64, emit_set_float64, emit_set_bool,
+                            emit_set_utf8, emit_set_null, emit_commit_row) != 0) {
         dpc_set_err(p, "dotnet.pipelinecomponent: register_emit returned non-zero");
         return -1;
     }
@@ -2135,6 +2102,7 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
     memset(out, 0, sizeof *out);
     if (dpc_cache_input_schema(p) != 0) return EIO;
     if (dpc_compile_and_load(p) != 0)   return EIO;
+    DsEmitter em = DS_EMITTER_OF(p);
 
     while (p->out_staging[0].n == 0) {
         if (p->eof_seen) {
@@ -2162,7 +2130,7 @@ static int dpc_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
             p->eof_seen = 1;
             continue; /* fall through to PostExecute on next loop turn */
         }
-        if (p->process_batch_fn(&in_arr, p) != 0) {
+        if (p->process_batch_fn(&in_arr, &em) != 0) {
             in_arr.release(&in_arr);
             dpc_set_err(p, "dotnet.pipelinecomponent: ProcessInput returned non-zero "
                            "(see [ERROR] log above)");
