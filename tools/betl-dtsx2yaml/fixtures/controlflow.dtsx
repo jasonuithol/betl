@@ -40,6 +40,15 @@
     DTS:refId="Package"
     DTS:ExecutableType="Microsoft.Package">
 
+  <DTS:Variables>
+    <DTS:Variable DTS:ObjectName="SkipLoop" DTS:Namespace="User">
+      <DTS:VariableValue DTS:DataType="3">False</DTS:VariableValue>
+    </DTS:Variable>
+    <DTS:Variable DTS:ObjectName="CurrentFile" DTS:Namespace="User">
+      <DTS:VariableValue DTS:DataType="18"></DTS:VariableValue>
+    </DTS:Variable>
+  </DTS:Variables>
+
   <DTS:Executables>
 
     <DTS:Executable DTS:refId="Package\Init"
