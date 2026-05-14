@@ -85,13 +85,13 @@ public static class Converter
          * enum values. */
         return dtsType switch
         {
-            3  => "int",        /* Int32 */
-            6  => "int",        /* UInt32 */
-            7  => "decimal",    /* Single — closest betl analogue */
-            13 => "decimal",    /* Double */
-            16 => "date",       /* DateTime */
-            18 => "string",     /* String */
-            _  => "string",
+            3                                  => "bool",    /* Boolean */
+            5 or 6 or 7 or 8 or 9 or 10
+              or 11 or 12                      => "int",     /* SByte..UInt64 */
+            13 or 14 or 15                     => "decimal", /* Single, Double, Decimal */
+            16                                 => "date",    /* DateTime */
+            18                                 => "string",  /* String */
+            _                                  => "string",
         };
     }
 
