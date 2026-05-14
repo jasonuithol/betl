@@ -1,0 +1,39 @@
+# Bench shape B (10col, derived): per-row arithmetic on every column.
+# Counterpart to: ssis/packages/B-derived-10col.dtsx
+# (OLEDB Source 10col → Derived Column (+1 on each) → Row Count).
+# This is the stock-vs-stock per-cell test — SSIS Derived Column is a
+# native component, so it should be the closest fair fight between the
+# two engines on simple expression evaluation.
+betl: 1
+name: bench-ssis-B-derived-10col
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM dbo.src_10col
+        batch_size: 10000
+      - id: m
+        type: map
+        from: source
+        add:
+          a2: { lang: ssisexpr, expr: "[a] + 1", type: l }
+          b2: { lang: ssisexpr, expr: "[b] + 1", type: l }
+          c2: { lang: ssisexpr, expr: "[c] + 1", type: l }
+          d2: { lang: ssisexpr, expr: "[d] + 1", type: l }
+          e2: { lang: ssisexpr, expr: "[e] + 1", type: l }
+          f2: { lang: ssisexpr, expr: "[f] + 1", type: l }
+          g2: { lang: ssisexpr, expr: "[g] + 1", type: l }
+          h2: { lang: ssisexpr, expr: "[h] + 1", type: l }
+          i2: { lang: ssisexpr, expr: "[i] + 1", type: l }
+          j2: { lang: ssisexpr, expr: "[j] + 1", type: l }
+      - id: sink
+        type: betl.count_rows
+        from: m
+        expect: 100000

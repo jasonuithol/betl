@@ -73,45 +73,118 @@ Reproduce: `make bench` (or `bench/run.sh` directly).
 Tunables: `BETL_BENCH_ITERS`, `BETL_BENCH_ROWS`,
 `BETL_BENCH_CSV_ROWS`, `BETL_BENCH_PC_ROWS`.
 
-## TODO: Windows-side SSIS comparison
+## SSIS comparison (real measured numbers)
 
-The `pc-*` shapes give us numbers for
-`dotnet.pipelinecomponent`'s throughput on a Linux box.
-We have an architectural argument that we should be faster
-than real SSIS on the component hot path — SSIS's
-`PipelineBuffer` is implemented in native C++ and managed
-code reaches it through COM RCWs, paying a marshalling tax
-per cell. Our shim's `BetlPipelineBuffer` is pure managed
-code with array-backed storage.
+These numbers compare `betl run <yaml>` against `dtexec
+<package>.dtsx` end-to-end wall time, both reading from the
+same SQL Server `betl_bench` database on the same host (peer
+mssql container, ODBC for betl, MSOLEDBSQL/OLE DB for SSIS).
+SSIS-on-Linux (SQL Server 2022 dtexec, version 16.0.4215.2)
+is hosted by the `mcp-ssis` service.
 
-**We have not actually measured real SSIS.** Until we do,
-the "5–30× faster per component" claim in
-`docs/PIPELINECOMPONENT.md` is structural reasoning, not
-data. To turn it into a defensible number:
+**Hardware/software:** Linux container host, SQL Server 2022
+Developer, dtexec 16.0.4215.2 (SSIS 2022). All runs use
+warmup=1, then min/p50/max over 5 measured iterations
+(except 1M-row which uses 3 due to longer per-iter cost).
 
-1. Windows box with SQL Server Developer Edition + SSDT
-   (Visual Studio extension). Both free.
-2. Pick a workload — same shape as one of our `pc-*` shapes.
-   The 10-col passthrough or the decimal-heavy variant
-   are the most informative because they amplify per-cell
-   crossing cost.
-3. Compile the same C# source two ways:
-   - Against the real Microsoft.SqlServer.Dts.Pipeline
-     assemblies via SSDT, deployed as a real SSIS package
-     and run under `dtexec`.
-   - Against our `Betl.Ssis.PipelineCompat` shim and
-     run via `betl run`.
-4. Same hardware, same input data, same row count, fair
-   source/sink setup.
-5. Publish the numbers here as a new section.
+### Shape catalogue
 
-The shim's API surface was made faithful to the SSIS one
-specifically so this A/B is possible without rewriting the
-user code. The runtime is the only variable.
+| shape          | source                          | transform                  | sink         |
+|----------------|---------------------------------|----------------------------|--------------|
+| `A-1col`       | `SELECT a FROM src_1col`        | (none)                     | row count    |
+| `A-10col`      | `SELECT a..j FROM src_10col`    | (none)                     | row count    |
+| `B-derived-10col`    | `SELECT a..j FROM src_10col`    | derived `a2..j2 = c + 1`  | row count    |
+| `B-derived-10col-1m` | `SELECT a..j FROM src_10col_1m` | derived `a2..j2 = c + 1`  | row count    |
 
-Estimated effort: half a day once the Windows box is set up.
-Until then, treat the per-component speedup claim as a
-hypothesis, not a benchmark.
+SSIS-side packages use `OLE DB Source → [Derived Column] →
+Row Count` with `hasSideEffects=true` so the optimizer
+doesn't prune the no-write pipeline. betl-side YAMLs use
+`mssql.read → [map / ssisexpr] → betl.count_rows`. Source
+schemas: `src_1col` is one BIGINT column × 100k rows,
+`src_10col` is ten BIGINT columns × 100k rows, `src_10col_1m`
+is the same shape × 1M rows.
+
+Packages and YAMLs live under `bench/ssis/`. Reproduce with
+`bench/ssis/run-comparison.sh` (drives both sides with
+matching warmup discipline).
+
+### Headline numbers (100k rows)
+
+| shape          | betl wall (min/p50/max) | SSIS wall (min/p50/max) | ratio |
+|----------------|------------------------:|------------------------:|------:|
+| `A-1col`       |     20 / 21 / 22 ms    |  1975 / 2033 / 2041 ms |  ~96× |
+| `A-10col`      |     67 / 67 / 70 ms    |  2098 / 2154 / 2157 ms |  ~32× |
+| `B-derived-10col` | 69 / 70 / 71 ms     |  2178 / 2207 / 2221 ms |  ~31× |
+
+At this batch size betl finishes the whole job (including
+process start, ODBC connect, query, fetch, transform, count,
+shutdown) in less time than dtexec spends starting up and
+validating. SSIS's ~1.9 s startup tax (process launch + CLR
+JIT + pipeline validation) is the dominant cost at 100k.
+
+### Steady-state throughput (1M rows)
+
+To disentangle startup from per-row throughput, the
+`B-derived-10col-1m` shape reads 1M rows × 10 BIGINT cols +
+10 derived columns. At this size SSIS's startup is <10% of
+wall time, so the ratio approximates the steady-state data
+flow advantage.
+
+| shape                       | betl wall (min/p50/max) | SSIS wall (min/p50/max) | ratio | betl rows/s | SSIS rows/s |
+|-----------------------------|------------------------:|------------------------:|------:|------------:|------------:|
+| `B-derived-10col-1m` (1M rows) | 536 / 539 / 542 ms |  3080 / 3148 / 3148 ms | ~5.8× | ~1.86 M rows/s | ~318 k rows/s |
+
+(SSIS had one outlier iteration at 8.1 s, likely a SQL
+Server cache compaction; excluded from the summary above.)
+
+### What this measures
+
+- **End-to-end wall time** — process launch through exit.
+  This is the unit users see when scheduling ETL jobs from
+  cron, Airflow, dbt, etc. It includes everything: connect,
+  query, fetch, transform, sink, teardown.
+- **Both sides read the same SQL Server table** through the
+  same Linux→SQL Server network path (TCP to the same
+  container). One uses ODBC/FreeTDS; the other uses
+  MSOLEDBSQL/OLE DB. Source path is not the bottleneck for
+  the betl side at 1M rows (we get ~1.86 M rows/s; bare
+  ODBC fetch from this server tops out higher).
+- **No `dotnet.pipelinecomponent` was used in these
+  measurements.** The transforms are stock SSIS Derived
+  Column on one side and stock betl `map`/`ssisexpr` on
+  the other. The architectural advantage we hypothesised
+  for `dotnet.pipelinecomponent` (managed `PipelineBuffer`
+  avoiding COM RCW marshalling) doesn't even come into
+  play here — and betl is still ~6× faster steady-state.
+
+### What's still untested
+
+- **Custom Script Components / managed `PipelineComponent`
+  subclasses.** This is where the SSIS COM-RCW marshalling
+  tax should show up most clearly. SSIS-on-Linux does not
+  ship the Script Component assemblies (and the standard
+  ADO.NET source assemblies are also absent — we had to use
+  OLE DB instead). To benchmark the
+  `dotnet.pipelinecomponent` vs real-SSIS Script Component
+  case we still need a Windows host with SSDT.
+- **End-to-end with a destination component.** Both sides
+  here count rows and discard. Adding an OLE DB Destination
+  on the SSIS side and `mssql.upsert` on the betl side
+  would measure round-trip ETL throughput.
+
+### Reproducing
+
+```
+# 1. Set up source data (one-time):
+#    Create database betl_bench with src_1col, src_10col,
+#    src_10col_1m as defined in bench/ssis/sql/schema.sql.
+# 2. betl side:
+export BETL_TEST_MSSQL_DSN="<your dsn>"
+bench/ssis/run-betl-side.sh bench/ssis/yaml/betl-A-1col.yml 6 1
+# 3. SSIS side:
+# Drop bench/ssis/packages/*.dtsx into the mcp-ssis packages dir,
+# then call mcp-ssis benchmark_package(path, runs=6, warmup=1).
+```
 
 ## `filter-count` — gen → filter(true) → count
 

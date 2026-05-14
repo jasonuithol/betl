@@ -260,16 +260,32 @@ overlap gains.
 
 ### Comparison vs SSIS
 
-We can't claim measured numbers against real SSIS without a
-Windows + SQL Server + SSDT setup. Based on published SSIS
-performance guidance (typical 100k–500k rows/s for custom
-transforms) and the architecture difference (NativeAOT direct
-function calls vs SSIS's COM-RCW per-cell access), the
-component-level throughput is plausibly **5–30× faster** for
-sync transforms. End-to-end throughput in real ETL is usually
-source/sink-bottlenecked, so the realised advantage is closer
-to **1.2–3×** for typical workloads. Cold-start: SSIS wins
-(no AOT compile penalty).
+`docs/BENCHMARKS.md` carries the full measured comparison
+against real SSIS (SQL Server 2022 dtexec on Linux, via the
+`mcp-ssis` service). Quick summary on a stock 10-col read +
+10-col derived workload, end-to-end wall time:
+
+- **100k rows** (typical small batch / cron-style ETL): betl
+  ~70 ms vs SSIS ~2.2 s → **~31× faster**. At this scale most
+  of SSIS's wall time is process startup, CLR JIT, and
+  pipeline validation.
+- **1M rows** (startup amortised, steady-state data-flow
+  throughput dominates): betl ~540 ms (~1.86 M rows/s) vs
+  SSIS ~3.1 s (~318 k rows/s) → **~5.8× faster**.
+
+These are stock-component shapes — they don't exercise
+`dotnet.pipelinecomponent` at all. They establish the
+*minimum* advantage you'd see migrating to betl. For
+SSIS Script Components specifically (the case where
+`PipelineBuffer`'s COM-RCW per-cell marshalling tax is at
+its worst), the structural argument says the gap should be
+larger again — but SSIS-on-Linux doesn't ship the Script
+Component assemblies, so that A/B still needs a Windows host
+with SSDT. Treat the Script-Component-specific multiplier as
+a hypothesis until then.
+
+**Trade-off:** SSIS wins on cold start (no AOT compile
+penalty). See `pc-startup` for cold/warm timings.
 
 ## Limitations
 

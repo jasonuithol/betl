@@ -1,0 +1,164 @@
+<?xml version="1.0"?>
+<DTS:Executable
+    xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+    DTS:refId="Package"
+    DTS:CreationName="Microsoft.Package"
+    DTS:DTSID="{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0001}"
+    DTS:ExecutableType="Microsoft.Package"
+    DTS:LocaleID="1033"
+    DTS:ObjectName="A_1col"
+    DTS:PackageType="5"
+    DTS:VersionBuild="0"
+    DTS:VersionGUID="{bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbb0001}">
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+        DTS:refId="Package.ConnectionManagers[SrcDb]"
+        DTS:CreationName="OLEDB"
+        DTS:DTSID="{cccccccc-cccc-cccc-cccc-cccccccc0001}"
+        DTS:ObjectName="SrcDb">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager DTS:ConnectionString="Data Source=host.containers.internal,1433;Initial Catalog=betl_bench;User ID=sa;Password=DevP@ssw0rd!42;Provider=MSOLEDBSQL;Persist Security Info=True;Trust Server Certificate=True;"/>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+  <DTS:Variables>
+    <DTS:Variable
+        DTS:CreationName="User::RowCount"
+        DTS:DTSID="{dddddddd-dddd-dddd-dddd-dddddddd0001}"
+        DTS:Namespace="User"
+        DTS:ObjectName="RowCount">
+      <DTS:VariableValue DTS:DataType="3">0</DTS:VariableValue>
+    </DTS:Variable>
+  </DTS:Variables>
+  <DTS:Executables>
+    <DTS:Executable
+        DTS:refId="Package\DataFlow"
+        DTS:CreationName="Microsoft.Pipeline"
+        DTS:DTSID="{eeeeeeee-eeee-eeee-eeee-eeeeeeee0001}"
+        DTS:ExecutableType="Microsoft.Pipeline"
+        DTS:ObjectName="DataFlow">
+      <DTS:Variables/>
+      <DTS:ObjectData>
+        <pipeline DefaultBufferMaxRows="10000" DefaultBufferSize="10485760" version="1">
+          <components>
+            <component
+                refId="Package\DataFlow\OleSource"
+                componentClassID="Microsoft.OLEDBSource"
+                contactInfo=""
+                description="OLE DB Source"
+                name="OleSource"
+                usesDispositions="true"
+                version="7">
+              <properties>
+                <property dataType="System.Int32" name="AccessMode">2</property>
+                <property dataType="System.String" name="OpenRowset"></property>
+                <property dataType="System.String" name="OpenRowsetVariable"></property>
+                <property dataType="System.String" name="SqlCommand">SELECT a FROM dbo.src_1col</property>
+                <property dataType="System.String" name="SqlCommandVariable"></property>
+                <property dataType="System.Int32" name="CommandTimeout">0</property>
+                <property dataType="System.Int32" name="DefaultCodePage">1252</property>
+                <property dataType="System.Boolean" name="AlwaysUseDefaultCodePage">false</property>
+                <property dataType="System.String" name="ParameterMapping"></property>
+              </properties>
+              <connections>
+                <connection
+                    refId="Package\DataFlow\OleSource.Connections[OleDbConnection]"
+                    connectionManagerID="Package.ConnectionManagers[SrcDb]"
+                    connectionManagerRefId="Package.ConnectionManagers[SrcDb]"
+                    description="The OLE DB runtime connection used to access the database."
+                    name="OleDbConnection"/>
+              </connections>
+              <outputs>
+                <output
+                    refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output]"
+                    name="OLE DB Source Output">
+                  <outputColumns>
+                    <outputColumn
+                        refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output].Columns[a]"
+                        dataType="i8"
+                        errorOrTruncationOperation="Conversion"
+                        errorRowDisposition="FailComponent"
+                        externalMetadataColumnId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output].ExternalColumns[a]"
+                        lineageId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output].Columns[a]"
+                        name="a"
+                        truncationRowDisposition="FailComponent"/>
+                  </outputColumns>
+                  <externalMetadataColumns isUsed="True">
+                    <externalMetadataColumn
+                        refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output].ExternalColumns[a]"
+                        dataType="i8"
+                        name="a"/>
+                  </externalMetadataColumns>
+                </output>
+                <output
+                    refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output]"
+                    isErrorOut="true"
+                    name="OLE DB Source Error Output">
+                  <outputColumns>
+                    <outputColumn
+                        refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output].Columns[a]"
+                        dataType="i8"
+                        lineageId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output].Columns[a]"
+                        name="a"/>
+                    <outputColumn
+                        refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output].Columns[ErrorCode]"
+                        dataType="i4"
+                        lineageId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output].Columns[ErrorCode]"
+                        name="ErrorCode"
+                        specialFlags="1"/>
+                    <outputColumn
+                        refId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output].Columns[ErrorColumn]"
+                        dataType="i4"
+                        lineageId="Package\DataFlow\OleSource.Outputs[OLE DB Source Error Output].Columns[ErrorColumn]"
+                        name="ErrorColumn"
+                        specialFlags="2"/>
+                  </outputColumns>
+                  <externalMetadataColumns/>
+                </output>
+              </outputs>
+            </component>
+            <component
+                refId="Package\DataFlow\RowCount"
+                componentClassID="Microsoft.RowCount"
+                contactInfo=""
+                description="Row Count"
+                name="RowCount"
+                usesDispositions="true">
+              <properties>
+                <property dataType="System.String" name="VariableName">User::RowCount</property>
+              </properties>
+              <inputs>
+                <input
+                    refId="Package\DataFlow\RowCount.Inputs[Row Count Input 1]"
+                    hasSideEffects="true"
+                    name="Row Count Input 1">
+                  <inputColumns>
+                    <inputColumn
+                        refId="Package\DataFlow\RowCount.Inputs[Row Count Input 1].Columns[a]"
+                        cachedDataType="i8"
+                        cachedName="a"
+                        lineageId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output].Columns[a]"/>
+                  </inputColumns>
+                  <externalMetadataColumns/>
+                </input>
+              </inputs>
+              <outputs>
+                <output
+                    refId="Package\DataFlow\RowCount.Outputs[Row Count Output 1]"
+                    name="Row Count Output 1"
+                    synchronousInputId="Package\DataFlow\RowCount.Inputs[Row Count Input 1]"/>
+              </outputs>
+            </component>
+          </components>
+          <paths>
+            <path
+                refId="Package\DataFlow.Paths[SrcToCount]"
+                endId="Package\DataFlow\RowCount.Inputs[Row Count Input 1]"
+                name="SrcToCount"
+                startId="Package\DataFlow\OleSource.Outputs[OLE DB Source Output]"/>
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+</DTS:Executable>

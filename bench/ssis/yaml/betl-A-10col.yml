@@ -1,0 +1,21 @@
+# Bench shape A (10col): pure read path — no per-row transform, 10 cols.
+# Counterpart to: ssis/packages/A-10col.dtsx (OLEDB Source 10col → Row Count).
+betl: 1
+name: bench-ssis-A-10col
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM dbo.src_10col
+        batch_size: 10000
+      - id: sink
+        type: betl.count_rows
+        from: source
+        expect: 100000
