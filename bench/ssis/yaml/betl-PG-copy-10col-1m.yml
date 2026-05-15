@@ -1,0 +1,24 @@
+# Bench shape PG-copy (1M × 10col): steady-state native binary COPY
+# throughput. At 1M rows the per-batch RTT cost is amortised across
+# thousands of inserts.
+betl: 1
+name: bench-pg-copy-10col-1m
+connections:
+  bench:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: postgres.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM src_10col_1m
+        batch_size: 10000
+      - id: sink
+        type: postgres.copy
+        from: source
+        connection: bench
+        table: dst_10col_1m
+        truncate: true

@@ -1,0 +1,22 @@
+# Bench shape PG-copy (10col): same as PG-copy-1col but 10 BIGINTs.
+betl: 1
+name: bench-pg-copy-10col
+connections:
+  bench:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: postgres.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM src_10col
+        batch_size: 10000
+      - id: sink
+        type: postgres.copy
+        from: source
+        connection: bench
+        table: dst_10col
+        truncate: true

@@ -1,0 +1,22 @@
+# Bench shape PG-upsert (10col): row-by-row INSERT...ON CONFLICT.
+betl: 1
+name: bench-pg-upsert-10col
+connections:
+  bench:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: postgres.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM src_10col
+        batch_size: 10000
+      - id: sink
+        type: postgres.upsert
+        from: source
+        connection: bench
+        table: dst_10col
+        key: [a]

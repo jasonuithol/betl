@@ -1,0 +1,25 @@
+# Bench shape PG-upsert (1col): row-by-row INSERT...ON CONFLICT via
+# PQexecPrepared. The slow baseline; pairs with PG-copy-1col for the
+# bulk-vs-row speedup comparison. TRUNCATE between iterations is
+# handled out-of-band by the bench harness.
+betl: 1
+name: bench-pg-upsert-1col
+connections:
+  bench:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: postgres.read
+        connection: bench
+        query: SELECT a FROM src_1col
+        batch_size: 10000
+      - id: sink
+        type: postgres.upsert
+        from: source
+        connection: bench
+        table: dst_1col
+        key: [a]

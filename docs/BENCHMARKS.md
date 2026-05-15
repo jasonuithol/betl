@@ -322,7 +322,7 @@ the Linux harness (shared-memory blocker for
 `OLEDBDestination`-FastLoad). Numbers above are betl
 read+write end-to-end; SSIS-side requires Windows.
 
-### Reproducing
+### Reproducing (SSIS comparison)
 
 ```
 # 1. Set up source data (one-time):
@@ -338,6 +338,69 @@ bench/ssis/run-betl-side.sh bench/ssis/yaml/betl-A-1col.yml 6 1
 # Drop bench/ssis/packages/*.dtsx into the mcp-ssis packages dir,
 # then call mcp-ssis benchmark_package(path, runs=6, warmup=1).
 # C-write-*.dtsx run only on Windows (SQL-Server-co-located).
+```
+
+## `postgres.copy` write path (landed 2026-05-15)
+
+Postgres twin of `mssql.bulkinsert`: bulk insert via libpq's
+binary `COPY FROM STDIN` protocol vs the row-by-row
+`postgres.upsert` (`INSERT ... ON CONFLICT` via
+`PQexecPrepared`). Same shapes as the mssql ladder so the
+ratios are directly comparable.
+
+### Setup
+
+Database `betl_bench` on the sibling Postgres, with
+`src_1col` / `src_10col` (100 k rows each) and `src_10col_1m`
+(1 M rows). Each iteration TRUNCATEs the `dst_*` target
+before the run; for `postgres.copy` that's `truncate: true`
+on the sink, for `postgres.upsert` the harness drives a
+separate one-shot `postgres.exec "TRUNCATE TABLE ..."`
+pipeline (`bench/ssis/run-pg-side.sh`).
+
+### Numbers (6 runs, 1 warmup, p50)
+
+| shape (rows × cols)           | upsert   | copy    | speedup |
+|-------------------------------|---------:|--------:|--------:|
+| 100 k × 1  BIGINT             | 3 770 ms | 89 ms   | **~42×** |
+| 100 k × 10 BIGINT             | 4 081 ms | 152 ms  | **~27×** |
+| 1 M  × 10 BIGINT              | 40 849 ms | 1 242 ms | **~33×** |
+
+Rows/sec:
+
+| shape                        | upsert      | copy          |
+|------------------------------|------------:|--------------:|
+| 100 k × 1 BIGINT             | ~26 500 / s | **~1 124 000 / s** |
+| 100 k × 10 BIGINT            | ~24 500 / s | **~658 000 / s** |
+| 1 M  × 10 BIGINT             | ~24 500 / s | **~805 000 / s** |
+
+### Framing
+
+- Same ladder shape as the mssql.bulkinsert work: **27-42×**
+  speedup of binary COPY over row-by-row INSERT...ON CONFLICT.
+- Absolute throughput is somewhat higher than the mssql side
+  (805 k rows/s vs ~361 k rows/s on the 1 M × 10 col shape).
+  Don't read too much into that direct comparison — different
+  storage paths (libpq direct vs FreeTDS BCP via TDS frames),
+  different DB engines, no schema work to compare apples-to-
+  apples — but Postgres' `COPY` is famously fast and the
+  number lands where you'd expect.
+- `postgres.copy` is insert-only (no MERGE / ON CONFLICT
+  support). Use `postgres.upsert` when you need conflict
+  handling; use `postgres.copy` for fresh loads where the
+  target is staged or empty.
+- dtsx2yaml does not currently route any SSIS component to
+  `postgres.copy` (no PG-targeting SSIS components exist in
+  the standard catalogue).
+
+### Reproducing (postgres.copy)
+
+```
+export BETL_TEST_PG_BENCH_DSN="postgresql://postgres@host:5432/betl_bench"
+bench/ssis/run-pg-side.sh \
+    bench/ssis/yaml/betl-PG-copy-10col-1m.yml dst_10col_1m 6 1
+bench/ssis/run-pg-side.sh \
+    bench/ssis/yaml/betl-PG-upsert-10col-1m.yml dst_10col_1m 6 1
 ```
 
 ## `filter-count` — gen → filter(true) → count

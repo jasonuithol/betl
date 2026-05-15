@@ -1,0 +1,26 @@
+# Bench shape PG-copy (1col): postgres.copy write path (libpq binary
+# COPY FROM STDIN). Mirror of mssql.bulkinsert E-bcp-1col so the
+# numbers compare directly. truncate: true keeps each iteration
+# starting from an empty target (TRUNCATE is metadata-only on PG and
+# below the noise floor of the measured runs).
+betl: 1
+name: bench-pg-copy-1col
+connections:
+  bench:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: postgres.read
+        connection: bench
+        query: SELECT a FROM src_1col
+        batch_size: 10000
+      - id: sink
+        type: postgres.copy
+        from: source
+        connection: bench
+        table: dst_1col
+        truncate: true
