@@ -40,6 +40,10 @@ typedef enum {
     EX_FLOAT64 = 2,
     EX_UTF8    = 3,
     EX_BOOL    = 4,
+    EX_INT8    = 5,
+    EX_INT16   = 6,
+    EX_INT32   = 7,
+    EX_FLOAT32 = 8,
 } ExColType;
 
 typedef struct {
@@ -292,7 +296,11 @@ static void ex_destroy(void *state) {
 static ExColType fmt_to_extype(const char *fmt) {
     if (!fmt) return 0;
     if (strcmp(fmt, "l") == 0) return EX_INT64;
+    if (strcmp(fmt, "i") == 0) return EX_INT32;
+    if (strcmp(fmt, "s") == 0) return EX_INT16;
+    if (strcmp(fmt, "c") == 0) return EX_INT8;
     if (strcmp(fmt, "g") == 0) return EX_FLOAT64;
+    if (strcmp(fmt, "f") == 0) return EX_FLOAT32;
     if (strcmp(fmt, "u") == 0) return EX_UTF8;
     if (strcmp(fmt, "b") == 0) return EX_BOOL;
     return 0;
@@ -301,12 +309,14 @@ static ExColType fmt_to_extype(const char *fmt) {
 static int bind_one(ExState *e, SQLUSMALLINT slot, ExParam *p) {
     SQLRETURN rc = SQL_ERROR;
     switch (p->type) {
-    case EX_INT64:
+    /* Narrow ints widen into p->i64 in fill_cell; bind as SQL_C_SBIGINT
+     * for all four widths and let ODBC down-convert at execute time. */
+    case EX_INT8: case EX_INT16: case EX_INT32: case EX_INT64:
         rc = SQLBindParameter(e->hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
                               &p->i64, 0, &p->ind);
         break;
-    case EX_FLOAT64:
+    case EX_FLOAT32: case EX_FLOAT64:
         rc = SQLBindParameter(e->hstmt, slot, SQL_PARAM_INPUT,
                               SQL_C_DOUBLE, SQL_DOUBLE, 0, 0,
                               &p->f64, 0, &p->ind);
@@ -359,8 +369,20 @@ static int fill_cell(ExState *e, const struct ArrowArray *col,
     }
     int64_t off = col->offset + row;
     switch (p->type) {
+    /* Narrow ints widen to int64 for the bound SQLBIGINT parameter —
+     * ODBC down-converts to the actual column type at execute time. */
+    case EX_INT8:  p->i64 = ((const int8_t  *)col->buffers[1])[off];
+                   p->ind = 0; return BETL_OK;
+    case EX_INT16: p->i64 = ((const int16_t *)col->buffers[1])[off];
+                   p->ind = 0; return BETL_OK;
+    case EX_INT32: p->i64 = ((const int32_t *)col->buffers[1])[off];
+                   p->ind = 0; return BETL_OK;
     case EX_INT64:
         p->i64 = ((const int64_t *)col->buffers[1])[off];
+        p->ind = 0;
+        return BETL_OK;
+    case EX_FLOAT32:
+        p->f64 = (double)((const float *)col->buffers[1])[off];
         p->ind = 0;
         return BETL_OK;
     case EX_FLOAT64:
@@ -434,7 +456,7 @@ static int prepare_and_bind(ExState *e, const struct ArrowSchema *sch) {
         ExColType t = fmt_to_extype(fmt);
         if (t == 0) {
             exset_err(e, "mssql.exec: parameter '%s' has unsupported Arrow "
-                         "type '%s' (v0.1 supports l/g/u/b)",
+                         "type '%s' (supported: l/i/s/c/g/f/u/b)",
                       names[i], fmt ? fmt : "(none)");
             if (names_owned_by_us) free(names);
             return BETL_ERR_UNSUPPORTED;

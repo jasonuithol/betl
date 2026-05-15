@@ -391,11 +391,15 @@ static void free_stage(BetlStage *s) {
     for (size_t i = 0; i < s->step_count; ++i) free_step(&s->steps[i]);
     free(s->steps);
     strlist_free(s->over, s->over_count);
+    free(s->over_glob);
+    free(s->over_query);
+    free(s->foreach_connection);
     free(s->foreach_var);
     for (size_t i = 0; i < s->child_count; ++i) free_stage(&s->children[i]);
     free(s->children);
     free(s->on_failure);
     free(s->condition);
+    free(s->condition_lang);
 }
 
 /* Parse one entry in the top-level `connections:` mapping. The key is
@@ -591,9 +595,12 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
     yaml_node_t *type_n    = map_get(ctx->doc, stage_node, "type");
     yaml_node_t *after_n   = map_get(ctx->doc, stage_node, "after");
     yaml_node_t *steps_n   = map_get(ctx->doc, stage_node, "steps");
-    yaml_node_t *over_n    = map_get(ctx->doc, stage_node, "over");
-    yaml_node_t *as_n      = map_get(ctx->doc, stage_node, "as");
-    yaml_node_t *body_n    = map_get(ctx->doc, stage_node, "body");
+    yaml_node_t *over_n        = map_get(ctx->doc, stage_node, "over");
+    yaml_node_t *over_glob_n   = map_get(ctx->doc, stage_node, "over_glob");
+    yaml_node_t *over_query_n  = map_get(ctx->doc, stage_node, "over_query");
+    yaml_node_t *for_conn_n    = map_get(ctx->doc, stage_node, "connection");
+    yaml_node_t *as_n          = map_get(ctx->doc, stage_node, "as");
+    yaml_node_t *body_n        = map_get(ctx->doc, stage_node, "body");
     yaml_node_t *onfail_n  = map_get(ctx->doc, stage_node, "on_failure");
     yaml_node_t *cond_n    = map_get(ctx->doc, stage_node, "condition");
 
@@ -654,23 +661,54 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
                    "not `steps:`", id);
             return -1;
         }
-        /* `over:` — required, must be a sequence of scalar strings (v1
-         * supports only literal-list iteration; future enumerators will
-         * gate on additional keys). */
-        if (!over_n) {
+        /* Exactly one iteration source: `over`, `over_glob`, or
+         * `over_query` (+ required `connection:` for the SQL form). */
+        int n_src = !!over_n + !!over_glob_n + !!over_query_n;
+        if (n_src != 1) {
             err_at(ctx, yaml_line(stage_node), yaml_col(stage_node),
-                   "stage '%s' (type=foreach): missing required `over:` list", id);
+                   "stage '%s' (type=foreach): specify exactly one of "
+                   "`over:`, `over_glob:`, or `over_query:`", id);
             return -1;
         }
-        if (extract_string_list(ctx, over_n, "stage `over`",
-                                &out->over, &out->over_count) != 0) {
-            return -1;
-        }
-        if (out->over_count == 0) {
-            err_at(ctx, yaml_line(over_n), yaml_col(over_n),
-                   "stage '%s' (type=foreach): `over:` must have at least "
-                   "one element", id);
-            return -1;
+        if (over_n) {
+            if (extract_string_list(ctx, over_n, "stage `over`",
+                                    &out->over, &out->over_count) != 0) {
+                return -1;
+            }
+            if (out->over_count == 0) {
+                err_at(ctx, yaml_line(over_n), yaml_col(over_n),
+                       "stage '%s' (type=foreach): `over:` must have at "
+                       "least one element", id);
+                return -1;
+            }
+        } else if (over_glob_n) {
+            const char *gv = scalar(over_glob_n);
+            if (!gv || !*gv) {
+                err_at(ctx, yaml_line(over_glob_n), yaml_col(over_glob_n),
+                       "stage '%s' (type=foreach): `over_glob:` must be a "
+                       "non-empty scalar pattern", id);
+                return -1;
+            }
+            out->over_glob = strdup(gv);
+            if (!out->over_glob) return -1;
+        } else /* over_query_n */ {
+            const char *qv = scalar(over_query_n);
+            if (!qv || !*qv) {
+                err_at(ctx, yaml_line(over_query_n), yaml_col(over_query_n),
+                       "stage '%s' (type=foreach): `over_query:` must be a "
+                       "non-empty SQL string", id);
+                return -1;
+            }
+            const char *cn = scalar(for_conn_n);
+            if (!cn || !*cn) {
+                err_at(ctx, yaml_line(stage_node), yaml_col(stage_node),
+                       "stage '%s' (type=foreach): `over_query:` requires "
+                       "a `connection:` reference", id);
+                return -1;
+            }
+            out->over_query         = strdup(qv);
+            out->foreach_connection = strdup(cn);
+            if (!out->over_query || !out->foreach_connection) return -1;
         }
         /* `as:` — required, the variable name bound per iteration. */
         const char *as_name = scalar(as_n);
@@ -757,20 +795,41 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
         if (!out->on_failure) return -1;
     }
 
-    /* `condition:` (optional, scalar string). The executor passes it
-     * through betl_substitute_refs at run-time and treats truthy strings
-     * as "run". Object-form conditions ({lang, expr}) are not yet
-     * accepted — return a clear error instead of silently ignoring. */
+    /* `condition:` accepts either:
+     *   - a scalar string (truthy-checked after ${...} substitution), or
+     *   - a mapping { lang, expr } or { lang: literal, value }
+     * The mapping form lets pipelines invoke a registered expression
+     * engine (e.g. lua) to compute a boolean from substituted inputs.
+     * Object-form parsing only stores the strings; the executor decides
+     * which engine to invoke based on `condition_lang`. */
     if (cond_n) {
-        const char *v = scalar(cond_n);
-        if (!v) {
+        const char *scalar_v = scalar(cond_n);
+        if (scalar_v) {
+            out->condition = strdup(scalar_v);
+            if (!out->condition) return -1;
+        } else if (is_map(cond_n)) {
+            yaml_node_t *lang_n  = map_get(ctx->doc, cond_n, "lang");
+            yaml_node_t *expr_n  = map_get(ctx->doc, cond_n, "expr");
+            yaml_node_t *value_n = map_get(ctx->doc, cond_n, "value");
+            const char *lang = scalar(lang_n);
+            const char *body = scalar(expr_n);
+            if (!body) body = scalar(value_n);
+            if (!lang || !body) {
+                err_at(ctx, yaml_line(cond_n), yaml_col(cond_n),
+                       "stage '%s': `condition:` object form needs `lang` "
+                       "plus `expr` (or `value` when lang=literal)", id);
+                return -1;
+            }
+            out->condition      = strdup(body);
+            out->condition_lang = strdup(lang);
+            if (!out->condition || !out->condition_lang) return -1;
+        } else {
             err_at(ctx, yaml_line(cond_n), yaml_col(cond_n),
-                   "stage '%s': `condition:` must be a scalar string in v1 "
-                   "(object form `{lang, expr}` is reserved)", id);
+                   "stage '%s': `condition:` must be a scalar string or "
+                   "a `{lang, expr}` / `{lang: literal, value}` mapping",
+                   id);
             return -1;
         }
-        out->condition = strdup(v);
-        if (!out->condition) return -1;
     }
 
     return 0;

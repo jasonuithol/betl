@@ -29,6 +29,7 @@
 
 #include "runtime/shell.h"
 #include "runtime/file_ops.h"
+#include "runtime/var_set.h"
 
 #ifdef BETL_HAVE_CJSON
 #include "runtime/json_read.h"
@@ -2045,6 +2046,21 @@ static int csv_write_render_cell(FILE *fp, char delim,
         if (fprintf(fp, "%" PRId64, vals[off]) < 0) return -1;
         return 0;
     }
+    if (strcmp(fmt, "i") == 0) {
+        const int32_t *vals = col->buffers[1];
+        if (fprintf(fp, "%" PRId32, vals[off]) < 0) return -1;
+        return 0;
+    }
+    if (strcmp(fmt, "s") == 0) {
+        const int16_t *vals = col->buffers[1];
+        if (fprintf(fp, "%" PRId16, vals[off]) < 0) return -1;
+        return 0;
+    }
+    if (strcmp(fmt, "c") == 0) {
+        const int8_t *vals = col->buffers[1];
+        if (fprintf(fp, "%" PRId8, vals[off]) < 0) return -1;
+        return 0;
+    }
     if (strcmp(fmt, "u") == 0) {
         const int32_t *offs = col->buffers[1];
         const char    *data = col->buffers[2];
@@ -2056,6 +2072,17 @@ static int csv_write_render_cell(FILE *fp, char delim,
     if (strcmp(fmt, "g") == 0) {
         const double *vals = col->buffers[1];
         if (fprintf(fp, "%.17g", vals[off]) < 0) return -1;
+        return 0;
+    }
+    if (strcmp(fmt, "f") == 0) {
+        const float *vals = col->buffers[1];
+        if (fprintf(fp, "%.9g", (double)vals[off]) < 0) return -1;
+        return 0;
+    }
+    if (strcmp(fmt, "b") == 0) {
+        const uint8_t *bits = col->buffers[1];
+        int v = (bits[off / 8] >> (off % 8)) & 1;
+        if (fputs(v ? "true" : "false", fp) == EOF) return -1;
         return 0;
     }
     if (strcmp(fmt, "tdD") == 0) {
@@ -2181,8 +2208,13 @@ static int csv_write_sink_run(void *state) {
     for (int64_t i = 0; i < n_cols; ++i) {
         const char *fmt = schema.children[i]->format;
         int ok = fmt && (strcmp(fmt, "l")        == 0 ||
+                         strcmp(fmt, "i")        == 0 ||
+                         strcmp(fmt, "s")        == 0 ||
+                         strcmp(fmt, "c")        == 0 ||
                          strcmp(fmt, "g")        == 0 ||
+                         strcmp(fmt, "f")        == 0 ||
                          strcmp(fmt, "u")        == 0 ||
+                         strcmp(fmt, "b")        == 0 ||
                          strcmp(fmt, "tdD")      == 0 ||
                          strcmp(fmt, "tsu:")     == 0 ||
                          strcmp(fmt, "tsu:UTC")  == 0 ||
@@ -2193,8 +2225,7 @@ static int csv_write_sink_run(void *state) {
         if (!ok) {
             betl_set_error(s->ctx,
                 "csv.write: column '%s' has unsupported Arrow format '%s' "
-                "(supported: int64 'l', utf8 'u', date 'tdD', timestamp 'tsu:', "
-                "decimal 'd:p,s')",
+                "(supported: l/i/s/c/g/f/u/b, tdD, tsu:[UTC], ttu, w:16, z, d:p,s)",
                 schema.children[i]->name ? schema.children[i]->name : "?",
                 fmt ? fmt : "(null)");
             schema.release(&schema);
@@ -2396,6 +2427,8 @@ int betl_register_builtins(BetlRegistry *r) {
     rc = betl_register_shell(r);
     if (rc != BETL_OK) return rc;
     rc = betl_register_file_ops(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_var_set(r);
     if (rc != BETL_OK) return rc;
 #ifdef BETL_HAVE_CJSON
     rc = betl_register_json_read(r);

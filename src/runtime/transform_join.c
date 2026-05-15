@@ -450,6 +450,52 @@ static int row_keys_equal(const JoinState *j, size_t lr, size_t rr) {
     return 1;
 }
 
+/* FNV-1a 64-bit hash combine. Mixes one byte at a time. */
+static uint64_t fnv1a_mix(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= b[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* Hash a row's key tuple from the given side. `side=0` → left, `side=1` →
+ * right. Mirrors row_keys_equal exactly so equality and hashing agree. */
+static uint64_t row_keys_hash(const JoinState *j, int side, size_t r) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t k = 0; k < j->n_keys; ++k) {
+        const JoinKey *key = &j->keys[k];
+        char fmt = key->fmt;
+        if (fmt == 'u') {
+            int idx = side ? key->right_idx : key->left_idx;
+            const JTab *t = side ? &j->R : &j->L;
+            size_t len = t->u8l[idx][r];
+            uint64_t L = (uint64_t)len;
+            h = fnv1a_mix(h, &L, sizeof L);
+            if (len) h = fnv1a_mix(h, t->u8s[idx][r], len);
+        } else if (fmt == 'f' || fmt == 'g') {
+            /* Floats: the equality check casts the int64 slot back to
+             * double and uses `a != b` (so -0.0 and +0.0 compare
+             * equal). Byte-hash would put them in different buckets,
+             * so normalize via `+ 0.0` before hashing. NaN never
+             * matches anything regardless of bucket. */
+            int idx = side ? key->right_idx : key->left_idx;
+            const JTab *t = side ? &j->R : &j->L;
+            double v;
+            memcpy(&v, &t->i64[idx][r], sizeof v);
+            v += 0.0;
+            h = fnv1a_mix(h, &v, sizeof v);
+        } else {
+            /* Fixed-width int keys all live in the i64 slot. */
+            int idx = side ? key->right_idx : key->left_idx;
+            const JTab *t = side ? &j->R : &j->L;
+            h = fnv1a_mix(h, &t->i64[idx][r], sizeof(int64_t));
+        }
+    }
+    return h;
+}
+
 /* Build a validity bitmap from a nulls flag array. Returns NULL if no
  * nulls are present (sets *out_null_count = 0); else returns a fresh
  * bitmap with bits set for valid rows, cleared for null rows. */
@@ -598,26 +644,64 @@ static int join_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
         if (!r_matched) goto oom;
     }
 
-    /* Match loop: for each left row, find right matches; if none and
-     * mode is left/outer, emit (li, NULL). For outer, also flag matched
-     * right rows so we can emit unmatched ones afterwards. */
+    /* ---- Hash-build on the right side --------------------------- *
+     * For each right row, compute the key hash and chain it through
+     * `head[bucket] / next[ri]`. n_buckets is the next power of two
+     * ≥ 2 × n_rows, capped at 1<<24 (16M buckets ≈ 128 MB worst case
+     * for the head[] array alone). Empty right side stays as a NULL
+     * head — probes immediately fall through to the unmatched path
+     * for left/outer. */
+    size_t  n_buckets   = 0;
+    int64_t *bucket_head = NULL;
+    int64_t *bucket_next = NULL;
+    if (j->R.n_rows > 0) {
+        size_t target = j->R.n_rows * 2;
+        n_buckets = 1;
+        while (n_buckets < target && n_buckets < ((size_t)1 << 24))
+            n_buckets <<= 1;
+        bucket_head = malloc(n_buckets * sizeof *bucket_head);
+        bucket_next = malloc(j->R.n_rows * sizeof *bucket_next);
+        if (!bucket_head || !bucket_next) {
+            free(bucket_head); free(bucket_next); goto oom;
+        }
+        for (size_t b = 0; b < n_buckets; ++b) bucket_head[b] = -1;
+        for (size_t ri = 0; ri < j->R.n_rows; ++ri) {
+            uint64_t h = row_keys_hash(j, /*side=*/1, ri);
+            size_t   b = (size_t)(h & (n_buckets - 1));
+            bucket_next[ri] = bucket_head[b];
+            bucket_head[b]  = (int64_t)ri;
+        }
+    }
+
+    /* Match loop: per left row, probe the right-side hash bucket.
+     * Falls back to the unmatched-emit path on misses for left/outer. */
     for (size_t li = 0; li < j->L.n_rows; ++li) {
         if (betl_should_cancel(j->ctx)) {
+            free(bucket_head); free(bucket_next);
             jset_err(j, "join: cancelled"); retcode = EIO; goto fail;
         }
         size_t before = n;
-        for (size_t ri = 0; ri < j->R.n_rows; ++ri) {
-            if (!row_keys_equal(j, li, ri)) continue;
-            if (n == cap && jpairs_grow(&pairs, &cap) != 0) goto oom;
-            pairs[n].lr     = li;
-            pairs[n].rr     = ri;
-            pairs[n].l_null = 0;
-            pairs[n].r_null = 0;
-            ++n;
-            if (r_matched) r_matched[ri] = 1;
+        if (bucket_head) {
+            uint64_t h = row_keys_hash(j, /*side=*/0, li);
+            size_t   b = (size_t)(h & (n_buckets - 1));
+            for (int64_t ri = bucket_head[b]; ri >= 0;
+                 ri = bucket_next[ri]) {
+                if (!row_keys_equal(j, li, (size_t)ri)) continue;
+                if (n == cap && jpairs_grow(&pairs, &cap) != 0) {
+                    free(bucket_head); free(bucket_next); goto oom;
+                }
+                pairs[n].lr     = li;
+                pairs[n].rr     = (size_t)ri;
+                pairs[n].l_null = 0;
+                pairs[n].r_null = 0;
+                ++n;
+                if (r_matched) r_matched[ri] = 1;
+            }
         }
         if (do_left && n == before) {
-            if (n == cap && jpairs_grow(&pairs, &cap) != 0) goto oom;
+            if (n == cap && jpairs_grow(&pairs, &cap) != 0) {
+                free(bucket_head); free(bucket_next); goto oom;
+            }
             pairs[n].lr     = li;
             pairs[n].rr     = 0;
             pairs[n].l_null = 0;
@@ -625,6 +709,8 @@ static int join_get_next(struct ArrowArrayStream *st, struct ArrowArray *out) {
             ++n;
         }
     }
+    free(bucket_head);
+    free(bucket_next);
     if (do_outer) {
         for (size_t ri = 0; ri < j->R.n_rows; ++ri) {
             if (r_matched[ri]) continue;

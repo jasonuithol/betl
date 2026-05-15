@@ -460,6 +460,14 @@ set_tests_properties(control_flow PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: control_flow integration test passed"
 )
 
+# --- var.set (mutable variables) ----------------------------------------
+add_executable(test_var_set test_var_set.c)
+target_link_libraries(test_var_set PRIVATE betl_core)
+add_test(NAME var_set COMMAND test_var_set)
+set_tests_properties(var_set PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: var_set integration test passed"
+)
+
 # --- json.read / json.write round-trip (no DB / network) ------------------
 if(CJSON_FOUND)
     add_executable(test_json_io test_json_io.c)

@@ -1,10 +1,19 @@
 #include "runtime/exec.h"
 
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "betl/provider.h"
+#include "runtime/connections.h"
+#ifdef BETL_HAVE_LIBPQ
+#include <libpq-fe.h>
+#endif
+#ifdef BETL_HAVE_ODBC
+#include <sql.h>
+#include <sqlext.h>
+#endif
 #include "runtime/async_stream.h"
 #include "runtime/context.h"
 #include "runtime/substitute.h"
@@ -494,6 +503,90 @@ cleanup:
 static int run_stages(BetlContext *ctx, BetlRegistry *reg,
                       const BetlStage *arr, size_t n);
 
+/* Release callbacks for the synthetic empty struct array we feed to
+ * the expression engine for scalar condition evaluation. */
+static void release_empty_struct(struct ArrowArray *a) {
+    free(a->buffers);
+    a->release = NULL;
+}
+static void release_empty_schema(struct ArrowSchema *s) {
+    s->release = NULL;
+}
+
+/* Evaluate `condition` using a registered expression engine that
+ * normally works row-by-row. The expression is treated as scalar:
+ * compile against an empty struct schema, evaluate with a 1-row
+ * struct array that has no children, read the single bool back.
+ * Engine references to row.X / [X] / params / vars resolve only via
+ * the already-substituted text; the engine sees no row payload.
+ *
+ * Returns 1 (true) / 0 (false) / -1 (error). */
+static int eval_condition_via_engine(BetlContext *ctx, const BetlStage *s,
+                                     const char *resolved_expr,
+                                     const char *lang) {
+    const struct BetlExprEngine *eng = betl_get_expr_engine(ctx, lang);
+    if (!eng || !eng->compile || !eng->evaluate) {
+        betl_set_error(ctx,
+            "stage '%s': condition lang '%s' not registered (load the "
+            "corresponding provider via --provider or the auto-discover path)",
+            s->id, lang);
+        return -1;
+    }
+
+    struct ArrowSchema schema = {
+        .format = "+s", .name = "",
+        .n_children = 0, .release = release_empty_schema,
+    };
+    void *handle = NULL;
+    int rc = eng->compile(ctx, resolved_expr, &schema, &handle);
+    if (rc != BETL_OK || !handle) {
+        if (schema.release) schema.release(&schema);
+        return -1;     /* engine populated betl_set_error on failure */
+    }
+
+    /* 1-row empty struct array. n_children=0 means no per-column data;
+     * the engine should evaluate the expression independently of the
+     * row payload — typical use is for `${...}`-substituted-then-const
+     * expressions like `42 > 0`. */
+    const void **buf = calloc(1, sizeof *buf);
+    buf[0] = NULL;     /* validity = all valid */
+    struct ArrowArray input = {
+        .length = 1, .null_count = 0, .offset = 0,
+        .n_buffers = 1, .n_children = 0,
+        .buffers = buf,
+        .release = release_empty_struct,
+    };
+
+    struct ArrowArray out = {0};
+    rc = eng->evaluate(handle, &input, "b", &out);
+    int result;
+    if (rc != BETL_OK || out.length < 1) {
+        result = -1;
+        /* engine should have set the error; add stage context. */
+    } else {
+        const uint8_t *bits = out.buffers ? (const uint8_t *)out.buffers[1] : NULL;
+        const uint8_t *validity = out.buffers ? (const uint8_t *)out.buffers[0] : NULL;
+        if (validity && !((validity[0] >> 0) & 1)) {
+            /* Null result → skip with a warning (treat as falsy). */
+            betl_log(ctx, BETL_LOG_WARN,
+                     "stage '%s': condition evaluated to NULL — skipping",
+                     s->id);
+            result = 0;
+        } else if (!bits) {
+            betl_set_error(ctx,
+                "stage '%s': condition engine returned no buffer", s->id);
+            result = -1;
+        } else {
+            result = (bits[0] & 1) ? 1 : 0;
+        }
+    }
+    if (out.release) out.release(&out);
+    if (input.release) input.release(&input);
+    if (schema.release) schema.release(&schema);
+    eng->release(handle);
+    return result;
+}
+
 /* Evaluate a stage's `condition:` (NULL if absent). Returns 1 to run,
  * 0 to skip, -1 on substitution / parse error (with betl_set_error). */
 static int eval_condition(BetlContext *ctx, const BetlStage *s) {
@@ -506,6 +599,16 @@ static int eval_condition(BetlContext *ctx, const BetlStage *s) {
                        s->id, sub_err);
         return -1;
     }
+
+    /* When `condition_lang` names a real expression engine, defer to
+     * it; otherwise (NULL, "literal") apply the v1 scalar-truthy check. */
+    if (s->condition_lang
+        && strcmp(s->condition_lang, "literal") != 0) {
+        int r = eval_condition_via_engine(ctx, s, resolved, s->condition_lang);
+        free(resolved);
+        return r;
+    }
+
     /* Trim leading / trailing ASCII whitespace so `condition: " true "`
      * works under YAML's flow-style quoting. */
     char *start = resolved;
@@ -543,23 +646,20 @@ static int eval_condition(BetlContext *ctx, const BetlStage *s) {
     return result;
 }
 
-static int run_foreach_stage(BetlContext *ctx, BetlRegistry *reg,
-                             const BetlStage *s) {
-    /* Save and restore any prior binding of `as:` so a nested foreach
-     * with the same loop variable name doesn't permanently shadow it. */
-    const char *prior = betl_context_get_var(ctx, s->foreach_var);
-    char *saved = prior ? strdup(prior) : NULL;
-    if (prior && !saved) return BETL_ERR_INTERNAL;
-
+/* Run `s->children` once per `value` in `values[0..n-1]`. Caller owns
+ * the strings; this is just the loop driver. */
+static int foreach_iterate(BetlContext *ctx, BetlRegistry *reg,
+                           const BetlStage *s,
+                           char **values, size_t n_values) {
     int rc = BETL_OK;
-    for (size_t i = 0; i < s->over_count && rc == BETL_OK; ++i) {
+    for (size_t i = 0; i < n_values && rc == BETL_OK; ++i) {
         if (betl_should_cancel(ctx)) {
             betl_set_error(ctx, "cancelled inside foreach '%s' at iter %zu",
                            s->id, i);
             rc = BETL_ERR_CANCELLED;
             break;
         }
-        int sr = betl_context_set_var(ctx, s->foreach_var, s->over[i]);
+        int sr = betl_context_set_var(ctx, s->foreach_var, values[i]);
         if (sr != BETL_OK) {
             betl_set_error(ctx,
                 "foreach '%s': failed to bind iteration variable", s->id);
@@ -568,9 +668,292 @@ static int run_foreach_stage(BetlContext *ctx, BetlRegistry *reg,
         }
         betl_log(ctx, BETL_LOG_INFO,
                  "foreach %s iter %zu/%zu: %s=\"%s\"",
-                 s->id, i + 1, s->over_count, s->foreach_var, s->over[i]);
+                 s->id, i + 1, n_values, s->foreach_var, values[i]);
         rc = run_stages(ctx, reg, s->children, s->child_count);
     }
+    return rc;
+}
+
+/* Build the iteration value list for the literal-`over:` enumerator.
+ * Per-iteration ${...} substitution so list entries can pick up vars
+ * set by earlier stages. Caller frees each entry + the array. */
+static int collect_over_literal(BetlContext *ctx, const BetlStage *s,
+                                char ***out, size_t *n_out) {
+    *out = calloc(s->over_count, sizeof *out);
+    if (!*out) return BETL_ERR_INTERNAL;
+    for (size_t i = 0; i < s->over_count; ++i) {
+        char sub_err[256];
+        char *value = betl_substitute_refs(s->over[i], ctx,
+                                           sub_err, sizeof sub_err);
+        if (!value) {
+            for (size_t k = 0; k < i; ++k) free((*out)[k]);
+            free(*out); *out = NULL;
+            betl_set_error(ctx,
+                "foreach '%s' iter %zu: %s", s->id, i + 1, sub_err);
+            return BETL_ERR_INVALID;
+        }
+        (*out)[i] = value;
+    }
+    *n_out = s->over_count;
+    return BETL_OK;
+}
+
+/* `over_glob:` enumerator. Expands the pattern via POSIX glob(3) and
+ * iterates the matches in sorted order. Empty match set is fine — the
+ * body just doesn't run. */
+static int collect_over_glob(BetlContext *ctx, const BetlStage *s,
+                             char ***out, size_t *n_out) {
+    *out = NULL; *n_out = 0;
+    char sub_err[256];
+    char *pattern = betl_substitute_refs(s->over_glob, ctx,
+                                         sub_err, sizeof sub_err);
+    if (!pattern) {
+        betl_set_error(ctx, "foreach '%s' over_glob: %s", s->id, sub_err);
+        return BETL_ERR_INVALID;
+    }
+    glob_t g;
+    int gr = glob(pattern, GLOB_NOSORT, NULL, &g);
+    if (gr == GLOB_NOMATCH) {
+        free(pattern); globfree(&g);
+        return BETL_OK;            /* zero iterations */
+    }
+    if (gr != 0) {
+        free(pattern);
+        globfree(&g);
+        betl_set_error(ctx, "foreach '%s' over_glob: glob() failed (rc=%d)",
+                       s->id, gr);
+        return BETL_ERR_IO;
+    }
+    char **paths = calloc(g.gl_pathc, sizeof *paths);
+    if (!paths) { globfree(&g); free(pattern); return BETL_ERR_INTERNAL; }
+    for (size_t i = 0; i < g.gl_pathc; ++i) {
+        paths[i] = strdup(g.gl_pathv[i]);
+        if (!paths[i]) {
+            for (size_t k = 0; k < i; ++k) free(paths[k]);
+            free(paths); globfree(&g); free(pattern);
+            return BETL_ERR_INTERNAL;
+        }
+    }
+    /* glob output is unsorted with GLOB_NOSORT — caller often wants
+     * deterministic order, sort lexicographically. */
+    for (size_t i = 1; i < g.gl_pathc; ++i) {
+        for (size_t j = i; j > 0 && strcmp(paths[j - 1], paths[j]) > 0; --j) {
+            char *tmp = paths[j - 1]; paths[j - 1] = paths[j]; paths[j] = tmp;
+        }
+    }
+    *out = paths;
+    *n_out = g.gl_pathc;
+    globfree(&g);
+    free(pattern);
+    return BETL_OK;
+}
+
+#if defined(BETL_HAVE_LIBPQ) || defined(BETL_HAVE_ODBC)
+/* Extract a string field from a connection JSON. Same simple scanner
+ * used by sql.execute / var.set; doesn't handle nested objects. */
+static int conn_string(const char *json, const char *key, char **out) {
+    *out = NULL;
+    if (!json) return -1;
+    char needle[64];
+    int n = snprintf(needle, sizeof needle, "\"%s\":", key);
+    if (n < 0 || (size_t)n >= sizeof needle) return -1;
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p += (size_t)n;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    if (*p != '"') return -1;
+    ++p;
+    const char *end = strchr(p, '"');
+    if (!end) return -1;
+    size_t len = (size_t)(end - p);
+    char *s = malloc(len + 1);
+    if (!s) return -1;
+    memcpy(s, p, len); s[len] = '\0';
+    *out = s;
+    return 0;
+}
+#endif
+
+#ifdef BETL_HAVE_LIBPQ
+static int collect_over_query_pg(BetlContext *ctx, const BetlStage *s,
+                                 const char *dsn, char ***out, size_t *n_out) {
+    *out = NULL; *n_out = 0;
+    PGconn *c = PQconnectdb(dsn);
+    if (PQstatus(c) != CONNECTION_OK) {
+        betl_set_error(ctx, "foreach '%s' over_query: connect failed: %s",
+                       s->id, PQerrorMessage(c));
+        PQfinish(c);
+        return BETL_ERR_AUTH;
+    }
+    PGresult *r = PQexec(c, s->over_query);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        betl_set_error(ctx, "foreach '%s' over_query: %s",
+                       s->id, PQresultErrorMessage(r));
+        PQclear(r); PQfinish(c);
+        return BETL_ERR_IO;
+    }
+    int n = PQntuples(r);
+    char **values = (n > 0) ? calloc((size_t)n, sizeof *values) : NULL;
+    if (n > 0 && !values) {
+        PQclear(r); PQfinish(c);
+        return BETL_ERR_INTERNAL;
+    }
+    for (int i = 0; i < n; ++i) {
+        const char *v = PQgetisnull(r, i, 0) ? "" : PQgetvalue(r, i, 0);
+        values[i] = strdup(v);
+        if (!values[i]) {
+            for (int k = 0; k < i; ++k) free(values[k]);
+            free(values); PQclear(r); PQfinish(c);
+            return BETL_ERR_INTERNAL;
+        }
+    }
+    *out = values; *n_out = (size_t)n;
+    PQclear(r); PQfinish(c);
+    return BETL_OK;
+}
+#endif
+
+#ifdef BETL_HAVE_ODBC
+static int collect_over_query_mssql(BetlContext *ctx, const BetlStage *s,
+                                    const char *dsn,
+                                    char ***out, size_t *n_out) {
+    *out = NULL; *n_out = 0;
+    SQLHENV  henv  = 0;
+    SQLHDBC  hdbc  = 0;
+    SQLHSTMT hstmt = 0;
+    int rc_out = BETL_OK;
+    char **values = NULL; size_t n_values = 0, n_cap = 0;
+
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+
+    SQLCHAR odsn[1024]; SQLSMALLINT ol = 0;
+    SQLRETURN rc = SQLDriverConnect(hdbc, NULL, (SQLCHAR *)dsn, SQL_NTS,
+                                    odsn, sizeof odsn, &ol,
+                                    SQL_DRIVER_NOPROMPT);
+    if (!SQL_SUCCEEDED(rc)) {
+        betl_set_error(ctx, "foreach '%s' over_query: mssql connect failed",
+                       s->id);
+        rc_out = BETL_ERR_AUTH; goto out;
+    }
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+    rc = SQLExecDirect(hstmt, (SQLCHAR *)s->over_query, SQL_NTS);
+    if (rc != SQL_NO_DATA && !SQL_SUCCEEDED(rc)) {
+        betl_set_error(ctx, "foreach '%s' over_query: SQLExecDirect failed",
+                       s->id);
+        rc_out = BETL_ERR_IO; goto out;
+    }
+    for (;;) {
+        if (SQLFetch(hstmt) != SQL_SUCCESS) break;
+        char buf[1024]; SQLLEN ind = 0;
+        if (!SQL_SUCCEEDED(SQLGetData(hstmt, 1, SQL_C_CHAR,
+                                      buf, sizeof buf, &ind))) {
+            betl_set_error(ctx, "foreach '%s' over_query: SQLGetData failed",
+                           s->id);
+            rc_out = BETL_ERR_IO; goto out;
+        }
+        if (n_values == n_cap) {
+            size_t nc = n_cap ? n_cap * 2 : 16;
+            char **g = realloc(values, nc * sizeof *g);
+            if (!g) { rc_out = BETL_ERR_INTERNAL; goto out; }
+            values = g; n_cap = nc;
+        }
+        values[n_values] = strdup(ind == SQL_NULL_DATA ? "" : buf);
+        if (!values[n_values]) { rc_out = BETL_ERR_INTERNAL; goto out; }
+        n_values++;
+    }
+    *out = values; *n_out = n_values;
+    values = NULL;          /* ownership transferred */
+out:
+    if (values) {
+        for (size_t i = 0; i < n_values; ++i) free(values[i]);
+        free(values);
+    }
+    if (hstmt) SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    if (hdbc)  { SQLDisconnect(hdbc); SQLFreeHandle(SQL_HANDLE_DBC, hdbc); }
+    if (henv)  SQLFreeHandle(SQL_HANDLE_ENV, henv);
+    return rc_out;
+}
+#endif
+
+/* `over_query:` enumerator — dispatches by connection type the same
+ * way sql.execute does. */
+static int collect_over_query(BetlContext *ctx, const BetlStage *s,
+                              char ***out, size_t *n_out) {
+    *out = NULL; *n_out = 0;
+#if !defined(BETL_HAVE_LIBPQ) && !defined(BETL_HAVE_ODBC)
+    betl_set_error(ctx, "foreach '%s' over_query: no SQL backend built in",
+                   s->id);
+    return BETL_ERR_INVALID;
+#else
+    const char *conn_json = betl_get_connection(ctx, s->foreach_connection);
+    if (!conn_json) {
+        betl_set_error(ctx,
+            "foreach '%s' over_query: connection '%s' not declared",
+            s->id, s->foreach_connection);
+        return BETL_ERR_NOT_FOUND;
+    }
+    char *type = NULL, *dsn = NULL;
+    if (conn_string(conn_json, "type", &type) != 0 || !type) {
+        betl_set_error(ctx, "foreach '%s': connection missing `type`", s->id);
+        return BETL_ERR_INVALID;
+    }
+    if (conn_string(conn_json, "dsn", &dsn) != 0 || !dsn) {
+        betl_set_error(ctx, "foreach '%s': connection missing `dsn`", s->id);
+        free(type); return BETL_ERR_INVALID;
+    }
+    int rc;
+    if (strcmp(type, "postgres") == 0) {
+#ifdef BETL_HAVE_LIBPQ
+        rc = collect_over_query_pg(ctx, s, dsn, out, n_out);
+#else
+        betl_set_error(ctx, "foreach '%s': postgres requires libpq build", s->id);
+        rc = BETL_ERR_INVALID;
+#endif
+    } else if (strcmp(type, "mssql") == 0) {
+#ifdef BETL_HAVE_ODBC
+        rc = collect_over_query_mssql(ctx, s, dsn, out, n_out);
+#else
+        betl_set_error(ctx, "foreach '%s': mssql requires ODBC build", s->id);
+        rc = BETL_ERR_INVALID;
+#endif
+    } else {
+        betl_set_error(ctx, "foreach '%s': unsupported connection type '%s'",
+                       s->id, type);
+        rc = BETL_ERR_INVALID;
+    }
+    free(type); free(dsn);
+    return rc;
+#endif
+}
+
+static int run_foreach_stage(BetlContext *ctx, BetlRegistry *reg,
+                             const BetlStage *s) {
+    /* Save and restore any prior binding of `as:` so a nested foreach
+     * with the same loop variable name doesn't permanently shadow it. */
+    const char *prior = betl_context_get_var(ctx, s->foreach_var);
+    char *saved = prior ? strdup(prior) : NULL;
+    if (prior && !saved) return BETL_ERR_INTERNAL;
+
+    char  **values   = NULL;
+    size_t  n_values = 0;
+    int rc;
+    if (s->over) {
+        rc = collect_over_literal(ctx, s, &values, &n_values);
+    } else if (s->over_glob) {
+        rc = collect_over_glob(ctx, s, &values, &n_values);
+    } else if (s->over_query) {
+        rc = collect_over_query(ctx, s, &values, &n_values);
+    } else {
+        betl_set_error(ctx, "foreach '%s': no iteration source", s->id);
+        rc = BETL_ERR_INVALID;
+    }
+    if (rc == BETL_OK) {
+        rc = foreach_iterate(ctx, reg, s, values, n_values);
+    }
+    for (size_t i = 0; i < n_values; ++i) free(values[i]);
+    free(values);
 
     if (saved) {
         betl_context_set_var(ctx, s->foreach_var, saved);

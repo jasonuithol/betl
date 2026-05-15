@@ -77,15 +77,24 @@ struct BetlStage {
     BetlDataflowStep *steps;
     size_t            step_count;
 
-    /* Set when kind == BETL_STAGE_FOREACH:
-     *   `over` is the iteration source (currently always a literal list
-     *   of strings; future enumerators will set foreach_kind),
-     *   `foreach_var` is the variable name the loop binds per iteration
-     *   (consumed by `${vars.<foreach_var>}` inside `children`),
-     *   `children` is the nested stage list to run once per `over`
-     *   element. */
+    /* Set when kind == BETL_STAGE_FOREACH. Exactly one of `over`,
+     * `over_glob`, or `over_query` is populated; the executor picks
+     * the iteration source based on which one is non-NULL:
+     *
+     *   over          — literal list of strings (parser-resolved).
+     *                   ${...} substitution happens per iteration so
+     *                   list entries can reference vars/params/env.
+     *   over_glob     — POSIX glob pattern; matches are sorted before
+     *                   iteration. Pattern itself gets ${...} subst.
+     *   over_query    — SQL run via `foreach_connection`; the first
+     *                   column of each result row is the iteration
+     *                   value (other columns are ignored).
+     */
     char           **over;
     size_t           over_count;
+    char            *over_glob;
+    char            *over_query;
+    char            *foreach_connection;
     char            *foreach_var;
     BetlStage       *children;
     size_t           child_count;
@@ -94,21 +103,24 @@ struct BetlStage {
     char           **after;
     size_t           after_count;
 
-    /* Optional per-stage flow-control attributes. Both are NULL when
+    /* Optional per-stage flow-control attributes. All are NULL when
      * unset on the source YAML.
      *
      *   `on_failure`: "stop" (default if unset) or "continue". When
      *      "continue", a non-zero return from this stage is logged at
      *      WARN and the executor proceeds to the next stage.
-     *   `condition`: a YAML scalar string. The executor passes it
-     *      through betl_substitute_refs (so `${params.X}` / `${vars.X}`
-     *      resolve) and treats truthy results as "run", falsy as
-     *      "skip with WARN". For v1 this is a string check; future
-     *      revisions may accept the full `{lang, expr}` shape from
-     *      the spec.
+     *   `condition`: the expression text. When `condition_lang` is
+     *      NULL or "literal", the executor passes this through
+     *      betl_substitute_refs (so `${params.X}` / `${vars.X}`
+     *      resolve) and truthy-checks the result. Otherwise the
+     *      registered expression engine for `condition_lang` evaluates
+     *      it as a scalar (no row schema) and its bool result is used.
+     *   `condition_lang`: optional language tag for `condition`. NULL
+     *      means "scalar literal" — same as "literal".
      */
     char            *on_failure;
     char            *condition;
+    char            *condition_lang;
 
     int              line;          /* 1-based, of the stage's id */
     int              column;

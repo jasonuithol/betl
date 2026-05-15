@@ -37,6 +37,10 @@ typedef enum {
     PE_FLOAT64 = 2,
     PE_UTF8    = 3,
     PE_BOOL    = 4,
+    PE_INT8    = 5,
+    PE_INT16   = 6,
+    PE_INT32   = 7,
+    PE_FLOAT32 = 8,
 } PeColType;
 
 typedef struct {
@@ -246,7 +250,11 @@ static void pe_destroy(void *state) {
 static PeColType fmt_to_petype(const char *fmt) {
     if (!fmt) return 0;
     if (strcmp(fmt, "l") == 0) return PE_INT64;
+    if (strcmp(fmt, "i") == 0) return PE_INT32;
+    if (strcmp(fmt, "s") == 0) return PE_INT16;
+    if (strcmp(fmt, "c") == 0) return PE_INT8;
     if (strcmp(fmt, "g") == 0) return PE_FLOAT64;
+    if (strcmp(fmt, "f") == 0) return PE_FLOAT32;
     if (strcmp(fmt, "u") == 0) return PE_UTF8;
     if (strcmp(fmt, "b") == 0) return PE_BOOL;
     return 0;
@@ -293,7 +301,7 @@ static int prepare_stmt(PeState *p, const struct ArrowSchema *sch) {
         PeColType t = fmt_to_petype(fmt);
         if (t == 0) {
             peset_err(p, "postgres.exec: parameter '%s' has unsupported Arrow "
-                         "type '%s' (v0.1 supports l/g/u/b)",
+                         "type '%s' (supported: l/i/s/c/g/f/u/b)",
                       names[i], fmt ? fmt : "(none)");
             if (names_owned) free(names);
             return BETL_ERR_UNSUPPORTED;
@@ -347,8 +355,14 @@ static char *encode_cell(PeState *p, const struct ArrowArray *col,
     if (validity_is_null(col, row)) return NULL;
     int64_t off = col->offset + row;
     switch (t) {
-    case PE_INT64: {
-        int64_t v = ((const int64_t *)col->buffers[1])[off];
+    case PE_INT8: case PE_INT16: case PE_INT32: case PE_INT64: {
+        int64_t v;
+        switch (t) {
+        case PE_INT8:  v = ((const int8_t  *)col->buffers[1])[off]; break;
+        case PE_INT16: v = ((const int16_t *)col->buffers[1])[off]; break;
+        case PE_INT32: v = ((const int32_t *)col->buffers[1])[off]; break;
+        default:       v = ((const int64_t *)col->buffers[1])[off]; break;
+        }
         char buf[24];
         int n = snprintf(buf, sizeof buf, "%" PRId64, v);
         if (n < 0 || (size_t)n >= sizeof buf) { *err_out = 1; return NULL; }
@@ -357,8 +371,10 @@ static char *encode_cell(PeState *p, const struct ArrowArray *col,
         memcpy(s, buf, (size_t)n + 1);
         return s;
     }
-    case PE_FLOAT64: {
-        double v = ((const double *)col->buffers[1])[off];
+    case PE_FLOAT32: case PE_FLOAT64: {
+        double v = (t == PE_FLOAT32)
+            ? (double)((const float  *)col->buffers[1])[off]
+            :         ((const double *)col->buffers[1])[off];
         char buf[40];
         int n = snprintf(buf, sizeof buf, "%.17g", v);
         if (n < 0 || (size_t)n >= sizeof buf) { *err_out = 1; return NULL; }

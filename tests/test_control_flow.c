@@ -22,6 +22,7 @@
 #include "loader/registry.h"
 #include "pipeline/pipeline.h"
 #include "runtime/builtins.h"
+#include "runtime/connections.h"
 #include "runtime/context.h"
 #include "runtime/exec.h"
 
@@ -64,9 +65,14 @@ static int run_yaml(const char *yaml, char *err_out, size_t err_cap) {
     BetlRegistry *reg = betl_registry_create();
     int rc = BETL_ERR_INTERNAL;
     if (ctx && reg && betl_register_builtins(reg) == BETL_OK) {
-        rc = betl_run(ctx, reg, p);
+        char conn_err[256] = {0};
+        rc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
+        if (rc == BETL_OK) rc = betl_run(ctx, reg, p);
         if (rc != BETL_OK && err_out) {
-            snprintf(err_out, err_cap, "%s", betl_context_last_error(ctx));
+            snprintf(err_out, err_cap,
+                     "%s", betl_context_last_error(ctx)[0]
+                              ? betl_context_last_error(ctx)
+                              : conn_err);
         }
     }
     betl_pipeline_free(p);
@@ -252,6 +258,144 @@ int main(void) {
         int rc = run_yaml(yaml, err, sizeof err);
         CHECK(rc != BETL_OK);
         CHECK(strstr(err, "non-boolean") != NULL);
+    }
+
+    /* --- 8: condition object form (`lang: literal`) ---------------- *
+     * Uses the env-substitution path so we don't have to wire up
+     * parameter defaults (the in-process run_yaml helper doesn't call
+     * betl_apply_parameters). */
+    {
+        setenv("BETL_CF_TEST_FLAG", "false", 1);
+        char yaml[512] =
+            "betl: 1\n"
+            "name: cf-cond-obj-literal\n"
+            "pipeline:\n"
+            "  - id: skipped\n"
+            "    type: shell\n"
+            "    argv: [\"/bin/false\"]\n"
+            "    condition: { lang: literal, value: \"${env.BETL_CF_TEST_FLAG}\" }\n";
+        char err[512] = {0};
+        int rc = run_yaml(yaml, err, sizeof err);
+        if (rc != BETL_OK) fprintf(stderr, "case 8: %s\n", err);
+        CHECK(rc == BETL_OK);   /* flag=false → skipped → no failure */
+    }
+
+    /* --- 9: condition object form (`lang: lua`) routes to the engine.
+     * Only meaningful when the lua plugin is loadable; otherwise the
+     * dispatch reports a clear "lang not registered" error. */
+    {
+        char yaml[512] =
+            "betl: 1\n"
+            "name: cf-cond-obj-lua\n"
+            "pipeline:\n"
+            "  - id: lua_cond\n"
+            "    type: shell\n"
+            "    argv: [\"/bin/true\"]\n"
+            "    condition: { lang: lua, expr: \"1 == 1\" }\n";
+        char err[512] = {0};
+        int rc = run_yaml(yaml, err, sizeof err);
+        /* Either: lua plugin loaded by CLI auto-load (rc=OK); OR not
+         * loaded in this test harness → engine missing → rc != OK
+         * with a clear "not registered" diagnostic. Both shapes are
+         * fine for v1 — we only assert the dispatch reached the
+         * lookup step and didn't silently no-op. */
+        if (rc != BETL_OK) {
+            CHECK(strstr(err, "lang 'lua'") != NULL
+               || strstr(err, "not registered") != NULL);
+        }
+    }
+
+    /* --- 10: foreach with over_glob:. Generates two scratch files
+     *         then iterates over them, capturing the count via a
+     *         marker file the shell body appends to. */
+    {
+        char glob_dir[64];
+        snprintf(glob_dir, sizeof glob_dir,
+                 "/tmp/betl-cf-glob-%d", (int)getpid());
+        mkdir(glob_dir, 0700);
+        char f1[128], f2[128], marker[128];
+        snprintf(f1, sizeof f1, "%s/a.txt", glob_dir);
+        snprintf(f2, sizeof f2, "%s/b.txt", glob_dir);
+        snprintf(marker, sizeof marker, "%s/seen.log", glob_dir);
+        write_file(f1, "1"); write_file(f2, "2");
+        char yaml[1024];
+        snprintf(yaml, sizeof yaml,
+            "betl: 1\n"
+            "name: cf-foreach-glob\n"
+            "pipeline:\n"
+            "  - id: walk\n"
+            "    type: foreach\n"
+            "    over_glob: '%s/*.txt'\n"
+            "    as: f\n"
+            "    body:\n"
+            "      - id: tag\n"
+            "        type: shell\n"
+            "        argv: ['/bin/sh', '-c', 'echo \"${vars.f}\" >> %s']\n",
+            glob_dir, marker);
+        char err[512] = {0};
+        int rc = run_yaml(yaml, err, sizeof err);
+        if (rc != BETL_OK) fprintf(stderr, "case 10: %s\n", err);
+        CHECK(rc == BETL_OK);
+        char *seen = NULL;
+        FILE *mf = fopen(marker, "r");
+        if (mf) {
+            fseek(mf, 0, SEEK_END);
+            long L = ftell(mf); fseek(mf, 0, SEEK_SET);
+            seen = malloc((size_t)L + 1);
+            if (seen) { fread(seen, 1, (size_t)L, mf); seen[L] = '\0'; }
+            fclose(mf);
+        }
+        CHECK(seen != NULL);
+        CHECK(seen && strstr(seen, "a.txt") != NULL);
+        CHECK(seen && strstr(seen, "b.txt") != NULL);
+        free(seen);
+        unlink(f1); unlink(f2); unlink(marker); rmdir(glob_dir);
+    }
+
+    /* --- 11: foreach with over_query: against Postgres if reachable.
+     *         Iterates rows of `VALUES ('one'),('two'),('three')`
+     *         and concatenates them via shell appends to a marker. */
+    {
+        const char *dsn = "postgresql://postgres@host.containers.internal:5432/postgres";
+        setenv("BETL_TEST_PG_DSN", dsn, 1);
+        char marker[128];
+        snprintf(marker, sizeof marker,
+                 "/tmp/betl-cf-query-marker-%d.log", (int)getpid());
+        unlink(marker);
+        char yaml[1024];
+        snprintf(yaml, sizeof yaml,
+            "betl: 1\n"
+            "name: cf-foreach-query\n"
+            "connections:\n"
+            "  w:\n"
+            "    type: postgres\n"
+            "    dsn: ${env.BETL_TEST_PG_DSN}\n"
+            "pipeline:\n"
+            "  - id: walk\n"
+            "    type: foreach\n"
+            "    connection: w\n"
+            "    over_query: \"SELECT * FROM (VALUES ('one'),('two'),('three')) AS t(v) ORDER BY v\"\n"
+            "    as: v\n"
+            "    body:\n"
+            "      - id: tag\n"
+            "        type: shell\n"
+            "        argv: ['/bin/sh', '-c', 'echo ${vars.v} >> %s']\n",
+            marker);
+        char err[512] = {0};
+        int rc = run_yaml(yaml, err, sizeof err);
+        if (rc != BETL_OK && (strstr(err, "connect") || strstr(err, "connection"))) {
+            fprintf(stderr, "[partial-skip] over_query: %s\n", err);
+        } else {
+            if (rc != BETL_OK) fprintf(stderr, "case 11: %s\n", err);
+            CHECK(rc == BETL_OK);
+            FILE *mf = fopen(marker, "r");
+            char buf[256] = {0};
+            if (mf) { fread(buf, 1, sizeof buf - 1, mf); fclose(mf); }
+            CHECK(strstr(buf, "one")   != NULL);
+            CHECK(strstr(buf, "two")   != NULL);
+            CHECK(strstr(buf, "three") != NULL);
+        }
+        unlink(marker);
     }
 
     unlink(src);

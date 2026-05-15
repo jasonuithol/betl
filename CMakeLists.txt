@@ -333,12 +333,16 @@ if(LIBPQ_FOUND OR ODBC_FOUND)
     )
 endif()
 
-# shell / file.copy / file.move / file.delete — control-flow tasks
-# that close out the SSIS Execute Process and File System Task gaps.
-# POSIX-only; always built.
+# shell / file.copy / file.move / file.delete / var.set — control-flow
+# tasks that close out the SSIS Execute Process and File System Task
+# gaps plus the SSIS Variable-mutation pattern. POSIX-only; always
+# built. var.set is connection-dispatched (postgres / mssql) the same
+# way sql.execute is, so it links the libpq / ODBC libs implicitly via
+# betl_core's existing build-time wiring.
 target_sources(betl_core PRIVATE
     src/runtime/shell.c
     src/runtime/file_ops.c
+    src/runtime/var_set.c
 )
 
 # json.read / json.write when cJSON is available.

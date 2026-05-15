@@ -425,12 +425,19 @@ int main(void) {
     CHECK_CONTAINS(yaml, "from: [src, src2]");
     CHECK_CONTAINS(yaml, "SSIS Merge preserves sort order");
 
-    /* SCD → passthrough + recipe scaffold referencing example 05. */
+    /* SCD → passthrough + recipe scaffold referencing example 05.
+     * The fixture's <inputColumns> declare ColumnType per column:
+     *   dim_id = 0 (key), label = 2 (type-2), email = 1 (type-1),
+     *   region = 3 (fixed). The scaffold extracts and lists each. */
     CHECK_CONTAINS(yaml, "id: dimupdate");
     CHECK_CONTAINS(yaml, "examples/05-scd-type2");
     CHECK_CONTAINS(yaml, "Target dim table:   [dbo].[DimThing]");
     CHECK_CONTAINS(yaml, "SELECT dim_id, label FROM dbo.DimThing");
     CHECK_CONTAINS(yaml, "Update history?     yes");
+    CHECK_CONTAINS(yaml, "Business key(s):    dim_id");
+    CHECK_CONTAINS(yaml, "Type-2 (tracked):   label");
+    CHECK_CONTAINS(yaml, "Type-1 (overwrite): email");
+    CHECK_CONTAINS(yaml, "Fixed (no-change):  region");
 
     /* Percentage / Row Sampling — both passthrough + TODO + preserved values. */
     CHECK_CONTAINS(yaml, "id: pctsamp");

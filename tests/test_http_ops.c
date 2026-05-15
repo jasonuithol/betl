@@ -36,7 +36,7 @@ static int failures = 0;
 } while (0)
 
 static const char *PYTHON_SERVER =
-    "import sys, http.server, socketserver\n"
+    "import sys, json, time, http.server, socketserver\n"
     "class H(http.server.BaseHTTPRequestHandler):\n"
     "    def log_message(self, *a, **kw): pass\n"
     "    def do_GET(self):\n"
@@ -45,6 +45,23 @@ static const char *PYTHON_SERVER =
     "            self.send_response(200)\n"
     "            self.send_header('Content-Length', str(len(body)))\n"
     "            self.end_headers(); self.wfile.write(body)\n"
+    "        elif self.path == '/slow':\n"
+    "            time.sleep(5)\n"
+    "            self.send_response(200); self.end_headers()\n"
+    "            self.wfile.write(b'eventually')\n"
+    "        elif self.path == '/headers':\n"
+    "            # Echo the request headers back as a JSON body so the\n"
+    "            # caller can verify that custom headers reached us.\n"
+    "            hdrs = {k.lower(): v for k, v in self.headers.items()}\n"
+    "            body = json.dumps(hdrs).encode()\n"
+    "            self.send_response(200)\n"
+    "            self.send_header('Content-Type', 'application/json')\n"
+    "            self.send_header('Content-Length', str(len(body)))\n"
+    "            self.end_headers(); self.wfile.write(body)\n"
+    "        elif self.path == '/redirect':\n"
+    "            self.send_response(302)\n"
+    "            self.send_header('Location', '/hello')\n"
+    "            self.end_headers()\n"
     "        else:\n"
     "            self.send_response(404); self.end_headers()\n"
     "            self.wfile.write(b'not found')\n"
@@ -194,6 +211,73 @@ int main(void) {
         char *body = read_file(resp_path);
         CHECK(body && strcmp(body, "ping-pong") == 0);
         free(body);
+    }
+
+    /* --- 4: custom headers reach the server (echoed via /headers) -- */
+    {
+        unlink(resp_path);
+        char cfg[512];
+        snprintf(cfg, sizeof cfg,
+            "{\"url\":\"%s/headers\",\"save_to\":\"%s\","
+             "\"headers\":[\"X-Betl-Marker: hello-from-test\","
+                          "\"X-Betl-Iter: 42\"],"
+             "\"timeout\":\"5s\"}",
+            base_url, resp_path);
+        CHECK(run_task(reg, ctx, "http.get", cfg) == BETL_OK);
+        char *body = read_file(resp_path);
+        CHECK(body && strstr(body, "hello-from-test") != NULL);
+        CHECK(body && strstr(body, "\"x-betl-iter\": \"42\"") != NULL);
+        free(body);
+    }
+
+    /* --- 5: timeout — request exceeds 1s against the /slow endpoint. */
+    {
+        unlink(resp_path);
+        char cfg[256];
+        snprintf(cfg, sizeof cfg,
+            "{\"url\":\"%s/slow\",\"save_to\":\"%s\",\"timeout\":\"1s\"}",
+            base_url, resp_path);
+        int rc = run_task(reg, ctx, "http.get", cfg);
+        CHECK(rc != BETL_OK);
+        const char *e = betl_context_last_error(ctx);
+        /* libcurl reports "Operation too slow" / "Timeout was reached"
+         * depending on version — check for the URL + a timeout-ish hint. */
+        CHECK(e && (strstr(e, "imeout") != NULL
+                 || strstr(e, "too slow") != NULL));
+    }
+
+    /* --- 6: redirects are followed by default (302 → /hello). ------ */
+    {
+        unlink(resp_path);
+        char cfg[256];
+        snprintf(cfg, sizeof cfg,
+            "{\"url\":\"%s/redirect\",\"save_to\":\"%s\",\"timeout\":\"5s\"}",
+            base_url, resp_path);
+        CHECK(run_task(reg, ctx, "http.get", cfg) == BETL_OK);
+        char *body = read_file(resp_path);
+        CHECK(body && strcmp(body, "hello, betl") == 0);
+        free(body);
+    }
+
+    /* --- 7: body_file POST — request body comes from a local file. - */
+    {
+        unlink(resp_path);
+        char body_path[64];
+        snprintf(body_path, sizeof body_path,
+                 "/tmp/betl-http-body-%d.txt", (int)getpid());
+        FILE *bf = fopen(body_path, "w");
+        if (bf) { fputs("body-from-file", bf); fclose(bf); }
+        CHECK(bf != NULL);
+        char cfg[512];
+        snprintf(cfg, sizeof cfg,
+            "{\"url\":\"%s/echo\",\"save_to\":\"%s\","
+             "\"body_file\":\"%s\",\"timeout\":\"5s\"}",
+            base_url, resp_path, body_path);
+        CHECK(run_task(reg, ctx, "http.post", cfg) == BETL_OK);
+        char *body = read_file(resp_path);
+        CHECK(body && strcmp(body, "body-from-file") == 0);
+        free(body);
+        unlink(body_path);
     }
 
     unlink(resp_path);

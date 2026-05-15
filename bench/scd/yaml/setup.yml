@@ -1,0 +1,73 @@
+# One-shot pipeline that builds the bench schemas (Postgres-side).
+# Replaces `psql -f setup.sql` so run.sh doesn't need psql.
+#
+# Idempotent — drops + recreates every time so consecutive bench runs
+# don't accumulate cruft.
+
+betl: 1
+name: scd-bench-setup
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+pipeline:
+  - id: drop_dim
+    type: sql.execute
+    connection: warehouse
+    sql: DROP SCHEMA IF EXISTS scdbench_dim CASCADE
+  - id: drop_stg
+    type: sql.execute
+    connection: warehouse
+    after: [drop_dim]
+    sql: DROP SCHEMA IF EXISTS scdbench_stg CASCADE
+  - id: create_dim
+    type: sql.execute
+    connection: warehouse
+    after: [drop_stg]
+    sql: CREATE SCHEMA scdbench_dim
+  - id: create_stg
+    type: sql.execute
+    connection: warehouse
+    after: [create_dim]
+    sql: CREATE SCHEMA scdbench_stg
+  - id: dim_table
+    type: sql.execute
+    connection: warehouse
+    after: [create_stg]
+    sql: |
+      CREATE TABLE scdbench_dim.customer (
+          customer_sk   BIGSERIAL    PRIMARY KEY,
+          customer_id   INTEGER      NOT NULL,
+          name          TEXT,
+          email         TEXT,
+          address       TEXT,
+          valid_from    TIMESTAMPTZ  NOT NULL,
+          valid_to      TIMESTAMPTZ,
+          is_current    BOOLEAN      NOT NULL DEFAULT TRUE
+      )
+  - id: dim_index
+    type: sql.execute
+    connection: warehouse
+    after: [dim_table]
+    sql: CREATE INDEX scdbench_dim_current_bk ON scdbench_dim.customer (customer_id) WHERE is_current
+  - id: dim_view
+    type: sql.execute
+    connection: warehouse
+    after: [dim_index]
+    sql: |
+      CREATE VIEW scdbench_dim.customer_current AS
+          SELECT customer_sk, customer_id, name, email, address,
+                 valid_from, valid_to
+            FROM scdbench_dim.customer
+           WHERE is_current
+  - id: stg_table
+    type: sql.execute
+    connection: warehouse
+    after: [dim_view]
+    sql: |
+      CREATE TABLE scdbench_stg.customer (
+          customer_id   INTEGER  NOT NULL,
+          name          TEXT,
+          email         TEXT,
+          address       TEXT
+      )

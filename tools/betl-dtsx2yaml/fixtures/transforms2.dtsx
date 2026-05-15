@@ -199,7 +199,11 @@
               </outputs>
             </component>
 
-            <!-- 7. SCD (Slowly Changing Dimension) -->
+            <!-- 7. SCD (Slowly Changing Dimension). Now with the
+                 full ColumnType per-input-column property set so the
+                 mapper can extract business key (0), type-1 changing
+                 (1), type-2 historical (2), and fixed (3) columns into
+                 the recipe scaffold. -->
             <component
                 refId="Package\TailFlow\DimUpdate"
                 name="DimUpdate"
@@ -209,6 +213,32 @@
                 <property name="SqlCommand">SELECT dim_id, label FROM dbo.DimThing WHERE current_ind = 1</property>
                 <property name="UpdateChangingAttributeHistory">true</property>
               </properties>
+              <inputs>
+                <input name="SCD Input">
+                  <inputColumns>
+                    <inputColumn cachedName="dim_id">
+                      <properties>
+                        <property name="ColumnType">0</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="label">
+                      <properties>
+                        <property name="ColumnType">2</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="email">
+                      <properties>
+                        <property name="ColumnType">1</property>
+                      </properties>
+                    </inputColumn>
+                    <inputColumn cachedName="region">
+                      <properties>
+                        <property name="ColumnType">3</property>
+                      </properties>
+                    </inputColumn>
+                  </inputColumns>
+                </input>
+              </inputs>
               <outputs>
                 <output name="SCD Output"/>
               </outputs>
