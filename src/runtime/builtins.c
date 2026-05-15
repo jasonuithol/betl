@@ -17,12 +17,24 @@
 
 #ifdef BETL_HAVE_LIBPQ
 #include "runtime/postgres_upsert.h"
+#include "runtime/postgres_exec.h"
+#include "runtime/postgres_copy.h"
 #include "runtime/postgres_lookup.h"
 #include "runtime/postgres_read.h"
 #endif
 
 #ifdef BETL_HAVE_ODBC
 #include "runtime/mssql_upsert.h"
+#include "runtime/mssql_exec.h"
+#ifdef BETL_HAVE_XLSXWRITER
+#include "runtime/xlsx_write.h"
+#endif
+#ifdef BETL_HAVE_XLSXIO_READ
+#include "runtime/xlsx_read.h"
+#endif
+#ifdef BETL_HAVE_LIBXML2
+#include "runtime/xml_read.h"
+#endif
 #include "runtime/mssql_bulkinsert.h"
 #include "runtime/mssql_lookup.h"
 #include "runtime/mssql_read.h"
@@ -2331,6 +2343,10 @@ int betl_register_builtins(BetlRegistry *r) {
     if (rc != BETL_OK) return rc;
     rc = betl_register_postgres_read(r);
     if (rc != BETL_OK) return rc;
+    rc = betl_register_postgres_exec(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_postgres_copy(r);
+    if (rc != BETL_OK) return rc;
 #endif
 #ifdef BETL_HAVE_ODBC
     rc = betl_register_mssql(r);
@@ -2340,6 +2356,20 @@ int betl_register_builtins(BetlRegistry *r) {
     rc = betl_register_mssql_lookup(r);
     if (rc != BETL_OK) return rc;
     rc = betl_register_mssql_read(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_mssql_exec(r);
+    if (rc != BETL_OK) return rc;
+#endif
+#ifdef BETL_HAVE_XLSXWRITER
+    rc = betl_register_xlsx_write(r);
+    if (rc != BETL_OK) return rc;
+#endif
+#ifdef BETL_HAVE_XLSXIO_READ
+    rc = betl_register_xlsx_read(r);
+    if (rc != BETL_OK) return rc;
+#endif
+#ifdef BETL_HAVE_LIBXML2
+    rc = betl_register_xml_read(r);
     if (rc != BETL_OK) return rc;
 #endif
     return rc;

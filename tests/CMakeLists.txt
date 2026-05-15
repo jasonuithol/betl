@@ -436,6 +436,52 @@ set_tests_properties(csv_write PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: csv.write end-to-end test passed"
 )
 
+# --- xlsx.write end-to-end test (libxlsxwriter required) -------------------
+if(XLSXWRITER_FOUND)
+    add_executable(test_xlsx_write test_xlsx_write.c)
+    target_link_libraries(test_xlsx_write PRIVATE betl_core)
+    add_test(NAME xlsx_write COMMAND test_xlsx_write)
+    set_tests_properties(xlsx_write PROPERTIES
+        PASS_REGULAR_EXPRESSION "ok: xlsx_write integration test passed"
+    )
+endif()
+
+# --- xlsx.read end-to-end round-trip (xlsx.write → xlsx.read) -------------
+# Drives gen_strings → xlsx.write → xlsx.read → lua.map (logs row) →
+# count_rows. Needs betl-lua.so for the lua.map verifier.
+if(XLSXWRITER_FOUND AND XLSXIO_READ_FOUND AND BETL_LUA_FOUND)
+    add_executable(test_xlsx_read test_xlsx_read.c)
+    target_link_libraries(test_xlsx_read PRIVATE betl_core)
+    set_target_properties(test_xlsx_read PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_xlsx_read PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_xlsx_read ${BETL_LUA_TARGET})
+    add_test(NAME xlsx_read
+        COMMAND test_xlsx_read $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+    set_tests_properties(xlsx_read PROPERTIES
+        PASS_REGULAR_EXPRESSION "ok: xlsx_read integration test passed"
+    )
+endif()
+
+# --- xml.read end-to-end test (libxml2 + lua.map verifier) ----------------
+if(LIBXML2_FOUND AND BETL_LUA_FOUND)
+    add_executable(test_xml_read test_xml_read.c)
+    target_link_libraries(test_xml_read PRIVATE betl_core)
+    set_target_properties(test_xml_read PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_xml_read PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_xml_read ${BETL_LUA_TARGET})
+    add_test(NAME xml_read
+        COMMAND test_xml_read $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+    set_tests_properties(xml_read PROPERTIES
+        PASS_REGULAR_EXPRESSION "ok: xml_read integration test passed"
+    )
+endif()
+
 # --- mssql.upsert SQL (MERGE) builder unit test -----------------------------
 # Pure string code — compiles even when ODBC isn't found, since mssql_sql.c
 # is always part of betl_core.
@@ -473,6 +519,15 @@ if(ODBC_FOUND)
     set_tests_properties(mssql_bulkinsert PROPERTIES
         SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "ok: mssql_bulkinsert integration test passed"
+    )
+
+    # --- mssql.exec end-to-end integration test (per-row SQL) ---------------
+    add_executable(test_mssql_exec test_mssql_exec.c)
+    target_link_libraries(test_mssql_exec PRIVATE betl_core betl_odbc)
+    add_test(NAME mssql_exec COMMAND test_mssql_exec)
+    set_tests_properties(mssql_exec PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: mssql_exec integration test passed"
     )
 
     # --- mssql.lookup end-to-end integration test ---------------------------
@@ -576,6 +631,24 @@ if(LIBPQ_FOUND)
     set_tests_properties(pg_upsert PROPERTIES
         SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "ok: pg_upsert integration test passed"
+    )
+
+    # --- postgres.exec end-to-end integration test (per-row SQL) -----------
+    add_executable(test_pg_exec test_pg_exec.c)
+    target_link_libraries(test_pg_exec PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_exec COMMAND test_pg_exec)
+    set_tests_properties(pg_exec PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_exec integration test passed"
+    )
+
+    # --- postgres.copy end-to-end integration test (binary COPY) -----------
+    add_executable(test_pg_copy test_pg_copy.c)
+    target_link_libraries(test_pg_copy PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_copy COMMAND test_pg_copy)
+    set_tests_properties(pg_copy PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: pg_copy integration test passed"
     )
 
     # --- postgres `lookup` end-to-end integration test ----------------------

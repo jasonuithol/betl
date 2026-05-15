@@ -30,5 +30,6 @@ int betl_register_transforms(BetlRegistry *r) {
     rc = betl_tx_register_unpivot(r);   if (rc != BETL_OK) return rc;
     rc = betl_tx_register_pivot(r);     if (rc != BETL_OK) return rc;
     rc = betl_tx_register_multicast(r); if (rc != BETL_OK) return rc;
+    rc = betl_tx_register_audit(r);     if (rc != BETL_OK) return rc;
     return BETL_OK;
 }

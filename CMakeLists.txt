@@ -115,6 +115,63 @@ else()
     message(STATUS "FreeTDS db-lib not found — mssql.bulkinsert will only support mode:array")
 endif()
 
+# libxlsxwriter: used by xlsx.write (SSIS Excel Destination parity).
+# Optional — when present, BETL_HAVE_XLSXWRITER is defined and the
+# component is registered; when absent the rest of betl builds fine.
+find_path(XLSXWRITER_INCLUDE_DIR xlsxwriter.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include
+)
+find_library(XLSXWRITER_LIBRARY NAMES xlsxwriter
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(XLSXWRITER_INCLUDE_DIR AND XLSXWRITER_LIBRARY)
+    set(XLSXWRITER_FOUND TRUE)
+    add_library(betl_xlsxwriter INTERFACE)
+    target_include_directories(betl_xlsxwriter INTERFACE ${XLSXWRITER_INCLUDE_DIR})
+    target_link_libraries(betl_xlsxwriter INTERFACE ${XLSXWRITER_LIBRARY})
+    message(STATUS "Found libxlsxwriter: ${XLSXWRITER_LIBRARY} (headers: ${XLSXWRITER_INCLUDE_DIR})")
+else()
+    set(XLSXWRITER_FOUND FALSE)
+    message(STATUS "libxlsxwriter not found — xlsx.write component disabled")
+endif()
+
+# libxlsxio_read: used by xlsx.read (SSIS Excel Source parity). Built
+# from upstream source by install_dep_source — see deps/.installed.json.
+find_path(XLSXIO_READ_INCLUDE_DIR xlsxio_read.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include
+)
+find_library(XLSXIO_READ_LIBRARY NAMES xlsxio_read
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(XLSXIO_READ_INCLUDE_DIR AND XLSXIO_READ_LIBRARY)
+    set(XLSXIO_READ_FOUND TRUE)
+    add_library(betl_xlsxio_read INTERFACE)
+    target_include_directories(betl_xlsxio_read INTERFACE ${XLSXIO_READ_INCLUDE_DIR})
+    target_link_libraries(betl_xlsxio_read INTERFACE ${XLSXIO_READ_LIBRARY})
+    message(STATUS "Found libxlsxio_read: ${XLSXIO_READ_LIBRARY} (headers: ${XLSXIO_READ_INCLUDE_DIR})")
+else()
+    set(XLSXIO_READ_FOUND FALSE)
+    message(STATUS "libxlsxio_read not found — xlsx.read component disabled")
+endif()
+
+# libxml2: used by xml.read (SSIS XML Source parity). Optional.
+find_path(LIBXML2_INCLUDE_DIR libxml/xpath.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include/libxml2
+)
+find_library(LIBXML2_LIBRARY NAMES xml2
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(LIBXML2_INCLUDE_DIR AND LIBXML2_LIBRARY)
+    set(LIBXML2_FOUND TRUE)
+    add_library(betl_libxml2 INTERFACE)
+    target_include_directories(betl_libxml2 INTERFACE ${LIBXML2_INCLUDE_DIR})
+    target_link_libraries(betl_libxml2 INTERFACE ${LIBXML2_LIBRARY})
+    message(STATUS "Found libxml2: ${LIBXML2_LIBRARY} (headers: ${LIBXML2_INCLUDE_DIR})")
+else()
+    set(LIBXML2_FOUND FALSE)
+    message(STATUS "libxml2 not found — xml.read component disabled")
+endif()
+
 # --- Generated headers -----------------------------------------------------
 configure_file(
     ${CMAKE_SOURCE_DIR}/include/betl/version.h.in
@@ -154,6 +211,7 @@ add_library(betl_core STATIC
     src/runtime/transform_unpivot.c
     src/runtime/transform_pivot.c
     src/runtime/transform_multicast.c
+    src/runtime/transform_audit.c
     src/yaml/yaml_load.c
 )
 target_include_directories(betl_core PUBLIC
@@ -170,6 +228,8 @@ if(LIBPQ_FOUND)
         src/runtime/postgres_upsert.c
         src/runtime/postgres_lookup.c
         src/runtime/postgres_read.c
+        src/runtime/postgres_exec.c
+        src/runtime/postgres_copy.c
     )
     target_link_libraries(betl_core PUBLIC betl_libpq)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBPQ)
@@ -183,6 +243,7 @@ if(ODBC_FOUND)
         src/runtime/mssql_bulkinsert.c
         src/runtime/mssql_lookup.c
         src/runtime/mssql_read.c
+        src/runtime/mssql_exec.c
     )
     target_link_libraries(betl_core PUBLIC betl_odbc)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_ODBC)
@@ -196,6 +257,33 @@ if(ODBC_FOUND)
         target_link_libraries(betl_core PUBLIC betl_sybdb)
         target_compile_definitions(betl_core PUBLIC BETL_HAVE_SYBDB)
     endif()
+endif()
+
+# Pull in xlsx.write when libxlsxwriter is available.
+if(XLSXWRITER_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/xlsx_write.c
+    )
+    target_link_libraries(betl_core PUBLIC betl_xlsxwriter)
+    target_compile_definitions(betl_core PUBLIC BETL_HAVE_XLSXWRITER)
+endif()
+
+# Pull in xlsx.read when libxlsxio_read is available.
+if(XLSXIO_READ_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/xlsx_read.c
+    )
+    target_link_libraries(betl_core PUBLIC betl_xlsxio_read)
+    target_compile_definitions(betl_core PUBLIC BETL_HAVE_XLSXIO_READ)
+endif()
+
+# Pull in xml.read when libxml2 is available.
+if(LIBXML2_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/xml_read.c
+    )
+    target_link_libraries(betl_core PUBLIC betl_libxml2)
+    target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBXML2)
 endif()
 
 # --- Engine binary ---------------------------------------------------------

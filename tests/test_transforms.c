@@ -813,6 +813,57 @@ static const char PL_SPLIT_FIRST_WINS[] =
     "        from: split:rest\n"
     "        expect: 1\n";
 
+/* audit: append constant columns of int64, float64 and utf8 kinds.
+ * Verify they all appear with the right values via lua.map logging. */
+static const char PL_AUDIT_MIXED[] =
+    "betl: 1\n"
+    "name: tx-audit-mixed\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 2\n"
+    "      - id: tag\n"
+    "        type: audit\n"
+    "        from: source\n"
+    "        columns:\n"
+    "          host: \"test-host\"\n"
+    "          run_id: 42\n"
+    "          rate: 1.5\n"
+    "      - id: probe\n"
+    "        type: lua.map\n"
+    "        from: tag\n"
+    "        script: |\n"
+    "          log.info('row id=' .. tostring(row.id) "
+    ".. ' host=' .. tostring(row.host) "
+    ".. ' run_id=' .. tostring(row.run_id) "
+    ".. ' rate=' .. tostring(row.rate))\n"
+    "          return row\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: probe\n"
+    "        expect: 2\n";
+
+/* audit: missing columns block → config error. */
+static const char PL_AUDIT_NO_COLUMNS[] =
+    "betl: 1\n"
+    "name: tx-audit-no-columns\n"
+    "pipeline:\n"
+    "  - id: stage_one\n"
+    "    type: dataflow\n"
+    "    steps:\n"
+    "      - id: source\n"
+    "        type: betl.gen_int64\n"
+    "        row_count: 1\n"
+    "      - id: tag\n"
+    "        type: audit\n"
+    "        from: source\n"
+    "      - id: sink\n"
+    "        type: betl.count_rows\n"
+    "        from: tag\n";
+
 /* Reference an unknown port name from a downstream step. */
 static const char PL_SPLIT_BAD_PORT[] =
     "betl: 1\n"
@@ -1162,6 +1213,8 @@ int main(int argc, char **argv) {
         { "split-first-wins",      PL_SPLIT_FIRST_WINS      },
     };
 
+    /* audit-mixed verifies row contents via log capture, not just count. */
+
     /* csv.read typed: substitute the fixture path into the template. */
     char csv_yaml[2048];
     {
@@ -1269,6 +1322,26 @@ int main(int argc, char **argv) {
         fclose(log);
     }
 
+    /* audit-mixed: verify the appended audit columns reach downstream
+     * with the right values. */
+    {
+        char err[512] = {0};
+        FILE *log = tmpfile();
+        int rc = run_yaml_log(plugin_path, PL_AUDIT_MIXED, err, sizeof err, log);
+        if (rc != BETL_OK) fprintf(stderr, "audit-mixed failed: %s\n", err);
+        CHECK(rc == BETL_OK);
+        char *txt = slurp_file(log);
+        if (txt) {
+            CHECK(strstr(txt, "host=test-host") != NULL);
+            CHECK(strstr(txt, "run_id=42")      != NULL);
+            CHECK(strstr(txt, "rate=1.5")       != NULL);
+            CHECK(strstr(txt, "row id=0")       != NULL);
+            CHECK(strstr(txt, "row id=1")       != NULL);
+            free(txt);
+        }
+        fclose(log);
+    }
+
     /* Cases that should fail with a specific error keyword. */
     struct {
         const char *name;
@@ -1297,6 +1370,8 @@ int main(int argc, char **argv) {
           "no output port 'no_such_port'" },
         { "split-no-cases", PL_SPLIT_NO_CASES,
           "`cases:` list is empty" },
+        { "audit-no-columns", PL_AUDIT_NO_COLUMNS,
+          "requires a `columns:` mapping" },
     };
     for (size_t i = 0; i < sizeof fail_cases / sizeof fail_cases[0]; ++i) {
         char err[512] = {0};
