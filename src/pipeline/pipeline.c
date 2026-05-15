@@ -390,6 +390,12 @@ static void free_stage(BetlStage *s) {
     strlist_free(s->after, s->after_count);
     for (size_t i = 0; i < s->step_count; ++i) free_step(&s->steps[i]);
     free(s->steps);
+    strlist_free(s->over, s->over_count);
+    free(s->foreach_var);
+    for (size_t i = 0; i < s->child_count; ++i) free_stage(&s->children[i]);
+    free(s->children);
+    free(s->on_failure);
+    free(s->condition);
 }
 
 /* Parse one entry in the top-level `connections:` mapping. The key is
@@ -581,10 +587,15 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
                "stage: expected a mapping");
         return -1;
     }
-    yaml_node_t *id_n    = map_get(ctx->doc, stage_node, "id");
-    yaml_node_t *type_n  = map_get(ctx->doc, stage_node, "type");
-    yaml_node_t *after_n = map_get(ctx->doc, stage_node, "after");
-    yaml_node_t *steps_n = map_get(ctx->doc, stage_node, "steps");
+    yaml_node_t *id_n      = map_get(ctx->doc, stage_node, "id");
+    yaml_node_t *type_n    = map_get(ctx->doc, stage_node, "type");
+    yaml_node_t *after_n   = map_get(ctx->doc, stage_node, "after");
+    yaml_node_t *steps_n   = map_get(ctx->doc, stage_node, "steps");
+    yaml_node_t *over_n    = map_get(ctx->doc, stage_node, "over");
+    yaml_node_t *as_n      = map_get(ctx->doc, stage_node, "as");
+    yaml_node_t *body_n    = map_get(ctx->doc, stage_node, "body");
+    yaml_node_t *onfail_n  = map_get(ctx->doc, stage_node, "on_failure");
+    yaml_node_t *cond_n    = map_get(ctx->doc, stage_node, "condition");
 
     const char *id   = scalar(id_n);
     const char *type = scalar(type_n);
@@ -635,14 +646,87 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
                    "stage '%s': type=dataflow has empty `steps:` sequence", id);
             return -1;
         }
+    } else if (strcmp(type, "foreach") == 0) {
+        out->kind = BETL_STAGE_FOREACH;
+        if (steps_n) {
+            err_at(ctx, yaml_line(steps_n), yaml_col(steps_n),
+                   "stage '%s' (type=foreach): use `body:` for nested stages, "
+                   "not `steps:`", id);
+            return -1;
+        }
+        /* `over:` — required, must be a sequence of scalar strings (v1
+         * supports only literal-list iteration; future enumerators will
+         * gate on additional keys). */
+        if (!over_n) {
+            err_at(ctx, yaml_line(stage_node), yaml_col(stage_node),
+                   "stage '%s' (type=foreach): missing required `over:` list", id);
+            return -1;
+        }
+        if (extract_string_list(ctx, over_n, "stage `over`",
+                                &out->over, &out->over_count) != 0) {
+            return -1;
+        }
+        if (out->over_count == 0) {
+            err_at(ctx, yaml_line(over_n), yaml_col(over_n),
+                   "stage '%s' (type=foreach): `over:` must have at least "
+                   "one element", id);
+            return -1;
+        }
+        /* `as:` — required, the variable name bound per iteration. */
+        const char *as_name = scalar(as_n);
+        if (!as_name || !*as_name) {
+            err_at(ctx, yaml_line(stage_node), yaml_col(stage_node),
+                   "stage '%s' (type=foreach): missing required `as:` "
+                   "variable name", id);
+            return -1;
+        }
+        out->foreach_var = strdup(as_name);
+        if (!out->foreach_var) return -1;
+        /* `body:` — required, a sequence of nested stages. */
+        if (!body_n || !is_seq(body_n)) {
+            err_at(ctx, yaml_line(stage_node), yaml_col(stage_node),
+                   "stage '%s' (type=foreach): missing required `body:` "
+                   "stage list", id);
+            return -1;
+        }
+        size_t cap = 0;
+        for (yaml_node_item_t *it = body_n->data.sequence.items.start;
+             it < body_n->data.sequence.items.top; ++it) {
+            if (out->child_count == cap) {
+                size_t nc = cap ? cap * 2 : 4;
+                BetlStage *p = realloc(out->children, nc * sizeof *p);
+                if (!p) return -1;
+                out->children = p;
+                cap = nc;
+            }
+            BetlStage *child = &out->children[out->child_count];
+            memset(child, 0, sizeof *child);
+            if (parse_stage(ctx, node(ctx->doc, *it), child) != 0) {
+                free_stage(child);
+                return -1;
+            }
+            out->child_count++;
+        }
+        if (out->child_count == 0) {
+            err_at(ctx, yaml_line(body_n), yaml_col(body_n),
+                   "stage '%s' (type=foreach): `body:` must have at least "
+                   "one stage", id);
+            return -1;
+        }
     } else {
         out->kind = BETL_STAGE_TASK;
         out->task_type = strdup(type);
         if (!out->task_type) return -1;
-        /* Tasks must NOT have `steps:`. */
+        /* Tasks must NOT have `steps:` / `body:`. */
         if (steps_n) {
             err_at(ctx, yaml_line(steps_n), yaml_col(steps_n),
                    "stage '%s' (type=%s): `steps:` is only allowed for type=dataflow",
+                   id, type);
+            return -1;
+        }
+        if (body_n) {
+            err_at(ctx, yaml_line(body_n), yaml_col(body_n),
+                   "stage '%s' (type=%s): `body:` is only allowed for type=foreach",
                    id, type);
             return -1;
         }
@@ -658,6 +742,37 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
                             &out->after, &out->after_count) != 0) {
         return -1;
     }
+
+    /* `on_failure:` (optional, scalar, one of "stop"/"continue"). */
+    if (onfail_n) {
+        const char *v = scalar(onfail_n);
+        if (!v || (strcmp(v, "stop") != 0 && strcmp(v, "continue") != 0)) {
+            err_at(ctx, yaml_line(onfail_n), yaml_col(onfail_n),
+                   "stage '%s': `on_failure:` must be \"stop\" or "
+                   "\"continue\" (got '%s')",
+                   id, v ? v : "(non-scalar)");
+            return -1;
+        }
+        out->on_failure = strdup(v);
+        if (!out->on_failure) return -1;
+    }
+
+    /* `condition:` (optional, scalar string). The executor passes it
+     * through betl_substitute_refs at run-time and treats truthy strings
+     * as "run". Object-form conditions ({lang, expr}) are not yet
+     * accepted — return a clear error instead of silently ignoring. */
+    if (cond_n) {
+        const char *v = scalar(cond_n);
+        if (!v) {
+            err_at(ctx, yaml_line(cond_n), yaml_col(cond_n),
+                   "stage '%s': `condition:` must be a scalar string in v1 "
+                   "(object form `{lang, expr}` is reserved)", id);
+            return -1;
+        }
+        out->condition = strdup(v);
+        if (!out->condition) return -1;
+    }
+
     return 0;
 }
 
@@ -665,18 +780,60 @@ static int parse_stage(Ctx *ctx, yaml_node_t *stage_node, BetlStage *out) {
  *  Cross-reference and cycle checks                                *
  * ============================================================== */
 
-static int check_unique_stage_ids(Ctx *ctx, const BetlPipeline *p) {
-    for (size_t i = 0; i < p->stage_count; ++i) {
-        for (size_t j = i + 1; j < p->stage_count; ++j) {
-            if (strcmp(p->stages[i].id, p->stages[j].id) == 0) {
-                err_at(ctx, p->stages[j].line, p->stages[j].column,
+/* Walk every stage in the tree (top-level + foreach bodies) and check
+ * IDs are unique globally. A foreach body running N times reuses the
+ * same stage IDs across iterations — that's fine at run-time — but two
+ * separately-declared stages with the same ID would make `after:` /
+ * log messages ambiguous, so we reject those. */
+typedef struct {
+    const BetlStage *stage;
+    int              dup_line;
+    int              dup_column;
+} IdEntry;
+
+typedef struct {
+    IdEntry *items;
+    size_t   count;
+    size_t   cap;
+} IdSet;
+
+static int id_set_add(IdSet *s, const BetlStage *st) {
+    if (s->count == s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 16;
+        IdEntry *grow = realloc(s->items, nc * sizeof *grow);
+        if (!grow) return -1;
+        s->items = grow;
+        s->cap   = nc;
+    }
+    s->items[s->count++] = (IdEntry){ .stage = st };
+    return 0;
+}
+
+static int collect_ids(Ctx *ctx, BetlStage *arr, size_t n, IdSet *seen) {
+    for (size_t i = 0; i < n; ++i) {
+        BetlStage *s = &arr[i];
+        for (size_t k = 0; k < seen->count; ++k) {
+            if (strcmp(seen->items[k].stage->id, s->id) == 0) {
+                err_at(ctx, s->line, s->column,
                        "duplicate stage id '%s' (first defined at line %d)",
-                       p->stages[i].id, p->stages[i].line);
+                       s->id, seen->items[k].stage->line);
                 return -1;
             }
         }
+        if (id_set_add(seen, s) != 0) return -1;
+        if (s->kind == BETL_STAGE_FOREACH) {
+            if (collect_ids(ctx, s->children, s->child_count, seen) != 0)
+                return -1;
+        }
     }
     return 0;
+}
+
+static int check_unique_stage_ids(Ctx *ctx, const BetlPipeline *p) {
+    IdSet seen = {0};
+    int rc = collect_ids(ctx, p->stages, p->stage_count, &seen);
+    free(seen.items);
+    return rc;
 }
 
 static int check_unique_step_ids(Ctx *ctx, const BetlStage *s) {
@@ -693,9 +850,9 @@ static int check_unique_step_ids(Ctx *ctx, const BetlStage *s) {
     return 0;
 }
 
-static int find_stage_index(const BetlPipeline *p, const char *id) {
-    for (size_t i = 0; i < p->stage_count; ++i) {
-        if (strcmp(p->stages[i].id, id) == 0) return (int)i;
+static int find_stage_index_in(const BetlStage *arr, size_t n, const char *id) {
+    for (size_t i = 0; i < n; ++i) {
+        if (strcmp(arr[i].id, id) == 0) return (int)i;
     }
     return -1;
 }
@@ -723,9 +880,14 @@ static int find_step_index_ref(const BetlStage *s, const char *ref) {
     return find_step_index(s, buf);
 }
 
-static int check_after_refs(Ctx *ctx, const BetlPipeline *p) {
-    for (size_t i = 0; i < p->stage_count; ++i) {
-        const BetlStage *s = &p->stages[i];
+/* `after:` is scoped — a stage can only reference siblings at the same
+ * level (top-level stages reference top-level; stages inside a foreach
+ * body reference siblings of that body). This both keeps the topo-sort
+ * straightforward and reflects what dtsx2yaml emits: container
+ * children with constraints pointing only at their own siblings. */
+static int check_after_refs_in(Ctx *ctx, const BetlStage *arr, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const BetlStage *s = &arr[i];
         for (size_t k = 0; k < s->after_count; ++k) {
             const char *ref = s->after[k];
             if (strcmp(ref, s->id) == 0) {
@@ -733,15 +895,24 @@ static int check_after_refs(Ctx *ctx, const BetlPipeline *p) {
                        "stage '%s' depends on itself in `after:`", s->id);
                 return -1;
             }
-            if (find_stage_index(p, ref) < 0) {
+            if (find_stage_index_in(arr, n, ref) < 0) {
                 err_at(ctx, s->line, s->column,
-                       "stage '%s' depends on undefined stage '%s' in `after:`",
+                       "stage '%s' depends on undefined sibling stage '%s' "
+                       "in `after:` (refs are scoped to same-level siblings)",
                        s->id, ref);
                 return -1;
             }
         }
+        if (s->kind == BETL_STAGE_FOREACH) {
+            if (check_after_refs_in(ctx, s->children, s->child_count) != 0)
+                return -1;
+        }
     }
     return 0;
+}
+
+static int check_after_refs(Ctx *ctx, const BetlPipeline *p) {
+    return check_after_refs_in(ctx, p->stages, p->stage_count);
 }
 
 static int check_from_refs(Ctx *ctx, const BetlStage *s) {
@@ -767,37 +938,71 @@ static int check_from_refs(Ctx *ctx, const BetlStage *s) {
     return 0;
 }
 
-/* DFS-based cycle detection. `state` per node:
- *   0 = unvisited, 1 = on stack, 2 = done. */
-static int dfs_stage(Ctx *ctx, const BetlPipeline *p, int idx,
-                     unsigned char *state) {
+/* DFS-based cycle detection within a single `after:` scope (top-level
+ * or one foreach body). `state` per node: 0 = unvisited, 1 = on stack,
+ * 2 = done. */
+static int dfs_stage_in(Ctx *ctx, const BetlStage *arr, size_t n,
+                        int idx, unsigned char *state) {
     if (state[idx] == 2) return 0;
     if (state[idx] == 1) {
-        const BetlStage *s = &p->stages[idx];
+        const BetlStage *s = &arr[idx];
         err_at(ctx, s->line, s->column,
                "cycle detected in stage `after:` involving '%s'", s->id);
         return -1;
     }
     state[idx] = 1;
-    const BetlStage *s = &p->stages[idx];
+    const BetlStage *s = &arr[idx];
     for (size_t k = 0; k < s->after_count; ++k) {
-        int nxt = find_stage_index(p, s->after[k]);
-        if (nxt >= 0 && dfs_stage(ctx, p, nxt, state) != 0) return -1;
+        int nxt = find_stage_index_in(arr, n, s->after[k]);
+        if (nxt >= 0 && dfs_stage_in(ctx, arr, n, nxt, state) != 0) return -1;
     }
     state[idx] = 2;
     return 0;
 }
 
-static int check_no_stage_cycles(Ctx *ctx, const BetlPipeline *p) {
-    if (p->stage_count == 0) return 0;
-    unsigned char *state = calloc(p->stage_count, 1);
+static int check_no_stage_cycles_in(Ctx *ctx, const BetlStage *arr, size_t n) {
+    if (n == 0) return 0;
+    unsigned char *state = calloc(n, 1);
     if (!state) return -1;
     int rc = 0;
-    for (size_t i = 0; i < p->stage_count && rc == 0; ++i) {
-        rc = dfs_stage(ctx, p, (int)i, state);
+    for (size_t i = 0; i < n && rc == 0; ++i) {
+        rc = dfs_stage_in(ctx, arr, n, (int)i, state);
     }
     free(state);
-    return rc;
+    if (rc != 0) return rc;
+    /* Recurse into each foreach body — each is its own scope. */
+    for (size_t i = 0; i < n; ++i) {
+        const BetlStage *s = &arr[i];
+        if (s->kind == BETL_STAGE_FOREACH) {
+            if (check_no_stage_cycles_in(ctx, s->children, s->child_count) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int check_no_stage_cycles(Ctx *ctx, const BetlPipeline *p) {
+    return check_no_stage_cycles_in(ctx, p->stages, p->stage_count);
+}
+
+/* Forward decl: defined further down (alongside dfs_step). */
+static int check_no_step_cycles(Ctx *ctx, const BetlStage *s);
+
+/* Walk every dataflow stage in the tree (top-level and inside foreach
+ * bodies) and run the dataflow-specific validators on each. */
+static int check_dataflow_stages(Ctx *ctx, const BetlStage *arr, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const BetlStage *s = &arr[i];
+        if (s->kind == BETL_STAGE_DATAFLOW) {
+            if (check_unique_step_ids(ctx, s) != 0) return -1;
+            if (check_from_refs(ctx, s) != 0)       return -1;
+            if (check_no_step_cycles(ctx, s) != 0)  return -1;
+        } else if (s->kind == BETL_STAGE_FOREACH) {
+            if (check_dataflow_stages(ctx, s->children, s->child_count) != 0)
+                return -1;
+        }
+    }
+    return 0;
 }
 
 static int dfs_step(Ctx *ctx, const BetlStage *s, int idx,
@@ -1312,21 +1517,9 @@ BetlPipeline *betl_pipeline_load(const char *path,
         betl_pipeline_free(p);
         return NULL;
     }
-    for (size_t i = 0; i < p->stage_count; ++i) {
-        const BetlStage *s = &p->stages[i];
-        if (s->kind != BETL_STAGE_DATAFLOW) continue;
-        if (check_unique_step_ids(&ctx, s) != 0) {
-            betl_pipeline_free(p);
-            return NULL;
-        }
-        if (check_from_refs(&ctx, s) != 0) {
-            betl_pipeline_free(p);
-            return NULL;
-        }
-        if (check_no_step_cycles(&ctx, s) != 0) {
-            betl_pipeline_free(p);
-            return NULL;
-        }
+    if (check_dataflow_stages(&ctx, p->stages, p->stage_count) != 0) {
+        betl_pipeline_free(p);
+        return NULL;
     }
     return p;
 }
@@ -1355,13 +1548,20 @@ const BetlStage *betl_pipeline_find_stage(const BetlPipeline *p,
     }
     return NULL;
 }
+static size_t total_steps_in(const BetlStage *arr, size_t n) {
+    size_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+        total += arr[i].step_count;
+        if (arr[i].kind == BETL_STAGE_FOREACH) {
+            total += total_steps_in(arr[i].children, arr[i].child_count);
+        }
+    }
+    return total;
+}
+
 size_t betl_pipeline_total_steps(const BetlPipeline *p) {
     if (!p) return 0;
-    size_t n = 0;
-    for (size_t i = 0; i < p->stage_count; ++i) {
-        n += p->stages[i].step_count;
-    }
-    return n;
+    return total_steps_in(p->stages, p->stage_count);
 }
 
 size_t betl_pipeline_connection_count(const BetlPipeline *p) {

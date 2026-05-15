@@ -17,8 +17,10 @@ extern "C" {
 #endif
 
 typedef enum {
-    BETL_STAGE_DATAFLOW = 1,    /* contains nested steps */
-    BETL_STAGE_TASK     = 2     /* a single control-flow task */
+    BETL_STAGE_DATAFLOW = 1,    /* contains nested data-flow steps */
+    BETL_STAGE_TASK     = 2,    /* a single control-flow task */
+    BETL_STAGE_FOREACH  = 3     /* iterates `body:` once per `over:` value;
+                                 * binds the current value to `${vars.<as>}` */
 } BetlStageKind;
 
 typedef struct {
@@ -59,7 +61,9 @@ typedef struct {
     int      column;
 } BetlParameterDecl;
 
-typedef struct {
+typedef struct BetlStage BetlStage;
+
+struct BetlStage {
     char            *id;            /* required, unique within file */
     BetlStageKind    kind;
 
@@ -73,13 +77,42 @@ typedef struct {
     BetlDataflowStep *steps;
     size_t            step_count;
 
+    /* Set when kind == BETL_STAGE_FOREACH:
+     *   `over` is the iteration source (currently always a literal list
+     *   of strings; future enumerators will set foreach_kind),
+     *   `foreach_var` is the variable name the loop binds per iteration
+     *   (consumed by `${vars.<foreach_var>}` inside `children`),
+     *   `children` is the nested stage list to run once per `over`
+     *   element. */
+    char           **over;
+    size_t           over_count;
+    char            *foreach_var;
+    BetlStage       *children;
+    size_t           child_count;
+
     /* Stages this stage waits on (from `after:`). */
     char           **after;
     size_t           after_count;
 
+    /* Optional per-stage flow-control attributes. Both are NULL when
+     * unset on the source YAML.
+     *
+     *   `on_failure`: "stop" (default if unset) or "continue". When
+     *      "continue", a non-zero return from this stage is logged at
+     *      WARN and the executor proceeds to the next stage.
+     *   `condition`: a YAML scalar string. The executor passes it
+     *      through betl_substitute_refs (so `${params.X}` / `${vars.X}`
+     *      resolve) and treats truthy results as "run", falsy as
+     *      "skip with WARN". For v1 this is a string check; future
+     *      revisions may accept the full `{lang, expr}` shape from
+     *      the spec.
+     */
+    char            *on_failure;
+    char            *condition;
+
     int              line;          /* 1-based, of the stage's id */
     int              column;
-} BetlStage;
+};
 
 typedef struct BetlPipeline BetlPipeline;
 

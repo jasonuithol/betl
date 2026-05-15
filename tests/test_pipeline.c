@@ -295,7 +295,7 @@ int main(int argc, char **argv) {
         { "bad_dup_step_id.yml",     NULL,
                                      "duplicate step id 'read'"            },
         { "bad_after_unknown.yml",   NULL,
-                                     "undefined stage 'no_such_stage'"     },
+                                     "undefined sibling stage 'no_such_stage'" },
         { "bad_from_unknown.yml",    NULL,
                                      "undefined sibling 'no_such_step'"    },
         { "bad_stage_cycle.yml",     NULL, "cycle"                         },

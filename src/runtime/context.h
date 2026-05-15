@@ -44,6 +44,15 @@ int betl_context_set_param(BetlContext *ctx,
 int betl_context_set_connection(BetlContext *ctx,
                                 const char *name, const char *json);
 
+/* Iteration variables (mutable, mid-run). The executor pushes one on
+ * foreach entry, restores the prior binding on exit. `${vars.NAME}`
+ * substitution resolves through this kv-store. unset_var returns
+ * BETL_ERR_NOT_FOUND if the name isn't bound. */
+int         betl_context_set_var  (BetlContext *ctx,
+                                   const char *name, const char *value);
+int         betl_context_unset_var(BetlContext *ctx, const char *name);
+const char *betl_context_get_var  (BetlContext *ctx, const char *name);
+
 /* Stash a registry pointer so components reachable through this context
  * can find expression engines via betl_get_expr_engine. The runtime sets
  * this once at run start (see betl_run in exec.c). The context does not

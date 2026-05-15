@@ -67,25 +67,31 @@ static int topo_sort(int n, incoming_fn incoming, void *user, int *order) {
     return (produced == n) ? 0 : -1;
 }
 
-/* ---- Stage-level edges (from `after:`) -------------------------- */
+/* ---- Stage-level edges (from `after:`) --------------------------
+ *
+ * `after:` is scoped — references resolve to siblings in the same
+ * stage array (top-level or one foreach body). So the topo-sort
+ * operates on a flat slice; recursion into foreach bodies happens
+ * from the caller, not the sort. */
 
 typedef struct {
-    const BetlPipeline *p;
+    const BetlStage *arr;
+    size_t           n;
 } StageCtx;
 
-static int stage_index(const BetlPipeline *p, const char *id) {
-    for (size_t i = 0; i < betl_pipeline_stage_count(p); ++i) {
-        if (strcmp(betl_pipeline_stage(p, i)->id, id) == 0) return (int)i;
+static int stage_index_in(const BetlStage *arr, size_t n, const char *id) {
+    for (size_t i = 0; i < n; ++i) {
+        if (strcmp(arr[i].id, id) == 0) return (int)i;
     }
     return -1;
 }
 
 static void stage_incoming(int i, int *out, size_t *out_count, void *user) {
     const StageCtx *c = user;
-    const BetlStage *s = betl_pipeline_stage(c->p, (size_t)i);
+    const BetlStage *s = &c->arr[i];
     *out_count = 0;
     for (size_t k = 0; k < s->after_count; ++k) {
-        int idx = stage_index(c->p, s->after[k]);
+        int idx = stage_index_in(c->arr, c->n, s->after[k]);
         if (idx >= 0 && *out_count < 64) out[(*out_count)++] = idx;
     }
 }
@@ -471,6 +477,168 @@ cleanup:
  *  Top-level                                                       *
  * ============================================================== */
 
+/* Forward decl: foreach calls back into the generic runner. */
+static int run_stages(BetlContext *ctx, BetlRegistry *reg,
+                      const BetlStage *arr, size_t n);
+
+/* Evaluate a stage's `condition:` (NULL if absent). Returns 1 to run,
+ * 0 to skip, -1 on substitution / parse error (with betl_set_error). */
+static int eval_condition(BetlContext *ctx, const BetlStage *s) {
+    if (!s->condition) return 1;
+    char sub_err[256] = {0};
+    char *resolved = betl_substitute_refs(s->condition, ctx,
+                                          sub_err, sizeof sub_err);
+    if (!resolved) {
+        betl_set_error(ctx, "stage '%s': condition substitution failed: %s",
+                       s->id, sub_err);
+        return -1;
+    }
+    /* Trim leading / trailing ASCII whitespace so `condition: " true "`
+     * works under YAML's flow-style quoting. */
+    char *start = resolved;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')
+        ++start;
+    size_t L = strlen(start);
+    while (L > 0 && (start[L-1] == ' '  || start[L-1] == '\t' ||
+                     start[L-1] == '\n' || start[L-1] == '\r')) {
+        start[--L] = '\0';
+    }
+    int result;
+    if (*start == '\0'
+        || strcmp(start, "0")     == 0
+        || strcmp(start, "false") == 0
+        || strcmp(start, "FALSE") == 0
+        || strcmp(start, "False") == 0
+        || strcmp(start, "no")    == 0
+        || strcmp(start, "NO")    == 0) {
+        result = 0;
+    } else if (strcmp(start, "1")    == 0
+            || strcmp(start, "true") == 0
+            || strcmp(start, "TRUE") == 0
+            || strcmp(start, "True") == 0
+            || strcmp(start, "yes")  == 0
+            || strcmp(start, "YES")  == 0) {
+        result = 1;
+    } else {
+        betl_set_error(ctx,
+            "stage '%s': condition evaluates to non-boolean '%s' "
+            "(supported: true/false/yes/no/1/0)",
+            s->id, start);
+        result = -1;
+    }
+    free(resolved);
+    return result;
+}
+
+static int run_foreach_stage(BetlContext *ctx, BetlRegistry *reg,
+                             const BetlStage *s) {
+    /* Save and restore any prior binding of `as:` so a nested foreach
+     * with the same loop variable name doesn't permanently shadow it. */
+    const char *prior = betl_context_get_var(ctx, s->foreach_var);
+    char *saved = prior ? strdup(prior) : NULL;
+    if (prior && !saved) return BETL_ERR_INTERNAL;
+
+    int rc = BETL_OK;
+    for (size_t i = 0; i < s->over_count && rc == BETL_OK; ++i) {
+        if (betl_should_cancel(ctx)) {
+            betl_set_error(ctx, "cancelled inside foreach '%s' at iter %zu",
+                           s->id, i);
+            rc = BETL_ERR_CANCELLED;
+            break;
+        }
+        int sr = betl_context_set_var(ctx, s->foreach_var, s->over[i]);
+        if (sr != BETL_OK) {
+            betl_set_error(ctx,
+                "foreach '%s': failed to bind iteration variable", s->id);
+            rc = sr;
+            break;
+        }
+        betl_log(ctx, BETL_LOG_INFO,
+                 "foreach %s iter %zu/%zu: %s=\"%s\"",
+                 s->id, i + 1, s->over_count, s->foreach_var, s->over[i]);
+        rc = run_stages(ctx, reg, s->children, s->child_count);
+    }
+
+    if (saved) {
+        betl_context_set_var(ctx, s->foreach_var, saved);
+        free(saved);
+    } else {
+        betl_context_unset_var(ctx, s->foreach_var);
+    }
+    return rc;
+}
+
+static int run_stages(BetlContext *ctx, BetlRegistry *reg,
+                      const BetlStage *arr, size_t n) {
+    if (n == 0) return BETL_OK;
+
+    int *order = malloc(n * sizeof *order);
+    if (!order) return BETL_ERR_INTERNAL;
+    StageCtx sc = { .arr = arr, .n = n };
+    if (topo_sort((int)n, stage_incoming, &sc, order) != 0) {
+        free(order);
+        betl_set_error(ctx, "stage `after:` cycle (parser should have caught)");
+        return BETL_ERR_INVALID;
+    }
+
+    int rc = BETL_OK;
+    for (size_t oi = 0; oi < n && rc == BETL_OK; ++oi) {
+        const BetlStage *s = &arr[order[oi]];
+
+        if (betl_should_cancel(ctx)) {
+            betl_set_error(ctx, "cancelled before stage '%s'", s->id);
+            rc = BETL_ERR_CANCELLED;
+            break;
+        }
+
+        int gate = eval_condition(ctx, s);
+        if (gate < 0) {
+            rc = BETL_ERR_INVALID;
+            break;
+        }
+        if (gate == 0) {
+            betl_log(ctx, BETL_LOG_INFO,
+                     "stage skip: %s (condition is falsy)", s->id);
+            continue;
+        }
+
+        const char *kind_label =
+            (s->kind == BETL_STAGE_DATAFLOW) ? "dataflow" :
+            (s->kind == BETL_STAGE_FOREACH)  ? "foreach"  : "task";
+        betl_log(ctx, BETL_LOG_INFO, "stage start: %s (%s)",
+                 s->id, kind_label);
+
+        int srcrc;
+        if (s->kind == BETL_STAGE_TASK) {
+            srcrc = run_task_stage(ctx, reg, s);
+        } else if (s->kind == BETL_STAGE_FOREACH) {
+            srcrc = run_foreach_stage(ctx, reg, s);
+        } else {
+            srcrc = run_dataflow_stage(ctx, reg, s);
+        }
+
+        betl_log(ctx,
+            (srcrc == BETL_OK) ? BETL_LOG_INFO : BETL_LOG_ERROR,
+            "stage end: %s rc=%d", s->id, srcrc);
+
+        if (srcrc == BETL_OK) continue;
+
+        /* Honor on_failure:continue (only for non-cancellation failures
+         * — Ctrl-C / host cancel always halts). */
+        if (srcrc != BETL_ERR_CANCELLED
+            && s->on_failure
+            && strcmp(s->on_failure, "continue") == 0) {
+            betl_log(ctx, BETL_LOG_WARN,
+                     "stage '%s' failed (rc=%d) but on_failure=continue: %s",
+                     s->id, srcrc, betl_context_last_error(ctx));
+            continue;
+        }
+        rc = srcrc;
+    }
+    free(order);
+    return rc;
+}
+
 int betl_run(BetlContext *ctx, BetlRegistry *reg, const BetlPipeline *p) {
     if (!ctx || !reg || !p) return BETL_ERR_INVALID;
 
@@ -479,38 +647,7 @@ int betl_run(BetlContext *ctx, BetlRegistry *reg, const BetlPipeline *p) {
      * find an expression engine by lang. */
     betl_context_set_registry(ctx, reg);
 
-    int n = (int)betl_pipeline_stage_count(p);
+    size_t n = betl_pipeline_stage_count(p);
     if (n == 0) return BETL_OK;
-
-    int *order = malloc((size_t)n * sizeof *order);
-    if (!order) return BETL_ERR_INTERNAL;
-    StageCtx sc = { .p = p };
-    if (topo_sort(n, stage_incoming, &sc, order) != 0) {
-        free(order);
-        betl_set_error(ctx, "stage `after:` cycle (parser should have caught)");
-        return BETL_ERR_INVALID;
-    }
-
-    int rc = BETL_OK;
-    for (int oi = 0; oi < n && rc == BETL_OK; ++oi) {
-        const BetlStage *s = betl_pipeline_stage(p, (size_t)order[oi]);
-        if (betl_should_cancel(ctx)) {
-            betl_set_error(ctx, "cancelled before stage '%s'", s->id);
-            rc = BETL_ERR_CANCELLED;
-            break;
-        }
-        betl_log(ctx, BETL_LOG_INFO, "stage start: %s (%s)",
-                 s->id,
-                 s->kind == BETL_STAGE_DATAFLOW ? "dataflow" : "task");
-        if (s->kind == BETL_STAGE_TASK) {
-            rc = run_task_stage(ctx, reg, s);
-        } else {
-            rc = run_dataflow_stage(ctx, reg, s);
-        }
-        betl_log(ctx,
-            (rc == BETL_OK) ? BETL_LOG_INFO : BETL_LOG_ERROR,
-            "stage end: %s rc=%d", s->id, rc);
-    }
-    free(order);
-    return rc;
+    return run_stages(ctx, reg, betl_pipeline_stage(p, 0), n);
 }

@@ -452,6 +452,14 @@ set_tests_properties(file_ops PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: file_ops integration test passed"
 )
 
+# --- Control-flow features (foreach + on_failure + condition) ------------
+add_executable(test_control_flow test_control_flow.c)
+target_link_libraries(test_control_flow PRIVATE betl_core)
+add_test(NAME control_flow COMMAND test_control_flow)
+set_tests_properties(control_flow PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: control_flow integration test passed"
+)
+
 # --- xlsx.write end-to-end test (libxlsxwriter required) -------------------
 if(XLSXWRITER_FOUND)
     add_executable(test_xlsx_write test_xlsx_write.c)

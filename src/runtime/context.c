@@ -28,6 +28,13 @@ struct BetlContext {
     size_t        connections_count;
     size_t        connections_cap;
 
+    /* Loop-iteration variables for `${vars.NAME}` substitution. Pushed
+     * on foreach entry, restored on exit. Unlike params/connections,
+     * this kv-store is mutated mid-run as stages enter/leave scopes. */
+    KvPair       *vars;
+    size_t        vars_count;
+    size_t        vars_cap;
+
     /* Borrowed pointer; set by the runtime so transforms can resolve
      * expression engines via betl_get_expr_engine. NULL during isolated
      * unit tests that don't bring a registry — those tests must not
@@ -103,6 +110,21 @@ static const char *kv_lookup(const KvPair *arr, size_t count, const char *k) {
     return NULL;
 }
 
+static int kv_unset(KvPair *arr, size_t *count, const char *k) {
+    for (size_t i = 0; i < *count; ++i) {
+        if (strcmp(arr[i].key, k) == 0) {
+            free(arr[i].key);
+            free(arr[i].value);
+            /* Shift the tail down; the array stays packed so kv_lookup
+             * remains O(n) without holes. */
+            for (size_t j = i + 1; j < *count; ++j) arr[j - 1] = arr[j];
+            (*count)--;
+            return BETL_OK;
+        }
+    }
+    return BETL_ERR_NOT_FOUND;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API                                                         */
 /* ------------------------------------------------------------------ */
@@ -120,6 +142,7 @@ void betl_context_destroy(BetlContext *ctx) {
     free(ctx->log_tag);
     kv_free(ctx->params,      ctx->params_count);
     kv_free(ctx->connections, ctx->connections_count);
+    kv_free(ctx->vars,         ctx->vars_count);
     free(ctx);
 }
 
@@ -209,6 +232,21 @@ const char *betl_get_param(BetlContext *ctx, const char *path) {
 const char *betl_get_connection(BetlContext *ctx, const char *name) {
     if (!ctx || !name) return NULL;
     return kv_lookup(ctx->connections, ctx->connections_count, name);
+}
+
+int betl_context_set_var(BetlContext *ctx, const char *name, const char *value) {
+    if (!ctx || !name || !value) return BETL_ERR_INVALID;
+    return kv_set(&ctx->vars, &ctx->vars_count, &ctx->vars_cap, name, value);
+}
+
+int betl_context_unset_var(BetlContext *ctx, const char *name) {
+    if (!ctx || !name) return BETL_ERR_INVALID;
+    return kv_unset(ctx->vars, &ctx->vars_count, name);
+}
+
+const char *betl_context_get_var(BetlContext *ctx, const char *name) {
+    if (!ctx || !name) return NULL;
+    return kv_lookup(ctx->vars, ctx->vars_count, name);
 }
 
 const struct BetlExprEngine *betl_get_expr_engine(BetlContext *ctx,

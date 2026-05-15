@@ -1,4 +1,5 @@
 #include "runtime/substitute.h"
+#include "runtime/context.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,6 +157,34 @@ char *betl_substitute_refs(const char *src,
             if (!val) {
                 if (err_buf) snprintf(err_buf, err_cap,
                     "${params.%s}: parameter is not set", name);
+                free(b.data);
+                return NULL;
+            }
+            if (put_lit(&b, val, strlen(val)) != 0) goto oom;
+            p += consumed;
+            continue;
+        }
+
+        /* vars.X (loop-iteration variable) */
+        consumed = try_match(p, "vars", name, sizeof name,
+                             inner_err, sizeof inner_err);
+        if (consumed < 0) {
+            if (err_buf) snprintf(err_buf, err_cap, "%s", inner_err);
+            free(b.data);
+            return NULL;
+        }
+        if (consumed > 0) {
+            if (!ctx) {
+                if (err_buf) snprintf(err_buf, err_cap,
+                    "${vars.%s}: no context available", name);
+                free(b.data);
+                return NULL;
+            }
+            const char *val = betl_context_get_var(ctx, name);
+            if (!val) {
+                if (err_buf) snprintf(err_buf, err_cap,
+                    "${vars.%s}: variable is not bound (outside its "
+                    "`foreach` scope?)", name);
                 free(b.data);
                 return NULL;
             }

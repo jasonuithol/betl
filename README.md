@@ -170,6 +170,9 @@ Server.
 | TASK | `sql.execute` | ✓ | Run a single SQL statement against a declared connection; dispatches by `type:` (postgres / mssql). SSIS Execute SQL Task at the control-flow layer |
 | TASK | `shell` | ✓ | fork+execvp with a literal `argv:` (no shell expansion); optional `timeout: <n>s` / `<n>m`; non-zero exit fails the task. SSIS Execute Process Task |
 | TASK | `file.copy` / `file.move` / `file.delete` | ✓ | POSIX file ops; `src:`/`dst:` (copy/move) or `path:` (delete); cross-device move falls back to copy+unlink. SSIS File System Task |
+| CONTROL | `foreach` | ✓ | Iterates `body:` (nested stages) once per element of `over:` (literal list of strings). Binds `${vars.<as>}` per iteration. SSIS Foreach Loop Container — From-Variable enumerator |
+| CONTROL | `on_failure: continue` | ✓ | Per-stage attribute; a non-zero return is logged at WARN and the executor proceeds. SSIS Failure/Completion precedence constraints |
+| CONTROL | `condition: "<scalar>"` | ✓ | Per-stage attribute; after `${...}` substitution, truthy values run, falsy values skip with a WARN. v1 accepts true/false/yes/no/1/0; `{lang, expr}` form deferred |
 | TOOL | `betl-dtsx2yaml` | ✓ | DTSX → betl YAML converter; ships in `tools/`, runs separately from `betl run` |
 | ENGINE | `literal` | ✓ | Constant expressions (built-in) |
 | ENGINE | `lua` | ✓ | Lua 5.4 (provider plugin) |
