@@ -37,3 +37,5 @@ __pycache__/
 # Project-local dependency installs (libpq / libyaml / dotnet SDK /
 # etc.). Populated by scripts/install-*.sh, not under source control.
 deps/
+
+.source-material/

@@ -14,6 +14,12 @@ public sealed class DtsxPackage
     public string Name { get; set; } = "package";
     public List<DtsxConnection>  Connections    { get; } = new();
     public List<DtsxVariable>    Variables      { get; } = new();
+    /* Project- or package-scope parameters. SSIS Project Deployment
+     * Model packages reference these as @[$Project::X] / @[$Package::X],
+     * with definitions either in Project.params (project-level) or in
+     * the .dtsx itself (package-level). DataType here is System.TypeCode
+     * (NOT VARENUM — that's only DtsxVariable.DataType). */
+    public List<DtsxParameter>   Parameters     { get; } = new();
     public List<DtsxExecutable>  Executables    { get; } = new();
     /* Top-level precedence constraints — edges between direct
      * children of the package. Constraints scoped to a Sequence /
@@ -36,10 +42,25 @@ public sealed class DtsxVariable
 {
     public string Namespace   { get; set; } = "User";
     public string Name        { get; set; } = "";
-    /* DTSX data-type code; see DtsxParser for the SSIS → betl type
-     * mapping. */
+    /* VARENUM (VT_*) code from a <DTS:VariableValue DataType="...">.
+     * See Converter.MapVariableType. */
     public int    DataType    { get; set; }
     public string ValueRaw    { get; set; } = "";
+}
+
+/* SSIS Project/Package parameter as found in Project.params or in an
+ * <SSIS:Parameter> block inside a .dtsx. Distinct from DtsxVariable:
+ *  - parameters are project-deployment-model artefacts referenced as
+ *    @[$Project::X] or @[$Package::X];
+ *  - their DataType uses System.TypeCode (18=String), NOT VARENUM. */
+public sealed class DtsxParameter
+{
+    public string Scope       { get; set; } = "Project"; /* "Project" or "Package" */
+    public string Name        { get; set; } = "";
+    public string Description { get; set; } = "";
+    public int    DataType    { get; set; }              /* System.TypeCode */
+    public string ValueRaw    { get; set; } = "";
+    public bool   Sensitive   { get; set; }
 }
 
 public sealed class DtsxExecutable
@@ -61,6 +82,15 @@ public sealed class DtsxExecutable
      * task-specific mappers can dig in for sql / script source / etc. */
     public XElement?           ObjectData { get; set; }
 
+    /* SSIS <DTS:PropertyExpression DTS:Name="X">expr</...>: a sibling
+     * of <DTS:ObjectData> that overrides task property X with an SSIS
+     * expression evaluated at runtime. Common pattern: parameterise
+     * SqlStatementSource with @[$Project::Server] etc. The static
+     * value stored elsewhere is the design-time fallback; the dynamic
+     * expression wins at runtime. Mappers should prefer the entry in
+     * this dictionary when present. */
+    public Dictionary<string,string> PropertyExpressions { get; } = new();
+
     /* Container support: a Sequence / ForEachLoop / ForLoop nests
      * child executables under <DTS:Executables>. Empty for leaf tasks. */
     public List<DtsxExecutable> Children    { get; } = new();
@@ -78,10 +108,21 @@ public sealed class DtsxExecutable
     public string? ForLoopEval   { get; set; }
     public string? ForLoopAssign { get; set; }
 
+    /* SSIS containers come in two naming flavours depending on the
+     * SSIS version that wrote the package — newer SSDT emits the
+     * "Microsoft.<Type>" names while older / direct-typed exports use
+     * "STOCK:<TYPE>". We accept both. */
     public bool IsContainer =>
-        Kind == "Microsoft.Sequence" ||
-        Kind == "Microsoft.ForEachLoop" ||
-        Kind == "Microsoft.ForLoop";
+        Kind == "Microsoft.Sequence"   || Kind == "STOCK:SEQUENCE" ||
+        Kind == "Microsoft.ForEachLoop"|| Kind == "STOCK:FOREACHLOOP" ||
+        Kind == "Microsoft.ForLoop"    || Kind == "STOCK:FORLOOP";
+
+    public bool IsSequence    =>
+        Kind == "Microsoft.Sequence" || Kind == "STOCK:SEQUENCE";
+    public bool IsForEachLoop =>
+        Kind == "Microsoft.ForEachLoop" || Kind == "STOCK:FOREACHLOOP";
+    public bool IsForLoop     =>
+        Kind == "Microsoft.ForLoop" || Kind == "STOCK:FORLOOP";
 }
 
 /* An SSIS precedence constraint — directed edge between two

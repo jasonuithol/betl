@@ -13,6 +13,8 @@ public static class DtsxParser
 {
     public static readonly XNamespace DtsNs =
         "www.microsoft.com/SqlServer/Dts";
+    public static readonly XNamespace SsisNs =
+        "www.microsoft.com/SqlServer/SSIS";
 
     public static DtsxPackage LoadFile(string path)
     {
@@ -28,6 +30,29 @@ public static class DtsxParser
         if (doc.Root == null)
             throw new InvalidDataException("empty document");
         return ParseRoot(doc.Root);
+    }
+
+    /* Standalone .conmgr file: a top-level <DTS:ConnectionManager> with
+     * the same shape as an embedded package <ConnectionManager>. Real
+     * SSIS Project Deployment Model packages reference connection
+     * managers stored in separate .conmgr files at the project root.
+     * Components reference them by name via
+     *   connectionManagerRefId="Project.ConnectionManagers[<name>]"
+     * which already matches what ConnectionLookup parses. */
+    public static DtsxConnection LoadConmgrFile(string path)
+    {
+        var doc = XDocument.Load(path);
+        if (doc.Root == null)
+            throw new InvalidDataException("conmgr file has no root element");
+        return ParseConnection(doc.Root);
+    }
+
+    /* Project.params (or any <SSIS:Parameters> document). */
+    public static List<DtsxParameter> LoadParamsFile(string path)
+    {
+        var doc = XDocument.Load(path);
+        if (doc.Root == null) return new List<DtsxParameter>();
+        return ParseSsisParameters(doc.Root, scopeLabel: "Project");
     }
 
     static DtsxPackage ParseRoot(XElement root)
@@ -51,6 +76,11 @@ public static class DtsxParser
                 pkg.Variables.Add(ParseVariable(v));
         }
 
+        /* Package-scope parameters: <SSIS:Parameter> can live as a
+         * descendant of the package root in Project Deployment Model
+         * packages. The element uses the SSIS:* namespace, not DTS:*. */
+        pkg.Parameters.AddRange(ParseSsisParameters(root, scopeLabel: "Package"));
+
         string pkgRefId = (string?)root.Attribute(DtsNs + "refId") ?? "Package";
         var execs = root.Element(DtsNs + "Executables");
         if (execs != null)
@@ -63,6 +93,57 @@ public static class DtsxParser
          * appear inside containers. */
         pkg.RootPrecedence.AddRange(ParsePrecedences(root));
         return pkg;
+    }
+
+    /* <SSIS:Parameters> / <SSIS:Parameter> blocks. Used in both
+     * Project.params (root is <SSIS:Parameters>) and embedded in a
+     * .dtsx (root is the package; we walk descendants). Each parameter
+     * has a flat <SSIS:Properties> bag — we pull the four fields that
+     * matter for conversion. DataType here is System.TypeCode
+     * (18=String, 11=Int64, etc.) — distinct from the VARENUM used on
+     * <DTS:Variable> values. */
+    static List<DtsxParameter> ParseSsisParameters(XElement scope, string scopeLabel)
+    {
+        var list = new List<DtsxParameter>();
+        var paramEls = scope.Name.LocalName == "Parameters"
+            ? scope.Elements(SsisNs + "Parameter")
+            : scope.Descendants(SsisNs + "Parameter");
+        foreach (var p in paramEls)
+        {
+            var name = (string?)p.Attribute(SsisNs + "Name") ?? "";
+            if (string.IsNullOrEmpty(name)) continue;
+            string desc = "", value = "";
+            int dt = 0;
+            bool sensitive = false;
+            var props = p.Element(SsisNs + "Properties");
+            if (props != null)
+            {
+                foreach (var prop in props.Elements(SsisNs + "Property"))
+                {
+                    var pn = (string?)prop.Attribute(SsisNs + "Name") ?? "";
+                    switch (pn)
+                    {
+                        case "Description": desc  = prop.Value; break;
+                        case "Value":       value = prop.Value; break;
+                        case "DataType":    int.TryParse(prop.Value, out dt); break;
+                        case "Sensitive":   sensitive = prop.Value == "1"
+                                                || prop.Value.Equals("True",
+                                                    System.StringComparison.OrdinalIgnoreCase);
+                                            break;
+                    }
+                }
+            }
+            list.Add(new DtsxParameter
+            {
+                Scope = scopeLabel,
+                Name = name,
+                Description = desc,
+                DataType = dt,
+                ValueRaw = value,
+                Sensitive = sensitive,
+            });
+        }
+        return list;
     }
 
     static List<DtsxPrecedence> ParsePrecedences(XElement container)
@@ -143,6 +224,17 @@ public static class DtsxParser
             RefId      = refId,
             ObjectData = e.Element(DtsNs + "ObjectData"),
         };
+
+        /* <DTS:PropertyExpression DTS:Name="X">expr</...> — runtime
+         * overrides for individual task properties. They sit at the same
+         * level as <DTS:ObjectData>. Mappers consult this dictionary
+         * before falling back to the static property value. */
+        foreach (var px in e.Elements(DtsNs + "PropertyExpression"))
+        {
+            var pname = (string?)px.Attribute(DtsNs + "Name");
+            if (!string.IsNullOrEmpty(pname))
+                exe.PropertyExpressions[pname!] = px.Value;
+        }
         if (exe.Kind == "Microsoft.Pipeline")
         {
             /* <ObjectData><pipeline xmlns=""><components/>...<paths/></pipeline></ObjectData>
@@ -182,7 +274,7 @@ public static class DtsxParser
 
         /* Foreach Loop has <DTS:ForEachEnumerator> and
          * <DTS:ForEachVariableMappings> at the executable level. */
-        if (exe.Kind == "Microsoft.ForEachLoop")
+        if (exe.IsForEachLoop)
         {
             var fe = e.Element(DtsNs + "ForEachEnumerator");
             var feObj = fe?.Element(DtsNs + "ObjectData");
@@ -207,7 +299,7 @@ public static class DtsxParser
 
         /* For Loop carries init / eval / assign as attributes in a
          * sibling namespace (DTS:ForLoop). We localName-match. */
-        if (exe.Kind == "Microsoft.ForLoop")
+        if (exe.IsForLoop)
         {
             foreach (var a in e.Attributes())
             {

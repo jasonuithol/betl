@@ -45,7 +45,10 @@
     <DTS:Variable
         DTS:ObjectName="BatchTag"
         DTS:Namespace="User">
-      <DTS:VariableValue DTS:DataType="18">nightly</DTS:VariableValue>
+      <!-- DataType="8" is VARENUM VT_BSTR (string). SSIS uses VARENUM,
+           NOT System.TypeCode, on this attribute — see Converter.cs
+           MapVariableType. -->
+      <DTS:VariableValue DTS:DataType="8">nightly</DTS:VariableValue>
     </DTS:Variable>
   </DTS:Variables>
 

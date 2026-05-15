@@ -60,15 +60,39 @@ public static class Converter
 
     static void EmitParameters(YamlWriter w, DtsxPackage pkg)
     {
-        if (pkg.Variables.Count == 0) return;
-        var user = pkg.Variables.Where(v => v.Namespace == "User").ToList();
-        if (user.Count == 0) return;
+        /* Two sources of parameters with two different DataType enums:
+         *   <DTS:Variable>      → VARENUM (VT_*) → MapVariableType
+         *   <SSIS:Parameter>    → System.TypeCode → MapParameterType
+         * Both emit into the same `parameters:` block (betl doesn't
+         * distinguish scope).  We dedupe by id so a Variable and a
+         * Parameter with the same name only emit once (Parameter wins,
+         * since project params override package-level vars at runtime
+         * in SSIS). */
+        var userVars = pkg.Variables.Where(v => v.Namespace == "User").ToList();
+        if (userVars.Count == 0 && pkg.Parameters.Count == 0) return;
         w.Line();
         w.Line("parameters:");
         w.Indent(2);
-        foreach (var v in user)
+        var seen = new HashSet<string>();
+        foreach (var p in pkg.Parameters)
         {
-            w.Line(YamlWriter.Id(v.Name) + ":");
+            string id = YamlWriter.Id(p.Name);
+            if (!seen.Add(id)) continue;
+            w.Line(id + ":");
+            w.Indent(2);
+            w.Line("type: " + MapParameterType(p.DataType));
+            if (!string.IsNullOrEmpty(p.ValueRaw))
+                w.Line("default: " + YamlWriter.Quote(p.ValueRaw));
+            if (!string.IsNullOrEmpty(p.Description))
+                w.Comment(p.Description);
+            if (p.Sensitive) w.Comment("sensitive: true — store outside source control");
+            w.Indent(-2);
+        }
+        foreach (var v in userVars)
+        {
+            string id = YamlWriter.Id(v.Name);
+            if (!seen.Add(id)) continue;
+            w.Line(id + ":");
             w.Indent(2);
             w.Line("type: " + MapVariableType(v.DataType));
             if (!string.IsNullOrEmpty(v.ValueRaw))
@@ -80,19 +104,63 @@ public static class Converter
 
     static string MapVariableType(int dtsType)
     {
-        /* https://learn.microsoft.com/en-us/dotnet/api/system.typecode
-         * SSIS' DataType attribute on Variable values uses .NET TypeCode
-         * enum values. */
+        /* SSIS' DataType attribute on a Variable's value is a VARENUM
+         * (Win32 VT_* / OLE-Automation Variant) code, NOT a .NET
+         * System.TypeCode. Empirically verified against dtexec 16.0
+         * on Linux: a Variable with DataType="8" + value "hello"
+         * loads as a String, while DataType="18" + "hello" fails
+         * to load (18 is VT_UI2, expects an unsigned-int parse). */
         return dtsType switch
         {
-            3                                  => "bool",    /* Boolean */
-            5 or 6 or 7 or 8 or 9 or 10
-              or 11 or 12                      => "int",     /* SByte..UInt64 */
-            13 or 14 or 15                     => "decimal", /* Single, Double, Decimal */
-            16                                 => "date",    /* DateTime */
-            18                                 => "string",  /* String */
+            2  or 3                            => "int",     /* VT_I2, VT_I4 */
+            4  or 5  or 6  or 14               => "decimal", /* VT_R4, VT_R8, VT_CY, VT_DECIMAL */
+            7                                  => "date",    /* VT_DATE */
+            8                                  => "string",  /* VT_BSTR */
+            11                                 => "bool",    /* VT_BOOL */
+            16 or 17 or 18 or 19 or 20 or 21
+              or 22 or 23                      => "int",     /* VT_I1..VT_UINT */
             _                                  => "string",
         };
+    }
+
+    /* <SSIS:Parameter>'s DataType property uses System.TypeCode (the
+     * .NET enum), NOT VARENUM. Real Project.params files emit
+     * DataType=18 for strings, which would be UInt16 in VARENUM but is
+     * String in TypeCode. Keep the two mappings cleanly separate. */
+    public static string MapParameterType(int typeCode)
+    {
+        return typeCode switch
+        {
+            3                       => "bool",    /* Boolean */
+            5 or 6 or 7 or 8 or 9
+              or 10 or 11 or 12     => "int",     /* SByte..UInt64 */
+            13 or 14 or 15          => "decimal", /* Single, Double, Decimal */
+            16                      => "date",    /* DateTime */
+            18                      => "string",  /* String */
+            _                       => "string",
+        };
+    }
+
+    /* Translate an SSIS expression embedded in a property — typically
+     * a runtime SqlStatementSource — into the same string with
+     * @[$Project::X] / @[$User::X] references rewritten as betl
+     * ${params.x} substitutions. Other SSIS expression syntax
+     * (concatenation with `+`, casts like `(DT_STR, 50, 1252)`) is
+     * left alone for the operator to clean up; the substitution alone
+     * gets the parameterisation working in betl. */
+    public static string TranslateSsisExpression(string ssisExpr)
+    {
+        if (string.IsNullOrEmpty(ssisExpr)) return ssisExpr;
+        /* @[$Project::Name]  /  @[$Package::Name]  /  @[$User::Name]
+         * /  @[$System::Name]   →   ${params.name}.
+         * System:: refs (PackageName, MachineName, etc.) have no
+         * parameter equivalent — translate them to ${params.X} so the
+         * substitution is visible, but mark them with a TODO at the
+         * call-site if you want to be picky. */
+        var re = new System.Text.RegularExpressions.Regex(
+            @"@\[\$(Project|Package|User|System)::([A-Za-z_][A-Za-z0-9_]*)\]");
+        return re.Replace(ssisExpr, m =>
+            "${params." + YamlWriter.Id(m.Groups[2].Value) + "}");
     }
 
     /* ============================================================== *
@@ -342,12 +410,12 @@ public static class Converter
      * doesn't survive the flatten. */
     static void EmitContainerHeader(YamlWriter w, DtsxExecutable exe)
     {
-        if (exe.Kind == "Microsoft.Sequence")
+        if (exe.IsSequence)
         {
             w.Comment($"── sequence: {exe.Name} (children flattened) ──");
             return;
         }
-        if (exe.Kind == "Microsoft.ForEachLoop")
+        if (exe.IsForEachLoop)
         {
             w.Comment($"── ForEach Loop: {exe.Name} ─────────────────────────────");
             w.Comment("TODO: SSIS Foreach Loop has no betl equivalent yet.");
@@ -362,7 +430,7 @@ public static class Converter
             w.Comment("        - rewrite the body as a SQL set-based query.");
             return;
         }
-        if (exe.Kind == "Microsoft.ForLoop")
+        if (exe.IsForLoop)
         {
             w.Comment($"── For Loop: {exe.Name} ─────────────────────────────────");
             w.Comment("TODO: SSIS For Loop has no betl equivalent yet.");
@@ -486,6 +554,9 @@ public static class Converter
                     break;
                 case "Microsoft.OLEDBDestination":
                     Mappers.OledbDestination.Emit(w, pkg, c, fromId);
+                    break;
+                case "Microsoft.SQLServerDestination":
+                    Mappers.SqlServerDestination.Emit(w, pkg, c, fromId);
                     break;
                 case "Microsoft.FlatFileSource":
                     Mappers.FlatFileSource.Emit(w, pkg, c);

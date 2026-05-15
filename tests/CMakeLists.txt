@@ -397,6 +397,8 @@ if(BETL_DTSX2YAML_FOUND)
         BETL_DTSX2YAML_CONTROLFLOW_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/controlflow.dtsx"
         BETL_DTSX2YAML_TASKS_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/tasks.dtsx"
         BETL_DTSX2YAML_TRANSFORMS2_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/transforms2.dtsx"
+        BETL_DTSX2YAML_KITCHENSINK_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/kitchen-sink.dtsx"
+        BETL_DTSX2YAML_PROJECT_FIXTURE="${CMAKE_SOURCE_DIR}/tools/betl-dtsx2yaml/fixtures/projectsample/ProjectSample.dtsx"
     )
     add_dependencies(test_dtsx2yaml dtsx2yaml)
     add_test(NAME dtsx2yaml COMMAND test_dtsx2yaml)

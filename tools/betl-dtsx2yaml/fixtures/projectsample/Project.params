@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<SSIS:Parameters xmlns:SSIS="www.microsoft.com/SqlServer/SSIS">
+  <SSIS:Parameter SSIS:Name="BatchTag">
+    <SSIS:Properties>
+      <SSIS:Property SSIS:Name="ID">{be6ccb60-a6bb-4998-b992-7700ac3e4d02}</SSIS:Property>
+      <SSIS:Property SSIS:Name="CreationName"></SSIS:Property>
+      <SSIS:Property SSIS:Name="Description">Run tag for the nightly batch</SSIS:Property>
+      <SSIS:Property SSIS:Name="IncludeInDebugDump">0</SSIS:Property>
+      <SSIS:Property SSIS:Name="Required">1</SSIS:Property>
+      <SSIS:Property SSIS:Name="Sensitive">0</SSIS:Property>
+      <SSIS:Property SSIS:Name="Value">nightly</SSIS:Property>
+      <SSIS:Property SSIS:Name="DataType">18</SSIS:Property>
+    </SSIS:Properties>
+  </SSIS:Parameter>
+  <SSIS:Parameter SSIS:Name="RowLimit">
+    <SSIS:Properties>
+      <SSIS:Property SSIS:Name="ID">{3a66b3ec-dc02-4832-a3b3-8d543fdc1da9}</SSIS:Property>
+      <SSIS:Property SSIS:Name="CreationName"></SSIS:Property>
+      <SSIS:Property SSIS:Name="Description">Max rows to load per run</SSIS:Property>
+      <SSIS:Property SSIS:Name="IncludeInDebugDump">0</SSIS:Property>
+      <SSIS:Property SSIS:Name="Required">1</SSIS:Property>
+      <SSIS:Property SSIS:Name="Sensitive">0</SSIS:Property>
+      <SSIS:Property SSIS:Name="Value">10000</SSIS:Property>
+      <SSIS:Property SSIS:Name="DataType">9</SSIS:Property>
+    </SSIS:Properties>
+  </SSIS:Parameter>
+</SSIS:Parameters>

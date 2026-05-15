@@ -41,11 +41,13 @@
     DTS:ExecutableType="Microsoft.Package">
 
   <DTS:Variables>
+    <!-- DataType values are VARENUM (VT_*) codes, not System.TypeCode.
+         11 = VT_BOOL, 8 = VT_BSTR. See Converter.cs MapVariableType. -->
     <DTS:Variable DTS:ObjectName="SkipLoop" DTS:Namespace="User">
-      <DTS:VariableValue DTS:DataType="3">False</DTS:VariableValue>
+      <DTS:VariableValue DTS:DataType="11">False</DTS:VariableValue>
     </DTS:Variable>
     <DTS:Variable DTS:ObjectName="CurrentFile" DTS:Namespace="User">
-      <DTS:VariableValue DTS:DataType="18"></DTS:VariableValue>
+      <DTS:VariableValue DTS:DataType="8"></DTS:VariableValue>
     </DTS:Variable>
   </DTS:Variables>
 

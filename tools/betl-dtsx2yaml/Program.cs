@@ -5,7 +5,14 @@
  *
  * Default output is stdout. Unsupported DTSX components emit a
  * "TODO: manual migration required" comment in-place so the operator
- * can spot them without parsing the whole stderr. */
+ * can spot them without parsing the whole stderr.
+ *
+ * Project Deployment Model: SSDT lays out a project as a directory
+ * containing the .dtsx alongside sibling .conmgr files (one per
+ * project-level connection) and a Project.params file. The .dtsx
+ * references these by name. When given a .dtsx, we auto-scan its
+ * parent directory for these siblings and merge them into the package
+ * model so the operator doesn't need a separate flag. */
 
 using System;
 using System.IO;
@@ -52,7 +59,8 @@ public static class Program
 
         try
         {
-            var pkg  = DtsxParser.LoadFile(input);
+            var pkg = DtsxParser.LoadFile(input);
+            MergeProjectSiblings(pkg, input);
             var yaml = Converter.PackageToYaml(pkg, verbose);
             if (output != null) File.WriteAllText(output, yaml);
             else Console.Out.Write(yaml);
@@ -73,5 +81,42 @@ public static class Program
             "\n" +
             "Converts an SSIS DTSX package to betl YAML. Unsupported\n" +
             "components emit a 'TODO: manual migration' comment in-place.");
+    }
+
+    /* Auto-discover project-level siblings sitting next to the .dtsx:
+     *   *.conmgr      → DtsxConnection appended to pkg.Connections
+     *   Project.params → DtsxParameter list appended to pkg.Parameters
+     * No-op when the input is a standalone .dtsx with no siblings —
+     * existing single-file conversions are unaffected. */
+    static void MergeProjectSiblings(DtsxPackage pkg, string inputPath)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(inputPath));
+        if (dir == null || !Directory.Exists(dir)) return;
+        foreach (var conmgr in Directory.EnumerateFiles(dir, "*.conmgr"))
+        {
+            try
+            {
+                var conn = DtsxParser.LoadConmgrFile(conmgr);
+                if (!string.IsNullOrEmpty(conn.Name))
+                    pkg.Connections.Add(conn);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"betl-dtsx2yaml: ignoring {Path.GetFileName(conmgr)}: {ex.Message}");
+            }
+        }
+        foreach (var paramsFile in Directory.EnumerateFiles(dir, "Project.params"))
+        {
+            try
+            {
+                pkg.Parameters.AddRange(DtsxParser.LoadParamsFile(paramsFile));
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"betl-dtsx2yaml: ignoring {Path.GetFileName(paramsFile)}: {ex.Message}");
+            }
+        }
     }
 }

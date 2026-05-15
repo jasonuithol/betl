@@ -485,6 +485,135 @@ int main(void) {
 
     free(yaml);
 
+    /* --- kitchen-sink.dtsx: real-format fixture (dtexec /Validate ✓) ----
+     * The other fixtures above are deliberately minimal — they strip
+     * DTSX to the attribute subset the converter actually reads.
+     * kitchen-sink.dtsx is the opposite: it's a full-fidelity package
+     * that validates clean against the SQL Server 2022 dtexec on Linux
+     * (via mcp-ssis). Its job is to catch regressions where the
+     * converter quietly stops handling the shape of XML that real SSDT
+     * actually emits. Notably it pins the VARENUM (VT_*) DataType
+     * encoding for Variable values — see Converter.cs MapVariableType. */
+    const char *ks_out = "/tmp/betl_dtsx2yaml_kitchen_sink.yml";
+    rc = run_convert(BETL_DTSX2YAML_KITCHENSINK_FIXTURE, ks_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for kitchen-sink fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(ks_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read kitchen-sink YAML\n");
+        return 1;
+    }
+
+    /* Top shape + connection. */
+    CHECK_CONTAINS(yaml, "name: kitchensink");
+    CHECK_CONTAINS(yaml, "warehouse:");
+    CHECK_CONTAINS(yaml, "type: mssql");
+
+    /* VARENUM mapping: DataType=8 (VT_BSTR) → string, 3 (VT_I4) → int,
+     * 11 (VT_BOOL) → bool. This is the regression test for the
+     * System.TypeCode-vs-VARENUM bug. */
+    CHECK_CONTAINS(yaml, "batchtag:");
+    CHECK_CONTAINS(yaml, "type: string");
+    CHECK_CONTAINS(yaml, "default: 'nightly'");
+    CHECK_CONTAINS(yaml, "minamount:");
+    CHECK_CONTAINS(yaml, "type: int");
+    CHECK_CONTAINS(yaml, "default: '100'");
+    CHECK_CONTAINS(yaml, "skipexecsql:");
+    CHECK_CONTAINS(yaml, "type: bool");
+
+    /* Pipeline: ExecuteSQL → sql.execute, Pipeline → dataflow with
+     * mssql.read + map (derive) + map (rowcount passthrough), and
+     * the precedence constraint becomes after: [truncate_stage]. */
+    CHECK_CONTAINS(yaml, "id: truncate_stage");
+    CHECK_CONTAINS(yaml, "type: sql.execute");
+    CHECK_CONTAINS(yaml, "TRUNCATE TABLE stage.Orders");
+    CHECK_CONTAINS(yaml, "id: extract_orders");
+    CHECK_CONTAINS(yaml, "after: [truncate_stage]");
+    CHECK_CONTAINS(yaml, "type: dataflow");
+    CHECK_CONTAINS(yaml, "id: olesource");
+    CHECK_CONTAINS(yaml, "type: mssql.read");
+    CHECK_CONTAINS(yaml, "SELECT id, amount FROM dbo.Orders");
+    CHECK_CONTAINS(yaml, "id: derive");
+    CHECK_CONTAINS(yaml, "[amount] + (DT_I8)1");
+    CHECK_CONTAINS(yaml, "id: rowcount");
+    CHECK_CONTAINS(yaml, "Original SSIS target variable: User::MinAmount");
+
+    free(yaml);
+
+    /* --- projectsample/ProjectSample.dtsx: project-deployment-model ----
+     * The fixture lives in a directory alongside Warehouse.conmgr and
+     * Project.params. The converter is expected to auto-discover those
+     * siblings and pull them into the package model. This is the
+     * regression test for:
+     *   - external .conmgr loading (no <ConnectionManagers> in the .dtsx)
+     *   - Project.params loading with System.TypeCode-encoded DataType
+     *     (DT=18 → string, distinct from VARENUM)
+     *   - <DTS:PropertyExpression> overriding SqlStatementSource with
+     *     a runtime SSIS expression splicing @[$Project::X]
+     *   - STOCK:SEQUENCE container (older SSDT spelling)
+     *   - Microsoft.SQLServerDestination → mssql.upsert (per project
+     *     decision: no special destination component, just write to SQL). */
+    const char *ps_out = "/tmp/betl_dtsx2yaml_projectsample.yml";
+    rc = run_convert(BETL_DTSX2YAML_PROJECT_FIXTURE, ps_out);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: converter returned %d for projectsample fixture\n", rc);
+        return 1;
+    }
+    yaml = slurp_file(ps_out);
+    if (!yaml) {
+        fprintf(stderr, "FAIL: cannot read projectsample YAML\n");
+        return 1;
+    }
+
+    /* External .conmgr → connection emitted under the project-level
+     * name "Warehouse" (lower-snake-cased). */
+    CHECK_CONTAINS(yaml, "warehouse:");
+    CHECK_CONTAINS(yaml, "type: mssql");
+    CHECK_CONTAINS(yaml, "Server=db.example.com");
+    CHECK_CONTAINS(yaml, "Database=Sales");
+
+    /* Project.params (TypeCode-encoded — distinct from VARENUM). */
+    CHECK_CONTAINS(yaml, "batchtag:");
+    CHECK_CONTAINS(yaml, "type: string");      /* TypeCode 18 = String */
+    CHECK_CONTAINS(yaml, "default: 'nightly'");
+    CHECK_CONTAINS(yaml, "rowlimit:");
+    CHECK_CONTAINS(yaml, "type: int");          /* TypeCode 9 = Int32 */
+    CHECK_CONTAINS(yaml, "default: '10000'");
+    /* Description carried through as a comment. */
+    CHECK_CONTAINS(yaml, "Run tag for the nightly batch");
+
+    /* STOCK:SEQUENCE container picked up under the same code path as
+     * Microsoft.Sequence — children flatten with a comment header. */
+    CHECK_CONTAINS(yaml, "sequence: Migrate");
+
+    /* ExecuteSQLTask with a PropertyExpression: the dynamic expression
+     * wins and project-param refs resolve to ${params.X}. The static
+     * 'placeholder' value baked into SqlStatementSource must NOT appear. */
+    CHECK_CONTAINS(yaml, "id: tag_batch");
+    CHECK_CONTAINS(yaml, "type: sql.execute");
+    CHECK_CONTAINS(yaml, "${params.batchtag}");
+    CHECK_CONTAINS(yaml, "${params.rowlimit}");
+    if (strstr(yaml, "'placeholder'") != NULL) {
+        fprintf(stderr, "FAIL: static SqlStatementSource leaked through "
+                "(PropertyExpression should override it)\n");
+        failures++;
+    }
+
+    /* Microsoft.SQLServerDestination → mssql.upsert with the
+     * BulkInsertTableName picked up as `table:`. */
+    CHECK_CONTAINS(yaml, "id: sqldest");
+    CHECK_CONTAINS(yaml, "type: mssql.upsert");
+    CHECK_CONTAINS(yaml, "table: '[dbo].[Orders_Staged]'");
+    /* BulkInsertKeepIdentity=true surfaces as a TODO. */
+    CHECK_CONTAINS(yaml, "BulkInsertKeepIdentity");
+
+    /* Precedence inside the container lowers to a flat after:. */
+    CHECK_CONTAINS(yaml, "after: [tag_batch]");
+
+    free(yaml);
+
     if (failures > 0) {
         fprintf(stderr, "FAIL: %d substring check(s) missed\n", failures);
         return 1;

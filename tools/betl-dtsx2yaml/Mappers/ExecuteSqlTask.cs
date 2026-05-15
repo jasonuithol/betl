@@ -42,6 +42,17 @@ public static class ExecuteSqlTask
             }
         }
 
+        /* If a <DTS:PropertyExpression DTS:Name="SqlStatementSource">
+         * is present, it's the runtime override — prefer it. Translate
+         * its @[$Project::X] refs to betl ${params.x}. The static
+         * SqlStatementSource above is the design-time fallback baked in
+         * for SSIS validation; in practice it's a stale snapshot. */
+        if (exe.PropertyExpressions.TryGetValue("SqlStatementSource", out var dyn)
+            && !string.IsNullOrEmpty(dyn))
+        {
+            sql = Converter.TranslateSsisExpression(StripExpressionQuotes(dyn));
+        }
+
         /* Connection here is by *DTSID GUID* not by name. Match it
          * against pkg.Connections by their DTSID attribute. */
         DtsxConnection? conn = null;
@@ -72,5 +83,27 @@ public static class ExecuteSqlTask
             w.Comment("TODO: SQL statement source missing");
         }
         w.Indent(-2);
+    }
+
+    /* SSIS string-expression syntax embeds SQL literals between
+     * "..." with `+` concatenation:
+     *     "UPDATE x SET y='" + @[$Project::A] + "' WHERE z=1"
+     * For SQL injection into a betl `sql:` block, we want the inner
+     * SQL with the @[$Project::A] refs already substituted out. After
+     * Converter.TranslateSsisExpression rewrites the references, we
+     * still have the surrounding "..." + "..." structure. Stripping the
+     * concatenation/quotes is fiddly; just leave the raw form and let
+     * the operator finish. We do strip one outer pair of straight
+     * double-quotes if the WHOLE expression is one quoted literal,
+     * which is the common case for simple parameterless statements. */
+    static string StripExpressionQuotes(string s)
+    {
+        s = s.Trim();
+        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"' &&
+            s.IndexOf('"', 1) == s.Length - 1)
+        {
+            return s.Substring(1, s.Length - 2);
+        }
+        return s;
     }
 }
