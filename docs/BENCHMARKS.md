@@ -157,8 +157,57 @@ Server cache compaction; excluded from the summary above.)
   avoiding COM RCW marshalling) doesn't even come into
   play here — and betl is still ~6× faster steady-state.
 
+### What this does NOT measure: the write path
+
+The numbers above are **read + transform only** — both sides
+count rows and discard. Real ETL workloads have a
+destination component, and that's where the picture changes.
+
+`bench/ssis/yaml/betl-C-write-*.yml` adds an `mssql.upsert`
+sink (`mssql.read → mssql.upsert` into a `dst_*` table; same
+shape as the C-side SSIS package, which goes
+`OLE DB Source → SQL Server Destination`). Measured 2026-05-15:
+
+| shape (rows × cols)   | iter1   | iter2   | iter3   | rows/s     |
+|-----------------------|--------:|--------:|--------:|-----------:|
+| `C-write-1col`     (100 k × 1 BIGINT) | 9 521 ms | 9 521 ms | 9 711 ms | **~10 400** |
+| `C-write-10col`    (100 k × 10 BIGINT)| 9 937 ms | 9 858 ms | 9 904 ms | **~10 100** |
+| `C-write-10col-1m` (1 M × 10 BIGINT)  | 100 800 ms | 101 253 ms | 98 064 ms | **~10 000** |
+
+The throughput is **dead flat at ~10 k rows/sec regardless
+of column count or row count** — column width has almost
+zero effect, which is the fingerprint of a round-trip-bound
+workload. `mssql.upsert` issues one `SQLExecute` per row
+(prepared MERGE statement); 1 M rows = 1 M round trips,
+network RTT dominates. The destination drops end-to-end
+throughput by **100×–500×** versus the read-only path
+(`A-10col` at ~1.5 M rows/s → `C-write-10col` at ~10 k rows/s).
+
+**This is the perf headroom for a future `mssql.bulkinsert`
+component** — bulk-array parameter binding via
+`SQL_ATTR_PARAMSET_SIZE` (or native FreeTDS `bcp_*`) would
+amortise the round-trip cost across thousands of rows per
+`SQLExecute`. See `docs/PIPELINECOMPONENT.md` for the
+implementation sketch.
+
 ### What's still untested
 
+- **SSIS-side C-write comparison.** We emit the SSIS-side
+  `C-write-*.dtsx` packages (under `bench/ssis/packages/`)
+  and they validate clean against dtexec on Linux, but they
+  do not RUN there. `Microsoft.SQLServerDestination` uses a
+  shared-memory file mapping (`Global\DTSQLIMPORT`) that
+  only works when SSIS and SQL Server are co-located on the
+  same host; cross-host invocation fails with OS error 87
+  during pre-execute. Hand-built `Microsoft.OLEDBDestination`
+  packages (FastLoad mode, AccessMode=3) keep hitting an
+  opaque `0xC0048004` (`DTS_E_PROCESSINPUTFAILED`) during
+  validation that I have not been able to crack from
+  hand-synthesised XML — every property and disposition
+  combination tried so far fails the same way. A Windows
+  host with SSDT can regenerate either destination and the
+  packages will run; the bench harness is ready for the
+  numbers.
 - **Custom Script Components / managed `PipelineComponent`
   subclasses.** This is where the SSIS COM-RCW marshalling
   tax should show up most clearly. SSIS-on-Linux does not
@@ -167,10 +216,20 @@ Server cache compaction; excluded from the summary above.)
   OLE DB instead). To benchmark the
   `dotnet.pipelinecomponent` vs real-SSIS Script Component
   case we still need a Windows host with SSDT.
-- **End-to-end with a destination component.** Both sides
-  here count rows and discard. Adding an OLE DB Destination
-  on the SSIS side and `mssql.upsert` on the betl side
-  would measure round-trip ETL throughput.
+
+### Honest framing
+
+The "~5.8× steady-state" claim above is for the **read +
+transform + count** shape. It's a true measurement of what
+SSIS' pipeline + COM-RCW marshalling costs over the same
+data path. But for workloads that **write to SQL Server**,
+the comparison flips: SSIS' `SQLServerDestination` /
+`OLEDBDestination`-FastLoad use TDS-level bulk-copy
+(BCP-style) at industry-typical 300 k – 1 M rows/sec, while
+the current betl `mssql.upsert` is row-by-row at ~10 k
+rows/sec. Until a `mssql.bulkinsert` (or equivalent) lands,
+**betl's write side is the limiter** on round-trip ETL
+workloads against SQL Server.
 
 ### Reproducing
 
@@ -181,9 +240,13 @@ Server cache compaction; excluded from the summary above.)
 # 2. betl side:
 export BETL_TEST_MSSQL_DSN="<your dsn>"
 bench/ssis/run-betl-side.sh bench/ssis/yaml/betl-A-1col.yml 6 1
+# For write benches, TRUNCATE the dst_* table between iterations
+# (the runtime does not yet expose a sql.execute task; use sqlcmd /
+#  mcp-mssql / etc to do this out-of-band).
 # 3. SSIS side:
 # Drop bench/ssis/packages/*.dtsx into the mcp-ssis packages dir,
 # then call mcp-ssis benchmark_package(path, runs=6, warmup=1).
+# C-write-*.dtsx run only on Windows (SQL-Server-co-located).
 ```
 
 ## `filter-count` — gen → filter(true) → count

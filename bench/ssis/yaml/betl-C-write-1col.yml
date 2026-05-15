@@ -1,0 +1,29 @@
+# Bench shape C-write (1col): write path — read source, MERGE into dst.
+# This is the honest write-end bench: row-by-row MERGE through ODBC
+# (the current mssql.upsert implementation). Pairs with the existing
+# A-1col read-only bench to show the write-path overhead.
+#
+# Discipline: TRUNCATE dbo.dst_1col between iterations so each run starts
+# from an empty target. The runtime doesn't yet ship a sql.execute task,
+# so we TRUNCATE out-of-band (mcp-mssql or sqlcmd from the harness).
+betl: 1
+name: bench-ssis-C-write-1col
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a FROM dbo.src_1col
+        batch_size: 10000
+      - id: sink
+        type: mssql.upsert
+        from: source
+        connection: bench
+        table: 'dbo.dst_1col'
+        key: [a]

@@ -15,12 +15,13 @@ GO
 USE betl_bench;
 GO
 
--- Tables: 1-col 100k, 10-col 100k, 10-col 1M.
+-- Tables: 1-col 100k, 10-col 100k, 10-col 1M, plus matching dst_* sinks.
 DROP TABLE IF EXISTS dbo.src_1col;
 DROP TABLE IF EXISTS dbo.src_10col;
 DROP TABLE IF EXISTS dbo.src_10col_1m;
 DROP TABLE IF EXISTS dbo.dst_1col;
 DROP TABLE IF EXISTS dbo.dst_10col;
+DROP TABLE IF EXISTS dbo.dst_10col_1m;
 GO
 
 CREATE TABLE dbo.src_1col     (a BIGINT NOT NULL);
@@ -32,11 +33,23 @@ CREATE TABLE dbo.src_10col_1m (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NO
                                d BIGINT NOT NULL, e BIGINT NOT NULL, f BIGINT NOT NULL,
                                g BIGINT NOT NULL, h BIGINT NOT NULL, i BIGINT NOT NULL,
                                j BIGINT NOT NULL);
+-- Write targets. NB the C-write/* shapes truncate these before each
+-- iteration so the perf number is steady-state, not "first INSERT into
+-- an empty table" (the difference matters because clustered-index
+-- maintenance dominates writes on an already-populated table).
+-- `a` is the upsert key (UNIQUE INDEX) so MERGE can use it.
 CREATE TABLE dbo.dst_1col     (a BIGINT NOT NULL);
+CREATE UNIQUE INDEX UX_dst_1col_a ON dbo.dst_1col(a);
 CREATE TABLE dbo.dst_10col    (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL,
                                d BIGINT NOT NULL, e BIGINT NOT NULL, f BIGINT NOT NULL,
                                g BIGINT NOT NULL, h BIGINT NOT NULL, i BIGINT NOT NULL,
                                j BIGINT NOT NULL);
+CREATE UNIQUE INDEX UX_dst_10col_a ON dbo.dst_10col(a);
+CREATE TABLE dbo.dst_10col_1m (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL,
+                               d BIGINT NOT NULL, e BIGINT NOT NULL, f BIGINT NOT NULL,
+                               g BIGINT NOT NULL, h BIGINT NOT NULL, i BIGINT NOT NULL,
+                               j BIGINT NOT NULL);
+CREATE UNIQUE INDEX UX_dst_10col_1m_a ON dbo.dst_10col_1m(a);
 GO
 
 -- Seed: src_1col (100k), src_10col (100k).

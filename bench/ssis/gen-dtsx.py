@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Generate runnable .dtsx files for the betl/SSIS bench comparison.
 
-Three shapes:
+Shapes:
   A-1col            OLE DB Source (1 BIGINT)  → RowCount
   A-10col           OLE DB Source (10 BIGINT) → RowCount
   B-derived-10col   OLE DB Source (10 BIGINT) → DerivedColumn (a2..j2 = +1)
                     → RowCount
+  C-write-*         OLE DB Source → SQL Server Destination
+                    (BLOCKED on Linux SSIS — see BENCHMARKS.md;
+                     emit the package shape for the future Windows
+                     bench but expect dtexec to fail to run them.)
 
 Output dir: /workspace/betl/bench/ssis/packages/
 """
@@ -281,9 +285,109 @@ def derived_column(cols, upstream_output_ref):
 '''
 
 
-def package(name, cols, table, with_derived=False):
-    """Compose a package: OleSource → [Derived] → RowCount."""
+def sqlserver_destination(cols, dst_table):
+    """SQLServerDestination component writing into dst_table.
+
+    NB: runtime fails on Linux SSIS with cross-host SQL Server — the
+    component uses a shared-memory file mapping (Global\\DTSQLIMPORT) that
+    only works when SSIS and SQL Server are co-located. Validate-only
+    passes. Kept for the future Windows-host comparison.
+    """
+    in_cols = "\n".join(
+        f'''                    <inputColumn
+                        refId="Package\\DataFlow\\SqlDest.Inputs[SQL Server Destination Input].Columns[{c}]"
+                        cachedDataType="i8"
+                        cachedName="{c}"
+                        externalMetadataColumnId="Package\\DataFlow\\SqlDest.Inputs[SQL Server Destination Input].ExternalColumns[{c}]"
+                        lineageId="Package\\DataFlow\\OleSource.Outputs[OLE DB Source Output].Columns[{c}]"/>'''
+        for c in cols)
+    ext_cols = "\n".join(
+        f'''                    <externalMetadataColumn
+                        refId="Package\\DataFlow\\SqlDest.Inputs[SQL Server Destination Input].ExternalColumns[{c}]"
+                        dataType="i8" name="{c}"/>'''
+        for c in cols)
+    return f'''            <component
+                refId="Package\\DataFlow\\SqlDest"
+                componentClassID="Microsoft.SQLServerDestination"
+                description="SQL Server Destination"
+                name="SqlDest"
+                version="5">
+              <properties>
+                <property dataType="System.Int32"   name="DefaultCodePage">1252</property>
+                <property dataType="System.Boolean" name="AlwaysUseDefaultCodePage">false</property>
+                <property dataType="System.String"  name="BulkInsertTableName">[dbo].[{dst_table}]</property>
+                <property dataType="System.Boolean" name="BulkInsertCheckConstraints">true</property>
+                <property dataType="System.Int32"   name="BulkInsertFirstRow">-1</property>
+                <property dataType="System.Boolean" name="BulkInsertFireTriggers">false</property>
+                <property dataType="System.Boolean" name="BulkInsertKeepIdentity">false</property>
+                <property dataType="System.Boolean" name="BulkInsertKeepNulls">false</property>
+                <property dataType="System.Int32"   name="BulkInsertLastRow">-1</property>
+                <property dataType="System.Int32"   name="BulkInsertMaxErrors">-1</property>
+                <property dataType="System.String"  name="BulkInsertOrder"></property>
+                <property dataType="System.Boolean" name="BulkInsertTablock">true</property>
+                <property dataType="System.Int32"   name="Timeout">30</property>
+                <property dataType="System.Int32"   name="MaxInsertCommitSize">0</property>
+              </properties>
+              <connections>
+                <connection
+                    refId="Package\\DataFlow\\SqlDest.Connections[OleDbConnection]"
+                    connectionManagerID="Package.ConnectionManagers[SrcDb]"
+                    connectionManagerRefId="Package.ConnectionManagers[SrcDb]"
+                    name="OleDbConnection"/>
+              </connections>
+              <inputs>
+                <input
+                    refId="Package\\DataFlow\\SqlDest.Inputs[SQL Server Destination Input]"
+                    hasSideEffects="true"
+                    name="SQL Server Destination Input">
+                  <inputColumns>
+{in_cols}
+                  </inputColumns>
+                  <externalMetadataColumns isUsed="True">
+{ext_cols}
+                  </externalMetadataColumns>
+                </input>
+              </inputs>
+            </component>
+'''
+
+
+def package(name, cols, table, with_derived=False, dst_table=None):
+    """Compose a package: OleSource → [Derived] → RowCount,
+    OR (when dst_table is set) OleSource → SqlServerDestination
+    for the write-path benches."""
     src = ole_source(cols, table)
+
+    if dst_table is not None:
+        dst = sqlserver_destination(cols, dst_table)
+        paths = f'''            <path
+                refId="Package\\DataFlow.Paths[SrcToDst]"
+                endId="Package\\DataFlow\\SqlDest.Inputs[SQL Server Destination Input]"
+                name="SrcToDst"
+                startId="Package\\DataFlow\\OleSource.Outputs[OLE DB Source Output]"/>'''
+        components = src + dst
+        pipeline = f'''      <DTS:ObjectData>
+        <pipeline DefaultBufferMaxRows="10000" DefaultBufferSize="10485760" version="1">
+          <components>
+{components}          </components>
+          <paths>
+{paths}
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+'''
+        dataflow = f'''  <DTS:Executables>
+    <DTS:Executable
+        DTS:refId="Package\\DataFlow"
+        DTS:CreationName="Microsoft.Pipeline"
+        DTS:DTSID="{{eeeeeeee-eeee-eeee-eeee-eeeeeeee0002}}"
+        DTS:ExecutableType="Microsoft.Pipeline"
+        DTS:ObjectName="DataFlow">
+      <DTS:Variables/>
+{pipeline}    </DTS:Executable>
+  </DTS:Executables>
+'''
+        return header(name) + dataflow + footer()
 
     if with_derived:
         # Cols flow into Derived, which produces a2..j2 via [c] + 1.
@@ -346,7 +450,8 @@ def package(name, cols, table, with_derived=False):
 
 
 def main():
-    pkgs = [
+    # Read-only shapes: source → [derived] → row count. Runnable on Linux.
+    read_pkgs = [
         ("A_1col",             ["a"],                "src_1col",     False),
         ("A_10col",            list("abcdefghij"),   "src_10col",    False),
         ("B_derived_10col",    list("abcdefghij"),   "src_10col",    True),
@@ -354,12 +459,30 @@ def main():
         # steady-state data-flow throughput rather than process launch.
         ("B_derived_10col_1m", list("abcdefghij"),   "src_10col_1m", True),
     ]
-    for name, cols, table, with_derived in pkgs:
+    for name, cols, table, with_derived in read_pkgs:
         s = package(name, cols, table, with_derived)
         path = os.path.join(OUT, name.replace("_", "-") + ".dtsx")
         with open(path, "w") as f:
             f.write(s)
         print(f"wrote {path}  ({len(s)} bytes)")
+
+    # Write shapes: source → SQL Server Destination. These VALIDATE but
+    # do NOT RUN on Linux SSIS — SQLServerDestination uses a shared-memory
+    # file mapping that only works when SSIS and SQL Server are co-located
+    # (see BENCHMARKS.md / reference_mcp_ssis_service.md). The package
+    # shape is emitted so the future Windows-host bench can pick them up
+    # without re-deriving them.
+    write_pkgs = [
+        ("C_write_1col",       ["a"],                "src_1col",     "dst_1col"),
+        ("C_write_10col",      list("abcdefghij"),   "src_10col",    "dst_10col"),
+        ("C_write_10col_1m",   list("abcdefghij"),   "src_10col_1m", "dst_10col_1m"),
+    ]
+    for name, cols, src_table, dst_table in write_pkgs:
+        s = package(name, cols, src_table, with_derived=False, dst_table=dst_table)
+        path = os.path.join(OUT, name.replace("_", "-") + ".dtsx")
+        with open(path, "w") as f:
+            f.write(s)
+        print(f"wrote {path}  ({len(s)} bytes)  [run blocked on Linux]")
 
 
 if __name__ == "__main__":

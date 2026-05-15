@@ -10,6 +10,10 @@
 #   BETL_TEST_MSSQL_DSN — required, ODBC DSN string
 #   BETL_BIN            — defaults to ./build/betl
 #
+# Write-bench YAMLs should put their TRUNCATE as the first pipeline
+# step (sql.execute) — TRUNCATE is metadata-only on SQL Server and the
+# extra wall-clock cost is below the noise floor of the measured runs.
+#
 # Output: one CSV line per measured iteration, plus a min/p50/max summary.
 
 set -euo pipefail

@@ -1,0 +1,25 @@
+# Bench shape C-write (10col, 1M rows): the steady-state write number.
+# At 1M rows the per-row INSERT overhead dominates; this is what would
+# benefit most from a bulk-insert component.
+# TRUNCATE dbo.dst_10col_1m out-of-band between iterations.
+betl: 1
+name: bench-ssis-C-write-10col-1m
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM dbo.src_10col_1m
+        batch_size: 10000
+      - id: sink
+        type: mssql.upsert
+        from: source
+        connection: bench
+        table: 'dbo.dst_10col_1m'
+        key: [a]
