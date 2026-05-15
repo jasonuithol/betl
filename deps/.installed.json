@@ -1,5 +1,26 @@
 {
   "apt": {
+    "freetds-dev": {
+      "arch": "amd64",
+      "files": [
+        "include/bkpublic.h",
+        "include/cspublic.h",
+        "include/cstypes.h",
+        "include/ctpublic.h",
+        "include/odbcss.h",
+        "include/sqldb.h",
+        "include/sqlfront.h",
+        "include/sybdb.h",
+        "include/syberror.h",
+        "include/sybfront.h",
+        "include/tds_sysdep_public.h",
+        "lib/libct.a",
+        "lib/libct.so",
+        "lib/libsybdb.a",
+        "lib/libsybdb.so"
+      ],
+      "version": "1.3.17+ds-2"
+    },
     "libltdl-dev": {
       "arch": "amd64",
       "files": [
@@ -99,6 +120,14 @@
         "lib/libpq.so.5.15"
       ],
       "version": "15.16-0+deb12u1"
+    },
+    "libsybdb5": {
+      "arch": "amd64",
+      "files": [
+        "lib/libsybdb.so.5",
+        "lib/libsybdb.so.5.1.0"
+      ],
+      "version": "1.3.17+ds-2"
     },
     "libyaml-0-2": {
       "arch": "amd64",

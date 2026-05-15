@@ -99,9 +99,11 @@ static int ms_exec(SQLHDBC hdbc, const char *sql) {
 }
 
 /* Run a `betl.gen_int64 → mssql.bulkinsert` pipeline against `table`.
- * row_count rows, ids starting at 1, batch_size for the sink. */
+ * row_count rows, ids starting at 1, batch_size for the sink, mode is
+ * "array" or "bcp". */
 static int run_bulk_pipeline(const char *table, int64_t row_count,
-                             int batch_size, char *err_out, size_t err_cap) {
+                             int batch_size, const char *mode,
+                             char *err_out, size_t err_cap) {
     char yaml[2048];
     snprintf(yaml, sizeof yaml,
         "betl: 1\n"
@@ -124,8 +126,9 @@ static int run_bulk_pipeline(const char *table, int64_t row_count,
         "        from: source\n"
         "        connection: warehouse\n"
         "        table: %s\n"
-        "        batch_size: %d\n",
-        row_count, table, batch_size);
+        "        batch_size: %d\n"
+        "        mode: %s\n",
+        row_count, table, batch_size, mode);
 
     char path[64];
     snprintf(path, sizeof path, "/tmp/betl-test-mssql-bulkinsert-%d.yml",
@@ -211,8 +214,9 @@ int main(void) {
      *     Tests the basic round-trip. --- */
     {
         char err[512] = {0};
-        if (run_bulk_pipeline(table, 5000, 1000, err, sizeof err) != 0) {
-            fprintf(stderr, "case 1 (5000 / 1000): %s\n", err);
+        if (run_bulk_pipeline(table, 5000, 1000, "array",
+                              err, sizeof err) != 0) {
+            fprintf(stderr, "case 1 (5000 / 1000 / array): %s\n", err);
             ++failures;
         }
         char q[256];
@@ -235,8 +239,9 @@ int main(void) {
      *     trailing partial of 168 rows. Tests the partial-batch path. --- */
     {
         char err[512] = {0};
-        if (run_bulk_pipeline(table, 1500, 333, err, sizeof err) != 0) {
-            fprintf(stderr, "case 2 (1500 / 333): %s\n", err);
+        if (run_bulk_pipeline(table, 1500, 333, "array",
+                              err, sizeof err) != 0) {
+            fprintf(stderr, "case 2 (1500 / 333 / array): %s\n", err);
             ++failures;
         }
         char q[256];
@@ -259,8 +264,9 @@ int main(void) {
      *     of 100. Tests "fewer rows than one full batch". --- */
     {
         char err[512] = {0};
-        if (run_bulk_pipeline(table, 100, 1000, err, sizeof err) != 0) {
-            fprintf(stderr, "case 3 (100 / 1000): %s\n", err);
+        if (run_bulk_pipeline(table, 100, 1000, "array",
+                              err, sizeof err) != 0) {
+            fprintf(stderr, "case 3 (100 / 1000 / array): %s\n", err);
             ++failures;
         }
         char q[256];
@@ -268,6 +274,42 @@ int main(void) {
         int64_t n = -1;
         CHECK(ms_select_int64(hdbc, q, &n) == 0);
         CHECK(n == 100);
+    }
+
+    /* Clean for case 4. */
+    snprintf(ddl, sizeof ddl, "TRUNCATE TABLE [%s].[bulk_demo]", schema);
+    if (ms_exec(hdbc, ddl) != 0) goto teardown;
+
+    /* --- Case 4: mode=bcp end-to-end. Same shape as case 1 (5000 rows,
+     *     batch=1000) but the Phase 2 native FreeTDS BCP path:
+     *     bcp_init → bcp_bind → bcp_sendrow per row → bcp_batch every
+     *     N → bcp_done. Verifies count + sum match. --- */
+    {
+        char err[512] = {0};
+        int rc4 = run_bulk_pipeline(table, 5000, 1000, "bcp",
+                                    err, sizeof err);
+#ifdef BETL_HAVE_SYBDB
+        if (rc4 != 0) {
+            fprintf(stderr, "case 4 (bcp): %s\n", err);
+            ++failures;
+        }
+        char q[256];
+        snprintf(q, sizeof q, "SELECT COUNT(*) FROM [%s].[bulk_demo]", schema);
+        int64_t n = -1;
+        CHECK(ms_select_int64(hdbc, q, &n) == 0);
+        CHECK(n == 5000);
+        snprintf(q, sizeof q, "SELECT SUM(id) FROM [%s].[bulk_demo]", schema);
+        int64_t sum = -1;
+        CHECK(ms_select_int64(hdbc, q, &sum) == 0);
+        CHECK(sum == 12502500);
+#else
+        /* No libsybdb at compile time → mode=bcp must be rejected
+         * cleanly at init, not silently succeed against the array path. */
+        if (rc4 == 0) {
+            fprintf(stderr, "case 4 (bcp w/o SYBDB): expected failure, got success\n");
+            ++failures;
+        }
+#endif
     }
 
 teardown:

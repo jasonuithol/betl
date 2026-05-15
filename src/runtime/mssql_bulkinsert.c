@@ -43,6 +43,7 @@
 #include "runtime/decimal_util.h"
 #include "runtime/uuid_util.h"
 #include "runtime/mssql_sql.h"
+#include "runtime/mssql_bulk_common.h"
 
 /* Default ODBC parameter array size — 1000 rows / SQLExecute. The
  * ODBC max is 65535 (SQL_UINTEGER); driver-side limits are typically
@@ -150,31 +151,36 @@ static void free_string_array(char **arr, size_t n) {
     free(arr);
 }
 
+/* Pull the `dsn` field out of the named connection. Returns a malloc'd
+ * NUL-terminated string on success or NULL with `out_err` populated.
+ * Shared with the BCP TU via mssql_bulk_common.h. */
+char *ms_bulk_get_dsn(BetlContext *ctx, const char *connection_name,
+                      char *out_err, size_t out_err_cap) {
+    const char *conn_json = betl_get_connection(ctx, connection_name);
+    if (!conn_json) {
+        snprintf(out_err, out_err_cap,
+                 "connection '%s' not declared", connection_name);
+        return NULL;
+    }
+    char *dsn = NULL;
+    if (json_string(conn_json, "dsn", &dsn) != 0 || !dsn) {
+        snprintf(out_err, out_err_cap,
+                 "connection '%s' missing `dsn` field", connection_name);
+        free(dsn);
+        return NULL;
+    }
+    return dsn;
+}
+
 /* ============================================================== *
  *  Arrow → ODBC type mapping (mirrors mssql_upsert.c)              *
  * ============================================================== */
 
-typedef enum {
-    MS_INT64,
-    MS_INT8,  MS_UINT8,
-    MS_INT16, MS_UINT16,
-    MS_INT32, MS_UINT32,
-    MS_UINT64,
-    MS_FLOAT64,
-    MS_FLOAT32,
-    MS_UTF8,
-    MS_BOOL,
-    MS_DATE32,
-    MS_TIMESTAMP_US,
-    MS_TIMESTAMP_TZ,
-    MS_DECIMAL128,
-    MS_UUID,
-    MS_TIME_US,
-    MS_BINARY,
-    MS_UNSUPPORTED
-} MsColType;
+/* MsColType lives in mssql_bulk_common.h so the BCP TU can see it
+ * too. The mapping function moved here is exported via the same
+ * header for the BCP TU to reuse. */
 
-static MsColType arrow_to_ms(const char *fmt) {
+MsColType ms_bulk_arrow_to_ms(const char *fmt) {
     if (!fmt) return MS_UNSUPPORTED;
     if (strcmp(fmt, "l")        == 0) return MS_INT64;
     if (strcmp(fmt, "L")        == 0) return MS_UINT64;
@@ -198,7 +204,7 @@ static MsColType arrow_to_ms(const char *fmt) {
     return MS_UNSUPPORTED;
 }
 
-static int ms_decimal_pscale(const char *fmt, int *p, int *s) {
+int ms_bulk_decimal_pscale(const char *fmt, int *p, int *s) {
     return sscanf(fmt + 2, "%d,%d", p, s) == 2 ? 0 : -1;
 }
 
@@ -280,17 +286,21 @@ static int ms_bulk_col_alloc(MsBulkCol *c, size_t n_rows) {
  *  State                                                           *
  * ============================================================== */
 
+/* MsBulkMode and MsColType live in mssql_bulk_common.h since the BCP
+ * TU needs them too. */
+
 typedef struct {
     BetlContext *ctx;
 
     /* Configured */
-    char    *connection_name;
-    char    *table;
-    char   **explicit_cols;
-    size_t   n_explicit_cols;
-    size_t   batch_size;
+    char       *connection_name;
+    char       *table;
+    char      **explicit_cols;
+    size_t      n_explicit_cols;
+    size_t      batch_size;
+    MsBulkMode  mode;
 
-    /* ODBC handles */
+    /* ODBC handles — only opened when mode == MS_MODE_ARRAY. */
     SQLHENV henv;
     SQLHDBC hdbc;
 
@@ -383,6 +393,7 @@ static void ms_close_conn(SQLHENV henv, SQLHDBC hdbc) {
     if (henv != SQL_NULL_HENV) SQLFreeHandle(SQL_HANDLE_ENV, henv);
 }
 
+
 /* ============================================================== *
  *  Lifecycle                                                       *
  * ============================================================== */
@@ -422,8 +433,41 @@ static int ms_init(BetlContext *ctx, const char *cfg, void **state) {
         s->batch_size = (size_t)bs;
     }
 
-    int conn_rc = ms_open_conn(ctx, s->connection_name, &s->henv, &s->hdbc);
-    if (conn_rc != BETL_OK) goto fail;
+    /* mode: array (default) | bcp (requires libsybdb at compile time) */
+    char *mode_str = NULL;
+    json_string(cfg, "mode", &mode_str);
+    if (mode_str && *mode_str) {
+        if (strcmp(mode_str, "array") == 0) {
+            s->mode = MS_MODE_ARRAY;
+        } else if (strcmp(mode_str, "bcp") == 0) {
+#ifdef BETL_HAVE_SYBDB
+            s->mode = MS_MODE_BCP;
+#else
+            betl_set_error(ctx,
+                "mssql.bulkinsert: mode=bcp requested but this build "
+                "lacks libsybdb (BETL_HAVE_SYBDB undefined). Use "
+                "mode=array, or rebuild with FreeTDS db-lib in deps/.");
+            free(mode_str);
+            goto fail;
+#endif
+        } else {
+            betl_set_error(ctx,
+                "mssql.bulkinsert: unknown mode '%s' (want array|bcp)",
+                mode_str);
+            free(mode_str);
+            goto fail;
+        }
+    }
+    free(mode_str);
+
+    /* ODBC connection is only needed in array mode. BCP mode opens
+     * its own dblib connection in ms_bcp_run() when the data starts
+     * flowing. */
+    if (s->mode == MS_MODE_ARRAY) {
+        int conn_rc = ms_open_conn(ctx, s->connection_name,
+                                   &s->henv, &s->hdbc);
+        if (conn_rc != BETL_OK) goto fail;
+    }
 
     *state = s;
     return BETL_OK;
@@ -814,19 +858,24 @@ static int ms_sink_run(void *state) {
     }
 
     int rc = BETL_OK;
-    int64_t  *col_to_child = malloc(n_out_cols * sizeof *col_to_child);
-    MsBulkCol *bufs        = calloc(n_out_cols, sizeof *bufs);
+    int64_t   *col_to_child = malloc(n_out_cols * sizeof *col_to_child);
+    MsBulkCol *bufs         = calloc(n_out_cols, sizeof *bufs);
     if (!col_to_child || !bufs) { rc = BETL_ERR_INTERNAL; goto cleanup_pre; }
 
+    /* Pass 1: resolve each `out_cols[i]` to a child index in the
+     * input schema, capture its Arrow type, and pull decimal p/scale
+     * if present. No buffer allocation yet — BCP mode delegates that
+     * to the BCP TU which manages its own driver-typed buffers. */
     for (size_t i = 0; i < n_out_cols; ++i) {
         col_to_child[i] = -1;
         for (int64_t j = 0; j < n_cols_in; ++j) {
             if (strcmp(out_cols[i], schema.children[j]->name) == 0) {
                 col_to_child[i] = j;
-                bufs[i].type = arrow_to_ms(schema.children[j]->format);
+                bufs[i].type = ms_bulk_arrow_to_ms(schema.children[j]->format);
                 if (bufs[i].type == MS_DECIMAL128) {
                     int p = 0, sc = 0;
-                    if (ms_decimal_pscale(schema.children[j]->format, &p, &sc) != 0) {
+                    if (ms_bulk_decimal_pscale(schema.children[j]->format,
+                                               &p, &sc) != 0) {
                         betl_set_error(s->ctx,
                             "mssql.bulkinsert: column '%s' has malformed decimal format",
                             out_cols[i]);
@@ -853,6 +902,41 @@ static int ms_sink_run(void *state) {
             rc = BETL_ERR_UNSUPPORTED;
             goto cleanup_pre;
         }
+    }
+
+    if (s->mode == MS_MODE_BCP) {
+#ifdef BETL_HAVE_SYBDB
+        /* Marshal per-column metadata into flat arrays for the BCP TU
+         * (it doesn't see our MsBulkCol layout — different headers). */
+        MsColType *col_types = malloc(n_out_cols * sizeof *col_types);
+        int       *col_prec  = malloc(n_out_cols * sizeof *col_prec);
+        int       *col_scale = malloc(n_out_cols * sizeof *col_scale);
+        if (!col_types || !col_prec || !col_scale) {
+            free(col_types); free(col_prec); free(col_scale);
+            rc = BETL_ERR_INTERNAL;
+            goto cleanup_pre;
+        }
+        for (size_t i = 0; i < n_out_cols; ++i) {
+            col_types[i] = bufs[i].type;
+            col_prec[i]  = bufs[i].dec_precision;
+            col_scale[i] = bufs[i].dec_scale;
+        }
+        rc = ms_bcp_run(s->ctx, s->connection_name, s->table,
+                        out_cols, n_out_cols, s->batch_size,
+                        col_to_child, col_types, col_prec, col_scale,
+                        &s->input);
+        free(col_types); free(col_prec); free(col_scale);
+        goto cleanup_pre;
+#else
+        betl_set_error(s->ctx,
+            "mssql.bulkinsert: mode=bcp not compiled in (libsybdb absent)");
+        rc = BETL_ERR_UNSUPPORTED;
+        goto cleanup_pre;
+#endif
+    }
+
+    /* Pass 2 (array mode only): allocate the bulk-array buffers. */
+    for (size_t i = 0; i < n_out_cols; ++i) {
         if (ms_bulk_col_alloc(&bufs[i], s->batch_size) != 0) {
             betl_set_error(s->ctx,
                 "mssql.bulkinsert: OOM allocating bulk buffers for col '%s'",
@@ -992,6 +1076,7 @@ cleanup_pre:
     if (schema.release) schema.release(&schema);
     return rc;
 }
+
 
 /* ============================================================== *
  *  Component definition                                            *

@@ -1,0 +1,25 @@
+# Bench shape E-bcp (1col): write path via Phase 2 native FreeTDS BCP.
+# bcp_init → bcp_bind → bcp_sendrow per row → bcp_batch every N → bcp_done.
+# TDS-level bulk-load frames, no ODBC on the write path.
+betl: 1
+name: bench-ssis-E-bcp-1col
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a FROM dbo.src_1col
+        batch_size: 10000
+      - id: sink
+        type: mssql.bulkinsert
+        from: source
+        connection: bench
+        table: 'dbo.dst_1col'
+        mode: bcp
+        batch_size: 1000

@@ -210,14 +210,32 @@ predicted Phase-1 target.
 remains the right choice for incremental/idempotent loads
 where on-conflict UPDATE semantics matter.
 
-### What's still on the table (Phase 2)
+### Phase 2: native FreeTDS BCP (landed 2026-05-15)
 
-Native FreeTDS `bcp_*` API would bypass ODBC on the write
-path entirely (TDS-level bulk frames, same as SSIS uses
-internally). Expected additional ~3× over the current Phase 1
-numbers, putting us at ~300 k rows/s — matching SSIS-on-
-Windows' typical bulk-insert throughput. Not landed yet; see
-`PIPELINECOMPONENT.md` for the design sketch.
+Opt-in via `mode: bcp` on `mssql.bulkinsert`. Bypasses ODBC
+entirely — opens a `DBPROCESS` via FreeTDS db-lib, then
+`bcp_init → bcp_bind → bcp_sendrow → bcp_batch → bcp_done`.
+Same TDS-level bulk-load protocol SQL Server's
+`SQLServerDestination` uses on Windows. Requires
+`libsybdb` at build time (Debian's `freetds-dev`/`libsybdb5`).
+
+| shape (rows × cols)   | iter1 | iter2 | iter3 | bcp rows/s | vs upsert | vs array |
+|-----------------------|------:|------:|------:|-----------:|----------:|---------:|
+| `E-bcp-1col`     (100 k × 1 BIGINT)  | 478 ms   | 499 ms   | 508 ms   | **~199 000** | **19×**  | **1.8×** |
+| `E-bcp-10col`    (100 k × 10 BIGINT) | 575 ms   | 576 ms   | 577 ms   | **~174 000** | **17×**  | **1.8×** |
+| `E-bcp-10col-1m` (1 M × 10 BIGINT)   | 5 693 ms | 5 953 ms | 5 692 ms | **~172 000** | **17.5×**| **1.9×** |
+
+BCP gives a further ~1.8× over the Phase 1 ODBC bulk-array
+path — less than the 3× originally projected, because Phase 1
+was already amortising RTT effectively at batch=1000. The
+absolute throughput (~175 k rows/s) closes most of the gap
+to SSIS' typical 300 k+ rows/s; the remaining gap is dominated
+by server-side ingest cost on this hardware.
+
+`mode: bcp` is currently opt-in (default stays `array`) so
+betl builds without `libsybdb` keep working. The dtsx2yaml
+converter emits `mode: array` and a comment suggesting
+operators flip to `mode: bcp` when their build supports it.
 
 ### What's still untested
 
@@ -255,12 +273,14 @@ SQL Server**:
 - `mssql.upsert` (row-by-row MERGE, ~10 k rows/s) is still
   slower than SSIS' bulk-load destinations. Use it for
   incremental/idempotent loads, not bulk reload.
-- `mssql.bulkinsert` (Phase 1 ODBC bulk-array, ~93–113 k
-  rows/s) closes most of the gap; SSIS-on-Windows
+- `mssql.bulkinsert` `mode: array` (Phase 1 ODBC bulk-array,
+  ~93-113 k rows/s) closes most of the gap; SSIS-on-Windows
   `SQLServerDestination` / `OLEDBDestination`-FastLoad
-  typically run 300 k – 1 M rows/s on similar hardware, so
-  Phase 1 puts us within ~3× of that range. Phase 2 (native
-  FreeTDS BCP) is expected to close the rest.
+  typically run 300 k - 1 M rows/s on similar hardware.
+- `mssql.bulkinsert` `mode: bcp` (Phase 2 native FreeTDS BCP,
+  ~172-199 k rows/s) lands within ~1.5-2× of typical
+  Windows-side throughput. Default-off until libsybdb is in
+  every build; flip to it for write-heavy workloads.
 
 The SSIS-side write comparison still can't be measured from
 the Linux harness (shared-memory blocker for

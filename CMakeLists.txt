@@ -94,6 +94,27 @@ else()
     message(STATUS "unixODBC not found — MSSQL components will be omitted")
 endif()
 
+# FreeTDS db-lib (libsybdb): used by mssql.bulkinsert's Phase 2 BCP
+# code path. Optional — when present, BETL_HAVE_SYBDB is defined and
+# `mode: bcp` becomes a valid runtime config; when absent the
+# component still ships with its Phase 1 ODBC-array path only.
+find_path(SYBDB_INCLUDE_DIR sybdb.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include
+)
+find_library(SYBDB_LIBRARY NAMES sybdb
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(SYBDB_INCLUDE_DIR AND SYBDB_LIBRARY)
+    set(SYBDB_FOUND TRUE)
+    add_library(betl_sybdb INTERFACE)
+    target_include_directories(betl_sybdb INTERFACE ${SYBDB_INCLUDE_DIR})
+    target_link_libraries(betl_sybdb INTERFACE ${SYBDB_LIBRARY})
+    message(STATUS "Found FreeTDS db-lib: ${SYBDB_LIBRARY} (headers: ${SYBDB_INCLUDE_DIR})")
+else()
+    set(SYBDB_FOUND FALSE)
+    message(STATUS "FreeTDS db-lib not found — mssql.bulkinsert will only support mode:array")
+endif()
+
 # --- Generated headers -----------------------------------------------------
 configure_file(
     ${CMAKE_SOURCE_DIR}/include/betl/version.h.in
@@ -165,6 +186,16 @@ if(ODBC_FOUND)
     )
     target_link_libraries(betl_core PUBLIC betl_odbc)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_ODBC)
+    # mssql.bulkinsert's BCP path lives in a separate TU because
+    # FreeTDS' <sybdb.h> and unixODBC's <sqltypes.h> define RETCODE /
+    # BOOL incompatibly. The TU only compiles when libsybdb is present.
+    if(SYBDB_FOUND)
+        target_sources(betl_core PRIVATE
+            src/runtime/mssql_bulkinsert_bcp.c
+        )
+        target_link_libraries(betl_core PUBLIC betl_sybdb)
+        target_compile_definitions(betl_core PUBLIC BETL_HAVE_SYBDB)
+    endif()
 endif()
 
 # --- Engine binary ---------------------------------------------------------
