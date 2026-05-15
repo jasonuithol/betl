@@ -553,8 +553,9 @@ int main(void) {
      *   - <DTS:PropertyExpression> overriding SqlStatementSource with
      *     a runtime SSIS expression splicing @[$Project::X]
      *   - STOCK:SEQUENCE container (older SSDT spelling)
-     *   - Microsoft.SQLServerDestination → mssql.upsert (per project
-     *     decision: no special destination component, just write to SQL). */
+     *   - Microsoft.SQLServerDestination → mssql.bulkinsert (since the
+     *     bulkinsert sink landed, this is the semantic match — insert-only,
+     *     bulk-array binding, no MERGE machinery). */
     const char *ps_out = "/tmp/betl_dtsx2yaml_projectsample.yml";
     rc = run_convert(BETL_DTSX2YAML_PROJECT_FIXTURE, ps_out);
     if (rc != 0) {
@@ -601,10 +602,10 @@ int main(void) {
         failures++;
     }
 
-    /* Microsoft.SQLServerDestination → mssql.upsert with the
+    /* Microsoft.SQLServerDestination → mssql.bulkinsert with the
      * BulkInsertTableName picked up as `table:`. */
     CHECK_CONTAINS(yaml, "id: sqldest");
-    CHECK_CONTAINS(yaml, "type: mssql.upsert");
+    CHECK_CONTAINS(yaml, "type: mssql.bulkinsert");
     CHECK_CONTAINS(yaml, "table: '[dbo].[Orders_Staged]'");
     /* BulkInsertKeepIdentity=true surfaces as a TODO. */
     CHECK_CONTAINS(yaml, "BulkInsertKeepIdentity");

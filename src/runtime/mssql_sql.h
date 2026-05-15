@@ -33,6 +33,14 @@ int betl_build_mssql_merge_sql(BetlBuf *out,
                                char **keys, size_t n_keys,
                                BetlOnConflict mode);
 
+/* Build a plain INSERT statement for mssql.bulkinsert:
+ *     INSERT INTO [schema].[table] (cols) VALUES (?, ?, ...)
+ * One `?` per column. Same return-code contract as the MERGE builder
+ * minus the -3 case (no keys to verify). */
+int betl_build_mssql_insert_sql(BetlBuf *out,
+                                const char *table,
+                                char **cols, size_t n_cols);
+
 #ifdef __cplusplus
 }
 #endif

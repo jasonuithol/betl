@@ -1,21 +1,22 @@
-/* SQL Server Destination → mssql.upsert.
+/* SQL Server Destination → mssql.bulkinsert.
  *
  * Microsoft.SQLServerDestination is SSIS' SQL-Server-specific bulk
- * insert sink. It only runs against a co-located SQL Server (uses
- * BULK INSERT under the hood) and is heavily used in older packages
- * that prefer it over OLEDB Destination for throughput. From betl's
- * perspective there's no need for a distinct component: the user
- * said "just the ability to write to SQL Server", so we route it
- * through the same mssql.upsert that OLEDB Destination uses.
+ * insert sink. It's insert-only, uses BULK INSERT under the hood, and
+ * is heavily used in older packages that wanted faster throughput than
+ * OLEDB Destination's row-by-row path. betl's `mssql.bulkinsert` is
+ * the semantic match: bulk-array ODBC binding, insert-only, no MERGE
+ * machinery. (Use `mssql.upsert` instead if you actually need
+ * UPDATE-on-conflict semantics — but SQLServerDestination didn't, so
+ * that's not what we emit here.)
  *
  * Property differences vs OLEDB Destination:
  *   - Table name is in `BulkInsertTableName` (not `OpenRowset`).
  *   - No AccessMode — it's always bulk insert.
  *   - Bunch of bulk-insert knobs (KeepIdentity, KeepNulls, FireTriggers,
  *     CheckConstraints, FirstRow, LastRow, MaxErrors, Order, Tablock,
- *     Timeout, MaxInsertCommitSize) that betl's mssql.upsert doesn't
- *     have parity with — surfaced as TODO comments so the operator
- *     can decide whether to keep equivalent behaviour. */
+ *     Timeout, MaxInsertCommitSize) that betl's mssql.bulkinsert
+ *     doesn't have parity with — surfaced as TODO comments so the
+ *     operator can decide whether equivalent behaviour matters. */
 
 namespace Betl.Dtsx2Yaml.Mappers;
 
@@ -26,7 +27,7 @@ public static class SqlServerDestination
         var conn = ConnectionLookup.For(pkg, c);
         w.Line($"- id: {YamlWriter.Id(c.Name)}");
         w.Indent(2);
-        w.Line("type: mssql.upsert");
+        w.Line("type: mssql.bulkinsert");
         if (fromId != null) w.Line($"from: {fromId}");
         w.Line($"connection: {YamlWriter.Id(conn?.Name ?? "warehouse")}");
 
@@ -37,8 +38,8 @@ public static class SqlServerDestination
             w.Comment("TODO: SQL Server Destination has no BulkInsertTableName — table unknown");
 
         /* Surface the non-trivial bulk-insert knobs so the operator can
-         * decide. We don't translate them — betl's mssql.upsert is
-         * higher level than BULK INSERT options. */
+         * decide. We don't translate them — betl's mssql.bulkinsert
+         * is higher level than the raw BULK INSERT options. */
         FlagOptional(w, c, "BulkInsertKeepIdentity",   "true",
             "KEEPIDENTITY (preserve source identity values)");
         FlagOptional(w, c, "BulkInsertFireTriggers",   "true",
@@ -46,9 +47,6 @@ public static class SqlServerDestination
         FlagOptional(w, c, "BulkInsertCheckConstraints", "false",
             "CHECK_CONSTRAINTS=false (skip constraint validation)");
 
-        w.Comment("TODO: SSIS SQL Server Destination is insert-only; betl upsert needs");
-        w.Comment("a key column list. Replace [] below with the actual primary key.");
-        w.Line("key: []");
         w.Indent(-2);
     }
 
@@ -61,7 +59,7 @@ public static class SqlServerDestination
             && v.Equals(nonDefault, System.StringComparison.OrdinalIgnoreCase))
         {
             w.Comment($"TODO: SSIS {prop}={nonDefault} — {explanation}; "
-                    + "betl mssql.upsert has no equivalent knob.");
+                    + "betl mssql.bulkinsert has no equivalent knob.");
         }
     }
 }

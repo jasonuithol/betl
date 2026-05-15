@@ -23,6 +23,7 @@
 
 #ifdef BETL_HAVE_ODBC
 #include "runtime/mssql_upsert.h"
+#include "runtime/mssql_bulkinsert.h"
 #include "runtime/mssql_lookup.h"
 #include "runtime/mssql_read.h"
 #endif
@@ -2333,6 +2334,8 @@ int betl_register_builtins(BetlRegistry *r) {
 #endif
 #ifdef BETL_HAVE_ODBC
     rc = betl_register_mssql(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_mssql_bulkinsert(r);
     if (rc != BETL_OK) return rc;
     rc = betl_register_mssql_lookup(r);
     if (rc != BETL_OK) return rc;

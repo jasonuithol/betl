@@ -36,7 +36,8 @@ static int is_in(const char *name, char **list, size_t n) {
     return 0;
 }
 
-/* INSERT only — the path used for OC_ERROR and as a building block. */
+/* INSERT only — the path used for OC_ERROR, mssql.bulkinsert, and as a
+ * building block. */
 static int append_plain_insert(BetlBuf *out,
                                const char *table,
                                char **cols, size_t n_cols) {
@@ -56,6 +57,12 @@ static int append_plain_insert(BetlBuf *out,
     }
     if (betl_buf_append(out, ")", 1) != 0) return -2;
     return 0;
+}
+
+int betl_build_mssql_insert_sql(BetlBuf *out,
+                                const char *table,
+                                char **cols, size_t n_cols) {
+    return append_plain_insert(out, table, cols, n_cols);
 }
 
 int betl_build_mssql_merge_sql(BetlBuf *out,

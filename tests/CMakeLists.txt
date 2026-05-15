@@ -466,6 +466,15 @@ if(ODBC_FOUND)
         PASS_REGULAR_EXPRESSION "ok: mssql_upsert integration test passed"
     )
 
+    # --- mssql.bulkinsert end-to-end integration test -----------------------
+    add_executable(test_mssql_bulkinsert test_mssql_bulkinsert.c)
+    target_link_libraries(test_mssql_bulkinsert PRIVATE betl_core betl_odbc)
+    add_test(NAME mssql_bulkinsert COMMAND test_mssql_bulkinsert)
+    set_tests_properties(mssql_bulkinsert PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: mssql_bulkinsert integration test passed"
+    )
+
     # --- mssql.lookup end-to-end integration test ---------------------------
     if(BETL_LUA_FOUND)
         add_executable(test_mssql_lookup test_mssql_lookup.c)

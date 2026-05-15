@@ -159,6 +159,7 @@ endif()
 if(ODBC_FOUND)
     target_sources(betl_core PRIVATE
         src/runtime/mssql_upsert.c
+        src/runtime/mssql_bulkinsert.c
         src/runtime/mssql_lookup.c
         src/runtime/mssql_read.c
     )

@@ -1,0 +1,25 @@
+# Bench shape D-bulk (1col): write path using the new mssql.bulkinsert
+# component (Phase 1: SQL_ATTR_PARAMSET_SIZE bulk-array binding).
+# Pairs with C-write-1col so we can compare apples-to-apples against
+# the row-by-row mssql.upsert numbers in BENCHMARKS.md.
+betl: 1
+name: bench-ssis-D-bulk-1col
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a FROM dbo.src_1col
+        batch_size: 10000
+      - id: sink
+        type: mssql.bulkinsert
+        from: source
+        connection: bench
+        table: 'dbo.dst_1col'
+        batch_size: 1000

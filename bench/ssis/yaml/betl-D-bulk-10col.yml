@@ -1,0 +1,22 @@
+# Bench shape D-bulk (10col): same as D-bulk-1col but 10 BIGINTs.
+betl: 1
+name: bench-ssis-D-bulk-10col
+connections:
+  bench:
+    type: mssql
+    dsn: ${env.BETL_TEST_MSSQL_DSN}
+pipeline:
+  - id: copy
+    type: dataflow
+    steps:
+      - id: source
+        type: mssql.read
+        connection: bench
+        query: SELECT a,b,c,d,e,f,g,h,i,j FROM dbo.src_10col
+        batch_size: 10000
+      - id: sink
+        type: mssql.bulkinsert
+        from: source
+        connection: bench
+        table: 'dbo.dst_10col'
+        batch_size: 1000

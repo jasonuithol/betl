@@ -183,12 +183,41 @@ network RTT dominates. The destination drops end-to-end
 throughput by **100×–500×** versus the read-only path
 (`A-10col` at ~1.5 M rows/s → `C-write-10col` at ~10 k rows/s).
 
-**This is the perf headroom for a future `mssql.bulkinsert`
-component** — bulk-array parameter binding via
-`SQL_ATTR_PARAMSET_SIZE` (or native FreeTDS `bcp_*`) would
-amortise the round-trip cost across thousands of rows per
-`SQLExecute`. See `docs/PIPELINECOMPONENT.md` for the
-implementation sketch.
+### Closing the gap: `mssql.bulkinsert` (Phase 1, landed 2026-05-15)
+
+`mssql.bulkinsert` is an insert-only sink that uses ODBC
+bulk-array parameter binding (`SQL_ATTR_PARAMSET_SIZE`).
+One `SQLPrepare`, columns bound as column-major arrays,
+one `SQLExecute` per batch (default 1000 rows). Same
+semantics as SSIS' `SQLServerDestination` — the converter
+maps `Microsoft.SQLServerDestination` → `mssql.bulkinsert`.
+
+Measured on the same hardware as the C-write numbers above:
+
+| shape (rows × cols)   | iter1 | iter2 | iter3 | bulkinsert rows/s | vs upsert |
+|-----------------------|------:|------:|------:|------------------:|----------:|
+| `D-bulk-1col`     (100 k × 1 BIGINT)  | 879 ms   | 901 ms   | 887 ms   | **~113 000** | **10.8×** |
+| `D-bulk-10col`    (100 k × 10 BIGINT) | 1070 ms  | 1052 ms  | 1040 ms  | **~95 000**  | **9.4×**  |
+| `D-bulk-10col-1m` (1 M × 10 BIGINT)   | 10 674 ms | 10 940 ms | 10 737 ms | **~93 000** | **9.3×** |
+
+Throughput now scales with **batch count** (~1000 SQLExecutes
+for 1 M rows) instead of **row count**, so per-RTT cost is
+amortised across 1000-row groups. Across all three shapes
+the speedup vs `mssql.upsert` is **~9-11×**, hitting the
+predicted Phase-1 target.
+
+`mssql.upsert` (row-by-row MERGE) stays unchanged — it
+remains the right choice for incremental/idempotent loads
+where on-conflict UPDATE semantics matter.
+
+### What's still on the table (Phase 2)
+
+Native FreeTDS `bcp_*` API would bypass ODBC on the write
+path entirely (TDS-level bulk frames, same as SSIS uses
+internally). Expected additional ~3× over the current Phase 1
+numbers, putting us at ~300 k rows/s — matching SSIS-on-
+Windows' typical bulk-insert throughput. Not landed yet; see
+`PIPELINECOMPONENT.md` for the design sketch.
 
 ### What's still untested
 
@@ -220,16 +249,24 @@ implementation sketch.
 ### Honest framing
 
 The "~5.8× steady-state" claim above is for the **read +
-transform + count** shape. It's a true measurement of what
-SSIS' pipeline + COM-RCW marshalling costs over the same
-data path. But for workloads that **write to SQL Server**,
-the comparison flips: SSIS' `SQLServerDestination` /
-`OLEDBDestination`-FastLoad use TDS-level bulk-copy
-(BCP-style) at industry-typical 300 k – 1 M rows/sec, while
-the current betl `mssql.upsert` is row-by-row at ~10 k
-rows/sec. Until a `mssql.bulkinsert` (or equivalent) lands,
-**betl's write side is the limiter** on round-trip ETL
-workloads against SQL Server.
+transform + count** shape. For workloads that **write to
+SQL Server**:
+
+- `mssql.upsert` (row-by-row MERGE, ~10 k rows/s) is still
+  slower than SSIS' bulk-load destinations. Use it for
+  incremental/idempotent loads, not bulk reload.
+- `mssql.bulkinsert` (Phase 1 ODBC bulk-array, ~93–113 k
+  rows/s) closes most of the gap; SSIS-on-Windows
+  `SQLServerDestination` / `OLEDBDestination`-FastLoad
+  typically run 300 k – 1 M rows/s on similar hardware, so
+  Phase 1 puts us within ~3× of that range. Phase 2 (native
+  FreeTDS BCP) is expected to close the rest.
+
+The SSIS-side write comparison still can't be measured from
+the Linux harness (shared-memory blocker for
+`SQLServerDestination`, opaque `0xC0048004` on hand-crafted
+`OLEDBDestination`-FastLoad). Numbers above are betl
+read+write end-to-end; SSIS-side requires Windows.
 
 ### Reproducing
 
