@@ -60,6 +60,9 @@ typedef struct {
     char        *sql;
     char       **param_cols;
     size_t       n_param_cols;     /* 0 → resolve from schema at run time */
+    int          params_explicit;  /* true iff `parameters:` was supplied
+                                    * (even as empty list) — when set, do
+                                    * NOT auto-fill from input schema */
 
     SQLHENV      henv;
     SQLHDBC      hdbc;
@@ -124,6 +127,7 @@ static int parse_param_list(ExState *e, const char *cfg,
         exset_err(e, "mssql.exec: `parameters:` must be a list");
         return -1;
     }
+    e->params_explicit = 1;
     ParamArrCtx c = { .e = e, .out = out, .n_out = n_out, .err = 0 };
     if (betl_tx_json_walk_array(p, param_visit, &c) != 0 || c.err) return -1;
     return 0;
@@ -390,11 +394,12 @@ static int fill_cell(ExState *e, const struct ArrowArray *col,
 static int prepare_and_bind(ExState *e, const struct ArrowSchema *sch) {
     if (e->prepared) return BETL_OK;
 
-    /* Resolve param column names (default = all input cols). */
+    /* Resolve param column names (default = all input cols when
+     * `parameters:` is absent; bind nothing when it's an empty list). */
     size_t n = e->n_param_cols;
     char **names = e->param_cols;
     int names_owned_by_us = 0;
-    if (n == 0) {
+    if (n == 0 && !e->params_explicit) {
         n = (size_t)sch->n_children;
         names = calloc(n, sizeof *names);
         if (!names) { exset_err(e, "mssql.exec: out of memory"); return BETL_ERR_INTERNAL; }

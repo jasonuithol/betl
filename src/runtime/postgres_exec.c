@@ -51,6 +51,9 @@ typedef struct {
     char        *sql;
     char       **param_cols;
     size_t       n_param_cols;
+    int          params_explicit;   /* true iff `parameters:` was supplied
+                                     * (even as empty list) — when set, do
+                                     * NOT auto-fill from input schema */
 
     PGconn      *conn;
     int          in_txn;
@@ -114,6 +117,7 @@ static int parse_param_list(PeState *p, const char *cfg,
         peset_err(p, "postgres.exec: `parameters:` must be a list");
         return -1;
     }
+    p->params_explicit = 1;
     ParamArrCtx c = { .p = p, .out = out, .n_out = n_out, .err = 0 };
     if (betl_tx_json_walk_array(pos, param_visit, &c) != 0 || c.err) return -1;
     return 0;
@@ -254,7 +258,7 @@ static int prepare_stmt(PeState *p, const struct ArrowSchema *sch) {
     size_t n = p->n_param_cols;
     char **names = p->param_cols;
     int names_owned = 0;
-    if (n == 0) {
+    if (n == 0 && !p->params_explicit) {
         n = (size_t)sch->n_children;
         names = calloc(n, sizeof *names);
         if (!names) { peset_err(p, "postgres.exec: out of memory"); return BETL_ERR_INTERNAL; }
