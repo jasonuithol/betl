@@ -351,10 +351,11 @@ if(CJSON_FOUND)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_CJSON)
 endif()
 
-# http.get / http.post when libcurl is available.
+# http.get / http.post + smtp.send when libcurl is available.
 if(LIBCURL_FOUND)
     target_sources(betl_core PRIVATE
         src/runtime/http_ops.c
+        src/runtime/smtp_send.c
     )
     target_link_libraries(betl_core PUBLIC betl_libcurl)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBCURL)

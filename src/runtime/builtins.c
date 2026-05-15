@@ -37,6 +37,7 @@
 
 #ifdef BETL_HAVE_LIBCURL
 #include "runtime/http_ops.h"
+#include "runtime/smtp_send.h"
 #endif
 
 #ifdef BETL_HAVE_ODBC
@@ -2404,6 +2405,8 @@ int betl_register_builtins(BetlRegistry *r) {
 #endif
 #ifdef BETL_HAVE_LIBCURL
     rc = betl_register_http_ops(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_smtp_send(r);
     if (rc != BETL_OK) return rc;
 #endif
     return rc;

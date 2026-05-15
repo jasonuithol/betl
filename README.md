@@ -174,6 +174,7 @@ Server.
 | TASK | `file.copy` / `file.move` / `file.delete` | ✓ | POSIX file ops; `src:`/`dst:` (copy/move) or `path:` (delete); cross-device move falls back to copy+unlink. SSIS File System Task |
 | TASK | `http.get` | ✓ | libcurl-based; `url:` + `save_to:` (response body), optional `headers:` list and `timeout: <n>s/<n>m`. Non-2xx fails with status code + body preview |
 | TASK | `http.post` | ✓ | Same shape as `http.get`; `body:` literal or `body_file:` path; headers/timeout/save_to as above |
+| TASK | `smtp.send` | ✓ | libcurl SMTP; `url:` (smtp:// or smtps://), `from:`, `to:` (list), optional `cc:`, `subject:`, `body:` or `body_file:`, optional `username:`/`password:` for AUTH. Plain text only — no attachments / HTML / MIME multipart yet. SSIS Send Mail Task |
 | CONTROL | `foreach` | ✓ | Iterates `body:` (nested stages) once per element of `over:` (literal list of strings). Binds `${vars.<as>}` per iteration. SSIS Foreach Loop Container — From-Variable enumerator |
 | CONTROL | `on_failure: continue` | ✓ | Per-stage attribute; a non-zero return is logged at WARN and the executor proceeds. SSIS Failure/Completion precedence constraints |
 | CONTROL | `condition: "<scalar>"` | ✓ | Per-stage attribute; after `${...}` substitution, truthy values run, falsy values skip with a WARN. v1 accepts true/false/yes/no/1/0; `{lang, expr}` form deferred |

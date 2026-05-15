@@ -470,6 +470,16 @@ if(CJSON_FOUND)
     )
 endif()
 
+# --- smtp.send config-validation tests (no SMTP server needed) -----------
+if(LIBCURL_FOUND)
+    add_executable(test_smtp_send test_smtp_send.c)
+    target_link_libraries(test_smtp_send PRIVATE betl_core)
+    add_test(NAME smtp_send COMMAND test_smtp_send)
+    set_tests_properties(smtp_send PROPERTIES
+        PASS_REGULAR_EXPRESSION "ok: smtp_send integration test passed"
+    )
+endif()
+
 
 # --- xlsx.write end-to-end test (libxlsxwriter required) -------------------
 if(XLSXWRITER_FOUND)
