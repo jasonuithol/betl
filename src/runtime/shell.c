@@ -69,11 +69,9 @@ static int parse_timeout(const char *raw, int *out_s) {
     long v = strtol(raw, &end, 10);
     if (end == raw || v < 0) return -1;
     int mul = 1;
-    if (*end == 's' || *end == 'S' || *end == '\0') mul = 1;
-    else if (*end == 'm' || *end == 'M')            mul = 60;
-    else                                            return -1;
-    /* Allow trailing whitespace after the unit. */
-    if (mul != 1) ++end;
+    if (*end == 's' || *end == 'S')      { mul = 1;  ++end; }
+    else if (*end == 'm' || *end == 'M') { mul = 60; ++end; }
+    else if (*end != '\0')               { return -1; }
     while (*end == ' ' || *end == '\t') ++end;
     if (*end != '\0') return -1;
     long long secs = (long long)v * mul;

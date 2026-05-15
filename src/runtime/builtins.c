@@ -30,6 +30,15 @@
 #include "runtime/shell.h"
 #include "runtime/file_ops.h"
 
+#ifdef BETL_HAVE_CJSON
+#include "runtime/json_read.h"
+#include "runtime/json_write.h"
+#endif
+
+#ifdef BETL_HAVE_LIBCURL
+#include "runtime/http_ops.h"
+#endif
+
 #ifdef BETL_HAVE_ODBC
 #include "runtime/mssql_upsert.h"
 #include "runtime/mssql_exec.h"
@@ -2387,5 +2396,15 @@ int betl_register_builtins(BetlRegistry *r) {
     if (rc != BETL_OK) return rc;
     rc = betl_register_file_ops(r);
     if (rc != BETL_OK) return rc;
+#ifdef BETL_HAVE_CJSON
+    rc = betl_register_json_read(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_json_write(r);
+    if (rc != BETL_OK) return rc;
+#endif
+#ifdef BETL_HAVE_LIBCURL
+    rc = betl_register_http_ops(r);
+    if (rc != BETL_OK) return rc;
+#endif
     return rc;
 }

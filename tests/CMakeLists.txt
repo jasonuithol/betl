@@ -460,6 +460,17 @@ set_tests_properties(control_flow PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: control_flow integration test passed"
 )
 
+# --- json.read / json.write round-trip (no DB / network) ------------------
+if(CJSON_FOUND)
+    add_executable(test_json_io test_json_io.c)
+    target_link_libraries(test_json_io PRIVATE betl_core)
+    add_test(NAME json_io COMMAND test_json_io)
+    set_tests_properties(json_io PROPERTIES
+        PASS_REGULAR_EXPRESSION "ok: json_io integration test passed"
+    )
+endif()
+
+
 # --- xlsx.write end-to-end test (libxlsxwriter required) -------------------
 if(XLSXWRITER_FOUND)
     add_executable(test_xlsx_write test_xlsx_write.c)

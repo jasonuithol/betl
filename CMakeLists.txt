@@ -154,6 +154,45 @@ else()
     message(STATUS "libxlsxio_read not found — xlsx.read component disabled")
 endif()
 
+# cJSON: used by json.read / json.write. Optional.
+find_path(CJSON_INCLUDE_DIR cjson/cJSON.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include
+)
+find_library(CJSON_LIBRARY NAMES cjson
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(CJSON_INCLUDE_DIR AND CJSON_LIBRARY)
+    set(CJSON_FOUND TRUE)
+    add_library(betl_cjson INTERFACE)
+    target_include_directories(betl_cjson INTERFACE ${CJSON_INCLUDE_DIR})
+    target_link_libraries(betl_cjson INTERFACE ${CJSON_LIBRARY})
+    message(STATUS "Found cJSON: ${CJSON_LIBRARY} (headers: ${CJSON_INCLUDE_DIR})")
+else()
+    set(CJSON_FOUND FALSE)
+    message(STATUS "cJSON not found — json.read/json.write disabled")
+endif()
+
+# libcurl: used by http.get / http.post. Optional.
+# Debian's libcurl4-openssl-dev installs curl/curl.h under the multiarch
+# include path; check both there and the regular include root.
+find_path(LIBCURL_INCLUDE_DIR curl/curl.h
+    HINTS ${CMAKE_SOURCE_DIR}/deps/include
+          ${CMAKE_SOURCE_DIR}/deps/include/x86_64-linux-gnu
+)
+find_library(LIBCURL_LIBRARY NAMES curl
+    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
+)
+if(LIBCURL_INCLUDE_DIR AND LIBCURL_LIBRARY)
+    set(LIBCURL_FOUND TRUE)
+    add_library(betl_libcurl INTERFACE)
+    target_include_directories(betl_libcurl INTERFACE ${LIBCURL_INCLUDE_DIR})
+    target_link_libraries(betl_libcurl INTERFACE ${LIBCURL_LIBRARY})
+    message(STATUS "Found libcurl: ${LIBCURL_LIBRARY} (headers: ${LIBCURL_INCLUDE_DIR})")
+else()
+    set(LIBCURL_FOUND FALSE)
+    message(STATUS "libcurl not found — http.* tasks disabled")
+endif()
+
 # libxml2: used by xml.read (SSIS XML Source parity). Optional.
 find_path(LIBXML2_INCLUDE_DIR libxml/xpath.h
     HINTS ${CMAKE_SOURCE_DIR}/deps/include/libxml2
@@ -301,6 +340,25 @@ target_sources(betl_core PRIVATE
     src/runtime/shell.c
     src/runtime/file_ops.c
 )
+
+# json.read / json.write when cJSON is available.
+if(CJSON_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/json_read.c
+        src/runtime/json_write.c
+    )
+    target_link_libraries(betl_core PUBLIC betl_cjson)
+    target_compile_definitions(betl_core PUBLIC BETL_HAVE_CJSON)
+endif()
+
+# http.get / http.post when libcurl is available.
+if(LIBCURL_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/http_ops.c
+    )
+    target_link_libraries(betl_core PUBLIC betl_libcurl)
+    target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBCURL)
+endif()
 
 # --- Engine binary ---------------------------------------------------------
 add_executable(betl

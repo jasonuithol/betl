@@ -143,10 +143,12 @@ Server.
 | SOURCE | `postgres.read` | ✓ | libpq cursor; int / text / float / DATE / TIMESTAMP[TZ] / TIME / NUMERIC / uuid / BYTEA; nulls supported |
 | SOURCE | `mssql.read` | ✓ | unixODBC + FreeTDS; int / varchar / float / DATE / DATETIME2 / DATETIMEOFFSET / TIME / DECIMAL / UNIQUEIDENTIFIER / VARBINARY; nulls supported |
 | SOURCE | `betl.gen_int64` / `betl.gen_strings` | ✓ | Test generators |
+| SOURCE | `json.read` | ✓ | NDJSON (default) or JSON array of objects; declared `columns:`; every column emitted as utf8 (downstream `map` + `ssisexpr` casts the rest) |
 | SINK | `csv.write` | ✓ | RFC 4180; renders all source types as ISO 8601 / canonical text (binary as lower-case hex) |
 | SINK | `postgres.upsert` | ✓ | INSERT…ON CONFLICT; 4 conflict modes; binds every source type incl. NUMERIC / TIMESTAMPTZ / uuid / TIME / BYTEA |
 | SINK | `mssql.upsert` | ✓ | MERGE; 4 conflict modes; binds DATE / DATETIME2 / DATETIMEOFFSET / DECIMAL / UNIQUEIDENTIFIER / TIME via SQL_C_CHAR text; VARBINARY via SQL_C_BINARY |
 | SINK | `betl.count_rows` | ✓ | Smoke / assertion sink |
+| SINK | `json.write` | ✓ | NDJSON or array form; column names become JSON keys; supports utf8 / int8/16/32/64 / float64 / bool. NaN/Inf emit as `null` |
 | TRANSFORM | `filter` | ✓ | Predicate via the expression engine |
 | TRANSFORM | `map` | ✓ | `add:` (append) and `select:` (project / rename) |
 | TRANSFORM | `aggregate` | ✓ | `group_by` + count / sum / min / max |
@@ -170,6 +172,8 @@ Server.
 | TASK | `sql.execute` | ✓ | Run a single SQL statement against a declared connection; dispatches by `type:` (postgres / mssql). SSIS Execute SQL Task at the control-flow layer |
 | TASK | `shell` | ✓ | fork+execvp with a literal `argv:` (no shell expansion); optional `timeout: <n>s` / `<n>m`; non-zero exit fails the task. SSIS Execute Process Task |
 | TASK | `file.copy` / `file.move` / `file.delete` | ✓ | POSIX file ops; `src:`/`dst:` (copy/move) or `path:` (delete); cross-device move falls back to copy+unlink. SSIS File System Task |
+| TASK | `http.get` | ✓ | libcurl-based; `url:` + `save_to:` (response body), optional `headers:` list and `timeout: <n>s/<n>m`. Non-2xx fails with status code + body preview |
+| TASK | `http.post` | ✓ | Same shape as `http.get`; `body:` literal or `body_file:` path; headers/timeout/save_to as above |
 | CONTROL | `foreach` | ✓ | Iterates `body:` (nested stages) once per element of `over:` (literal list of strings). Binds `${vars.<as>}` per iteration. SSIS Foreach Loop Container — From-Variable enumerator |
 | CONTROL | `on_failure: continue` | ✓ | Per-stage attribute; a non-zero return is logged at WARN and the executor proceeds. SSIS Failure/Completion precedence constraints |
 | CONTROL | `condition: "<scalar>"` | ✓ | Per-stage attribute; after `${...}` substitution, truthy values run, falsy values skip with a WARN. v1 accepts true/false/yes/no/1/0; `{lang, expr}` form deferred |
