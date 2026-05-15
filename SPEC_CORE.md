@@ -4,7 +4,7 @@
 
 This document defines the **runtime-neutral contract** that any conforming
 betl implementation must honor. It is deliberately smaller than the full
-`SPEC.md` reference, which describes the betl-legacy (C/Lua) implementation
+`SPEC.md` reference, which describes the betl.linux (C/Lua) implementation
 in detail. SPEC.md is one valid implementation of this contract; future
 implementations (e.g. betl.dotnet) implement the same contract differently.
 
@@ -308,7 +308,7 @@ plus spec-defined step types is the **guaranteed portable subset** —
 it runs on every conforming runtime that ships the providers it uses.
 
 The `ssisexpr` grammar and semantics are documented in `docs/SSISEXPR.md`
-in the betl-legacy repository and promoted to spec status by reference.
+in the betl.linux repository and promoted to spec status by reference.
 The name acknowledges its origin (SSIS expressions); the semantics are
 documented independently of any SSIS implementation.
 
@@ -427,7 +427,7 @@ that implement the languages and providers they use.
 
 | Runtime         | Status     | Languages              | Notes                              |
 |-----------------|------------|------------------------|------------------------------------|
-| **betl-legacy** | live       | `ssisexpr`, `lua`      | C engine, Lua scripting, AOT plugins. First implementation; the "in-spirit" name acknowledges that the destination is a multi-runtime family, not this one binary. |
+| **betl.linux**  | live       | `ssisexpr`, `lua`      | C engine, Lua scripting, AOT plugins. First implementation; named for its host platform — the destination is a multi-runtime family, not this one binary. |
 | **betl.dotnet** | planned    | `ssisexpr`, `csharp`   | Headless .NET 8 engine. Hosts compiled SSIS PipelineComponents. |
 
 ## 15. Glossary

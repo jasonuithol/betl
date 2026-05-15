@@ -9,7 +9,7 @@ binary blobs, no IDE lock-in.
 > sub-ABI are stable in shape but may gain fields before v1.0.
 >
 > The runtime-neutral contract is documented in
-> [`SPEC_CORE.md`](SPEC_CORE.md). This repository hosts **betl-legacy**
+> [`SPEC_CORE.md`](SPEC_CORE.md). This repository hosts **betl.linux**
 > — the first reference implementation (C engine + Lua scripting). A
 > second reference implementation, `betl.dotnet` (headless .NET 8,
 > hosts compiled SSIS components on Linux), is planned. See
@@ -98,7 +98,7 @@ upserts, and SSIS-style date enrichment with `ssisexpr`.
 
 ## Migrating from SSIS
 
-SSIS migration is one supported use case, not the headline. betl-legacy
+SSIS migration is one supported use case, not the headline. betl.linux
 ships four pieces aimed at it:
 
 - **`betl-dtsx2yaml`** (in `tools/`) — a C# console converter that reads
@@ -135,7 +135,7 @@ recompile a third-party C# component against the shim, drop the
 `.dll` into a plugins directory, run it on Linux without SSDT or SQL
 Server.
 
-## What betl-legacy ships (v0.1 + v0.2)
+## What betl.linux ships (v0.1 + v0.2)
 
 | Kind | Component | Status | Notes |
 |---|---|---|---|
@@ -276,7 +276,7 @@ schemas/                  JSON Schema for the YAML pipeline format
 docs/EXPR_ABI.md          Expression-engine ABI reference
 docs/SSISEXPR.md          SSIS-EL function reference (for `.dtsx` migrations)
 docs/PIPELINECOMPONENT.md `dotnet.pipelinecomponent` API + porting guide
-SPEC.md                   Full betl-legacy design (text-first, types, ABI, …)
+SPEC.md                   Full betl.linux design (text-first, types, ABI, …)
 SPEC_CORE.md              Runtime-neutral contract; what conforming
                           implementations must honor
 ```
@@ -286,7 +286,7 @@ SPEC_CORE.md              Runtime-neutral contract; what conforming
 - [`SPEC_CORE.md`](SPEC_CORE.md) — the runtime-neutral contract: file
   format, step types, type system, placeholder mechanism, validation
   rules, conformance levels. What any betl implementation must honor.
-- [`SPEC.md`](SPEC.md) — full betl-legacy design and rationale,
+- [`SPEC.md`](SPEC.md) — full betl.linux design and rationale,
   including the type system (Apache Arrow), the provider model, and
   v0.x vs. v1 commitments.
 - `include/betl/provider.h` — authoritative C ABI for components and
