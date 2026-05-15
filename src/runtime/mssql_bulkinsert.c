@@ -49,8 +49,19 @@
  * ODBC max is 65535 (SQL_UINTEGER); driver-side limits are typically
  * lower (memory cost per batch grows linearly). 1000 is the sweet
  * spot in practice for INSERT into SQL Server. */
-#define BI_DEFAULT_BATCH 1000
-#define BI_MAX_BATCH     65535
+/* Mode-dependent default batch sizes:
+ *   array: 1000 — bigger doesn't help (the ODBC driver flattens
+ *          SQL_ATTR_PARAMSET_SIZE arrays to per-row INSERTs server-
+ *          side) and costs memory proportional to batch_size.
+ *   bcp:   10000 — TDS bulk-load throughput keeps climbing through
+ *          ~20k before flattening. Memory cost in bcp mode is
+ *          negligible because we only allocate one row of scalar
+ *          buffers regardless of batch_size; batch_size only
+ *          controls the bcp_batch commit-grouping cadence.
+ * Both can be overridden via the `batch_size:` config. */
+#define BI_DEFAULT_BATCH_ARRAY 1000
+#define BI_DEFAULT_BATCH_BCP   10000
+#define BI_MAX_BATCH           65535
 
 /* Per-column max-width caps for variable-length types. Rows that
  * exceed these limits return BETL_ERR_INVALID at fill time rather
@@ -404,7 +415,6 @@ static int ms_init(BetlContext *ctx, const char *cfg, void **state) {
     s->ctx = ctx;
     s->henv = SQL_NULL_HENV;
     s->hdbc = SQL_NULL_HDBC;
-    s->batch_size = BI_DEFAULT_BATCH;
 
     if (json_string(cfg, "connection", &s->connection_name) != 0
         || !s->connection_name)
@@ -422,18 +432,9 @@ static int ms_init(BetlContext *ctx, const char *cfg, void **state) {
         s->explicit_cols   = NULL;
         s->n_explicit_cols = 0;
     }
-    int64_t bs = 0;
-    if (json_int(cfg, "batch_size", &bs) == 0) {
-        if (bs < 1 || bs > BI_MAX_BATCH) {
-            betl_set_error(ctx,
-                "mssql.bulkinsert: batch_size %" PRId64
-                " out of range (1..%d)", bs, BI_MAX_BATCH);
-            goto fail;
-        }
-        s->batch_size = (size_t)bs;
-    }
 
-    /* mode: array (default) | bcp (requires libsybdb at compile time) */
+    /* mode: array (default) | bcp (requires libsybdb at compile time).
+     * Parse first so the batch_size default can be mode-dependent. */
     char *mode_str = NULL;
     json_string(cfg, "mode", &mode_str);
     if (mode_str && *mode_str) {
@@ -459,6 +460,21 @@ static int ms_init(BetlContext *ctx, const char *cfg, void **state) {
         }
     }
     free(mode_str);
+
+    /* Default batch_size depends on mode (see BI_DEFAULT_BATCH_*).
+     * Explicit batch_size: overrides. */
+    s->batch_size = (s->mode == MS_MODE_BCP)
+        ? BI_DEFAULT_BATCH_BCP : BI_DEFAULT_BATCH_ARRAY;
+    int64_t bs = 0;
+    if (json_int(cfg, "batch_size", &bs) == 0) {
+        if (bs < 1 || bs > BI_MAX_BATCH) {
+            betl_set_error(ctx,
+                "mssql.bulkinsert: batch_size %" PRId64
+                " out of range (1..%d)", bs, BI_MAX_BATCH);
+            goto fail;
+        }
+        s->batch_size = (size_t)bs;
+    }
 
     /* ODBC connection is only needed in array mode. BCP mode opens
      * its own dblib connection in ms_bcp_run() when the data starts

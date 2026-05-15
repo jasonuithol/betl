@@ -22,4 +22,7 @@ pipeline:
         connection: bench
         table: 'dbo.dst_1col'
         mode: bcp
-        batch_size: 1000
+        # Uses the BCP default batch_size = 10000. Bigger batches help
+        # significantly in bcp mode (the knee is around 10-20k) and
+        # carry no memory cost since bcp mode only allocates one row's
+        # worth of scalar buffers regardless of batch_size.

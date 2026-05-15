@@ -219,23 +219,55 @@ Same TDS-level bulk-load protocol SQL Server's
 `SQLServerDestination` uses on Windows. Requires
 `libsybdb` at build time (Debian's `freetds-dev`/`libsybdb5`).
 
+#### Initial numbers at `batch_size = 1000`
+
 | shape (rows × cols)   | iter1 | iter2 | iter3 | bcp rows/s | vs upsert | vs array |
 |-----------------------|------:|------:|------:|-----------:|----------:|---------:|
-| `E-bcp-1col`     (100 k × 1 BIGINT)  | 478 ms   | 499 ms   | 508 ms   | **~199 000** | **19×**  | **1.8×** |
-| `E-bcp-10col`    (100 k × 10 BIGINT) | 575 ms   | 576 ms   | 577 ms   | **~174 000** | **17×**  | **1.8×** |
-| `E-bcp-10col-1m` (1 M × 10 BIGINT)   | 5 693 ms | 5 953 ms | 5 692 ms | **~172 000** | **17.5×**| **1.9×** |
+| `E-bcp-1col`     (100 k × 1 BIGINT)  | 478 ms   | 499 ms   | 508 ms   | ~199 000  | 19×    | 1.8× |
+| `E-bcp-10col`    (100 k × 10 BIGINT) | 575 ms   | 576 ms   | 577 ms   | ~174 000  | 17×    | 1.8× |
+| `E-bcp-10col-1m` (1 M × 10 BIGINT)   | 5 693 ms | 5 953 ms | 5 692 ms | ~172 000  | 17.5×  | 1.9× |
 
-BCP gives a further ~1.8× over the Phase 1 ODBC bulk-array
-path — less than the 3× originally projected, because Phase 1
-was already amortising RTT effectively at batch=1000. The
-absolute throughput (~175 k rows/s) closes most of the gap
-to SSIS' typical 300 k+ rows/s; the remaining gap is dominated
-by server-side ingest cost on this hardware.
+#### Batch-size sweep (1 M × 10 BIGINT, mode=bcp)
 
-`mode: bcp` is currently opt-in (default stays `array`) so
-betl builds without `libsybdb` keep working. The dtsx2yaml
-converter emits `mode: array` and a comment suggesting
-operators flip to `mode: bcp` when their build supports it.
+In BCP mode `batch_size` is only the `bcp_batch` commit-
+grouping cadence — no per-batch memory allocation, so it
+can be raised freely.
+
+| batch_size | best wall | rows/sec | gain vs 1000 |
+|-----------:|----------:|---------:|-------------:|
+| 1 000      | 5 692 ms  | ~175 k   | 1.0× |
+| 2 000      | 4 130 ms  | ~242 k   | 1.4× |
+| 5 000      | 3 167 ms  | ~316 k   | 1.8× |
+| 10 000     | 2 786 ms  | ~359 k   | 2.0× |
+| 20 000     | 2 513 ms  | ~398 k   | 2.3× |
+| 50 000     | 2 356 ms  | ~424 k   | 2.4× |
+| 65 535     | 2 321 ms  | ~431 k   | 2.5× |
+
+Knee around batch_size = 10 000; further gains are marginal.
+The component now defaults to **`batch_size = 10000` in bcp
+mode**, **`batch_size = 1000` in array mode** (the latter
+doesn't benefit from bigger batches — the ODBC driver
+appears to flatten `SQL_ATTR_PARAMSET_SIZE` arrays to per-
+row INSERTs server-side).
+
+#### Headline numbers at the tuned default
+
+| shape (rows × cols)   | iter1 | iter2 | iter3 | rows/sec | vs upsert |
+|-----------------------|------:|------:|------:|---------:|----------:|
+| `E-bcp-1col`     (100 k × 1 BIGINT)  | 226 ms   | 242 ms   | 226 ms   | **~442 000** | **~42×** |
+| `E-bcp-10col`    (100 k × 10 BIGINT) | 292 ms   | 291 ms   | 294 ms   | **~344 000** | **~34×** |
+| `E-bcp-10col-1m` (1 M × 10 BIGINT)   | 2 789 ms | 2 787 ms | 2 772 ms | **~361 000** | **~36×** |
+
+That's a **1 M row 10-column load in ~2.8 seconds**, down
+from ~100 s on the original `mssql.upsert` path — a 36× total
+speedup. The 100 k cases land at ~442 k and ~344 k rows/s,
+mid-range for SSIS' typical 300 k - 1 M bulk-insert
+throughput on similar hardware.
+
+`mode: bcp` remains opt-in (default stays `array`) so betl
+builds without `libsybdb` keep working. The dtsx2yaml
+converter emits no `mode` field; operators flip to
+`mode: bcp` when their build supports it.
 
 ### What's still untested
 
@@ -277,10 +309,12 @@ SQL Server**:
   ~93-113 k rows/s) closes most of the gap; SSIS-on-Windows
   `SQLServerDestination` / `OLEDBDestination`-FastLoad
   typically run 300 k - 1 M rows/s on similar hardware.
-- `mssql.bulkinsert` `mode: bcp` (Phase 2 native FreeTDS BCP,
-  ~172-199 k rows/s) lands within ~1.5-2× of typical
-  Windows-side throughput. Default-off until libsybdb is in
-  every build; flip to it for write-heavy workloads.
+- `mssql.bulkinsert` `mode: bcp` at the new tuned default
+  (batch_size=10000) ≈ **~344-442 k rows/s** — squarely in
+  the middle of SSIS' typical 300 k-1 M Windows range, and
+  no longer the limiter for round-trip ETL workloads against
+  SQL Server. Default-off until libsybdb is in every build;
+  flip to it for write-heavy workloads.
 
 The SSIS-side write comparison still can't be measured from
 the Linux harness (shared-memory blocker for

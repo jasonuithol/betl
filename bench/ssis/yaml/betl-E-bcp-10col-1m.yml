@@ -22,4 +22,4 @@ pipeline:
         connection: bench
         table: 'dbo.dst_10col_1m'
         mode: bcp
-        batch_size: 1000
+        # Uses the BCP default batch_size = 10000.
