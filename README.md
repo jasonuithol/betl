@@ -167,6 +167,9 @@ Server.
 | TRANSFORM | `dotnet.pipelinecomponent` | ✓ | Hosts user-written `PipelineComponent` source with the SSIS lifecycle; sync + async modes, error-row routing, full DataType set incl. decimal128 / GUID / timestamps. See [`docs/PIPELINECOMPONENT.md`](docs/PIPELINECOMPONENT.md) |
 | TASK | `lua.task` | ✓ | Standalone Lua script with host bridges |
 | TASK | `dotnet.task` | ✓ | Standalone C# / VB.NET Script Task analogue; NativeAOT compile-on-validate; Params / Connection / Log bridges |
+| TASK | `sql.execute` | ✓ | Run a single SQL statement against a declared connection; dispatches by `type:` (postgres / mssql). SSIS Execute SQL Task at the control-flow layer |
+| TASK | `shell` | ✓ | fork+execvp with a literal `argv:` (no shell expansion); optional `timeout: <n>s` / `<n>m`; non-zero exit fails the task. SSIS Execute Process Task |
+| TASK | `file.copy` / `file.move` / `file.delete` | ✓ | POSIX file ops; `src:`/`dst:` (copy/move) or `path:` (delete); cross-device move falls back to copy+unlink. SSIS File System Task |
 | TOOL | `betl-dtsx2yaml` | ✓ | DTSX → betl YAML converter; ships in `tools/`, runs separately from `betl run` |
 | ENGINE | `literal` | ✓ | Constant expressions (built-in) |
 | ENGINE | `lua` | ✓ | Lua 5.4 (provider plugin) |

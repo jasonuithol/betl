@@ -23,6 +23,13 @@
 #include "runtime/postgres_read.h"
 #endif
 
+#if defined(BETL_HAVE_LIBPQ) || defined(BETL_HAVE_ODBC)
+#include "runtime/sql_execute.h"
+#endif
+
+#include "runtime/shell.h"
+#include "runtime/file_ops.h"
+
 #ifdef BETL_HAVE_ODBC
 #include "runtime/mssql_upsert.h"
 #include "runtime/mssql_exec.h"
@@ -2372,5 +2379,13 @@ int betl_register_builtins(BetlRegistry *r) {
     rc = betl_register_xml_read(r);
     if (rc != BETL_OK) return rc;
 #endif
+#if defined(BETL_HAVE_LIBPQ) || defined(BETL_HAVE_ODBC)
+    rc = betl_register_sql_execute(r);
+    if (rc != BETL_OK) return rc;
+#endif
+    rc = betl_register_shell(r);
+    if (rc != BETL_OK) return rc;
+    rc = betl_register_file_ops(r);
+    if (rc != BETL_OK) return rc;
     return rc;
 }

@@ -286,6 +286,22 @@ if(LIBXML2_FOUND)
     target_compile_definitions(betl_core PUBLIC BETL_HAVE_LIBXML2)
 endif()
 
+# sql.execute — control-flow task that dispatches by connection type.
+# Available when at least one backend (libpq, ODBC) is compiled in.
+if(LIBPQ_FOUND OR ODBC_FOUND)
+    target_sources(betl_core PRIVATE
+        src/runtime/sql_execute.c
+    )
+endif()
+
+# shell / file.copy / file.move / file.delete — control-flow tasks
+# that close out the SSIS Execute Process and File System Task gaps.
+# POSIX-only; always built.
+target_sources(betl_core PRIVATE
+    src/runtime/shell.c
+    src/runtime/file_ops.c
+)
+
 # --- Engine binary ---------------------------------------------------------
 add_executable(betl
     src/cli/main.c

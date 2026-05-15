@@ -436,6 +436,22 @@ set_tests_properties(csv_write PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: csv.write end-to-end test passed"
 )
 
+# --- shell control-flow task tests (POSIX-only, no DB needed) -------------
+add_executable(test_shell test_shell.c)
+target_link_libraries(test_shell PRIVATE betl_core)
+add_test(NAME shell COMMAND test_shell)
+set_tests_properties(shell PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: shell integration test passed"
+)
+
+# --- file.copy / file.move / file.delete tests (POSIX-only) ---------------
+add_executable(test_file_ops test_file_ops.c)
+target_link_libraries(test_file_ops PRIVATE betl_core)
+add_test(NAME file_ops COMMAND test_file_ops)
+set_tests_properties(file_ops PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: file_ops integration test passed"
+)
+
 # --- xlsx.write end-to-end test (libxlsxwriter required) -------------------
 if(XLSXWRITER_FOUND)
     add_executable(test_xlsx_write test_xlsx_write.c)
@@ -640,6 +656,15 @@ if(LIBPQ_FOUND)
     set_tests_properties(pg_exec PROPERTIES
         SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "ok: pg_exec integration test passed"
+    )
+
+    # --- sql.execute end-to-end integration test (control-flow task) -------
+    add_executable(test_sql_execute test_sql_execute.c)
+    target_link_libraries(test_sql_execute PRIVATE betl_core betl_libpq)
+    add_test(NAME sql_execute COMMAND test_sql_execute)
+    set_tests_properties(sql_execute PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: sql_execute integration test passed"
     )
 
     # --- postgres.copy end-to-end integration test (binary COPY) -----------
