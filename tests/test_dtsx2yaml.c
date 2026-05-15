@@ -425,12 +425,12 @@ int main(void) {
     CHECK_CONTAINS(yaml, "from: [src, src2]");
     CHECK_CONTAINS(yaml, "SSIS Merge preserves sort order");
 
-    /* SCD → passthrough + TODO mentioning MERGE rewrite + dim table. */
+    /* SCD → passthrough + recipe scaffold referencing example 05. */
     CHECK_CONTAINS(yaml, "id: dimupdate");
-    CHECK_CONTAINS(yaml, "Slowly Changing Dimension has no betl equivalent");
-    CHECK_CONTAINS(yaml, "MERGEs the staged rows");
-    CHECK_CONTAINS(yaml, "Dimension table: [dbo].[DimThing]");
+    CHECK_CONTAINS(yaml, "examples/05-scd-type2");
+    CHECK_CONTAINS(yaml, "Target dim table:   [dbo].[DimThing]");
     CHECK_CONTAINS(yaml, "SELECT dim_id, label FROM dbo.DimThing");
+    CHECK_CONTAINS(yaml, "Update history?     yes");
 
     /* Percentage / Row Sampling — both passthrough + TODO + preserved values. */
     CHECK_CONTAINS(yaml, "id: pctsamp");

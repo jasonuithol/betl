@@ -23,11 +23,13 @@ visible in the YAML helps when something diverges from expectations.
                        ▼
               conditional_split
                   ╱        ╲
-               new          changed
-                │              │
-                └─── union ────┤
-                       │       │
-                       │       └─→ close_old_version
+               new       changed
+                │            │
+                │       multicast
+                │       ╱       ╲
+                │   for_insert   for_close
+                │       │           │
+                └─union─┘           └─→ close_old_version
                        │              (UPDATE dim SET is_current=false,
                        │               valid_to = batch_ts WHERE customer_sk=$1)
                        │
@@ -97,21 +99,105 @@ Re-running with the same staging is a no-op (every row classifies
 as UNCHANGED). Re-running after a tracked column in staging changes
 produces a new dim row at `batch_ts` and closes the old one.
 
+## Mixing type-1 ("changing") attributes
+
+Real SSIS SCDs mix attribute kinds per column. The base recipe above
+tracks every changed column as a type-2 (historical) change. To
+overwrite a column in place instead — type-1 semantics, no new row,
+no closed version — extend the classifier and add a third branch.
+
+### Diff against the base recipe
+
+Suppose `name` and `address` are type-2 (track history) and `email`
+is type-1 (overwrite the current row in place):
+
+```yaml
+      - id: classify
+        type: map
+        from: joined
+        add:
+          # NEW / TYPE2_CHANGED / TYPE1_ONLY / UNCHANGED.
+          # betl's `lang: lua` wraps expressions as `return (<expr>)`,
+          # so multi-statement Lua won't compile here. Express the
+          # 4-way choice with chained `a and b or c` ternaries:
+          scd_status:
+            lang: lua
+            expr: |
+              row.dim_sk == nil and "NEW"
+                or (row.name    ~= row.dim_name
+                 or row.address ~= row.dim_address) and "TYPE2_CHANGED"
+                or row.email    ~= row.dim_email   and "TYPE1_ONLY"
+                or "UNCHANGED"
+
+      - id: route
+        type: conditional_split
+        from: classify
+        cases:
+          - { name: new,         where: 'row.scd_status == "NEW"' }
+          - { name: type2,       where: 'row.scd_status == "TYPE2_CHANGED"' }
+          - { name: type1_only,  where: 'row.scd_status == "TYPE1_ONLY"' }
+        default: unchanged
+
+      # ... insert_new_version / close_old_version as before
+      # for `route:new` + `route:type2`.
+
+      # NEW: overwrite the type-1 columns on the current dim_sk
+      # without closing it or generating a new version.
+      - id: overwrite_type1
+        type: postgres.exec
+        from: route:type1_only
+        connection: warehouse
+        sql: |
+          UPDATE dim.customer
+             SET email = $1
+           WHERE customer_sk = $2
+        parameters: [email, dim_sk]
+```
+
+A type-2 change on a row that *also* has a type-1 difference is
+treated as a single type-2 split: when you start a new version the
+type-1 column gets its fresh value naturally — no separate UPDATE
+needed. Only "type-1 alone" rows hit the `overwrite_type1` branch.
+
+## Handling "fixed" attributes
+
+For columns that must never change after the dim row is created,
+validate in `classify` and route mismatches to an error sink. SSIS
+calls this the Fixed-Attribute Output. The recipe extension:
+
+```yaml
+      # Inside the classify map, add a second derived column:
+      add:
+        scd_status: ...
+        fixed_violation:
+          lang: lua
+          expr: |
+            (row.dim_sk and row.country_code ~= row.dim_country_code)
+              and "VIOLATION" or "OK"
+
+      # Then add a route branch that fails the pipeline:
+      - id: fixed_violations
+        type: filter
+        from: classify
+        where: 'row.fixed_violation == "VIOLATION"'
+
+      - id: stop_on_violation
+        type: betl.count_rows
+        from: fixed_violations
+        expect: 0          # any violation → pipeline fails here
+```
+
 ## Notes & limitations
 
 - **One `batch_ts` per run.** Both branches use the same timestamp so
   history stays consistent. Pass the same value to every retry of a
   failed batch.
-- **Type-1 ("changing") and "fixed" attributes** aren't covered. Real
-  SSIS SCD transforms can mix the two kinds per column. To extend:
-  - For type-1, add a `route:type1_only_changed` stream that emits an
-    UPDATE-in-place against the current dim_sk.
-  - For "fixed", validate in the classify step and route mismatches
-    to an error sink.
 - **Inferred-member handling** (load a placeholder dim row when the
   fact lands before the dim) — not modelled. The fact-side pipeline
   can use a `*.lookup` with `on_miss: error` and a separate
   late-arriving-dim job.
 - **`dtsx2yaml`** translates SSIS Slowly Changing Dimension
-  transforms into this exact recipe shape (one-to-many lowering), so
-  packages converted from .dtsx land here automatically.
+  transforms into a commented scaffold of this recipe shape — the
+  scaffold includes per-column ColumnType extraction (key / type-1 /
+  type-2 / fixed) so the operator can drop the values into the
+  classifier and route branches above.

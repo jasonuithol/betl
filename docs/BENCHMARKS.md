@@ -524,3 +524,48 @@ still warm). **Warm** reuses the cached .so.
 - **cold**: min=1473.60 ms · p50=1473.60 ms · max=1473.60 ms · maxrss=9776 KB
 - **warm**: min=0.63 ms · p50=0.64 ms · max=2.03 ms · maxrss=9848 KB
 
+
+## SCD type-2 recipe (landed 2026-05-15)
+
+Composed-not-coded: the SCD type-2 pattern lives as
+[`examples/05-scd-type2/`](../examples/05-scd-type2/) (Postgres) and
+[`examples/06-scd-type2-mssql/`](../examples/06-scd-type2-mssql/) (SQL
+Server), using only existing transforms (`join` + `map` +
+`conditional_split` + `multicast` + `union` + `postgres.exec` /
+`mssql.exec`). bench/scd/yaml/scd.yml mirrors the recipe.
+
+### Shape
+
+| Phase | N (staging) | Dim state at run start | Outcome | p50 | Throughput |
+|---|---:|---|---|---:|---:|
+| Initial load | 10k  | empty                     | 10k NEW           | 450 ms | ~22k rows/s |
+| Initial load | 100k | empty                     | 100k NEW          | 4.4 s  | ~22k rows/s |
+| Steady state | 100k | 100k current (matching)   | 100k UNCHANGED    | 40 s   | ~2.5k rows/s |
+
+### Reading the numbers
+
+- **Initial load is INSERT-bound.** ~22k rows/sec matches the
+  `postgres.upsert` baseline from the SSIS comparison bench
+  (~24-26k rows/sec) — both are bottlenecked by per-row round-trip
+  on the INSERT path. For 10× headroom, swap `insert_new_version`
+  for a staging table + a final `postgres.copy` flush (the
+  ~660k-1M rows/s tier from the `postgres.copy` bench above).
+
+- **Steady-state (everything UNCHANGED) is 16× slower per-row
+  than the all-NEW path.** That's the per-row Lua classify
+  function getting called for every staging row when no rows
+  actually land in dim, with no per-row INSERT to amortize
+  across. The fix here is the same staging+bulk strategy plus
+  a coarser pre-filter (e.g. `WHERE staging.updated_at > last_sync`)
+  to skip the classify altogether for rows that demonstrably
+  didn't change upstream.
+
+Reproducing:
+
+```sh
+export BETL_TEST_PG_BENCH_DSN=postgresql://.../betl_bench
+psql "$BETL_TEST_PG_BENCH_DSN" -f bench/scd/setup.sql
+bench/scd/run.sh 100000 0                # 100k all-NEW
+bench/scd/run.sh 100000 100000           # 100k vs 100k (50/25/25 mix)
+```
+

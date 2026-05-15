@@ -1,0 +1,122 @@
+# =============================================================================
+# Example 06 — SCD type-2 dimension load on SQL Server.
+#
+# Sibling of example 05; same recipe shape, MSSQL data types + ODBC `?`
+# placeholders. See examples/05-scd-type2/README.md for the full pattern
+# description; this file only documents the MSSQL-specific differences.
+#
+# Setup (one-time):
+#   sqlcmd -S <server> -d <db> -i sql/dim_setup.sql
+#
+# Run:
+#   export WAREHOUSE_DSN="DRIVER={FreeTDS};SERVER=...;DATABASE=...;UID=...;PWD=..."
+#   betl run pipeline.betl.yml --param batch_ts=2026-05-15T00:00:00
+# =============================================================================
+
+betl: 1
+name: scd-type2-customer-mssql
+
+parameters:
+  batch_ts:
+    type: timestamp
+    required: true
+
+connections:
+  warehouse:
+    type: mssql
+    dsn: ${env.WAREHOUSE_DSN}
+
+pipeline:
+  - id: scd_customer
+    type: dataflow
+    steps:
+      - id: stage
+        type: mssql.read
+        connection: warehouse
+        query: SELECT customer_id, name, email, address FROM stg.customer
+
+      - id: current_dim
+        type: mssql.read
+        connection: warehouse
+        query: |
+          SELECT customer_id  AS dim_customer_id,
+                 customer_sk  AS dim_sk,
+                 name         AS dim_name,
+                 email        AS dim_email,
+                 address      AS dim_address
+            FROM dim.customer_current
+
+      - id: joined
+        type: join
+        kind: left
+        from: [stage, current_dim]
+        # `"on"` quoted so YAML 1.1 doesn't coerce it to a boolean.
+        "on": { customer_id: dim_customer_id }
+
+      - id: classify
+        type: map
+        from: joined
+        add:
+          scd_status:
+            lang: lua
+            expr: |
+              row.dim_sk == nil and "NEW"
+                or (row.name    ~= row.dim_name
+                 or row.email   ~= row.dim_email
+                 or row.address ~= row.dim_address) and "CHANGED"
+                or "UNCHANGED"
+
+      - id: route
+        type: conditional_split
+        from: classify
+        cases:
+          - { name: new,     where: 'row.scd_status == "NEW"' }
+          - { name: changed, where: 'row.scd_status == "CHANGED"' }
+        default: unchanged
+
+      # CHANGED rows feed both the union below AND close_old_version
+      # — fan out so each consumer gets its own stream.
+      - id: changed_fan
+        type: multicast
+        from: route:changed
+        taps: [for_insert, for_close]
+
+      - id: to_insert
+        type: union
+        from: [route:new, changed_fan:for_insert]
+
+      - id: shape_new
+        type: map
+        from: to_insert
+        select: [customer_id, name, email, address]
+
+      # MSSQL/ODBC uses positional `?` placeholders, not Postgres $N.
+      # The valid_from / is_current columns come from inline literals
+      # since ODBC parameter binding doesn't help with constants the
+      # way pg's $N placeholders for params would.
+      - id: insert_new_version
+        type: mssql.exec
+        from: shape_new
+        connection: warehouse
+        sql: |
+          INSERT INTO dim.customer
+              (customer_id, name, email, address, valid_from, is_current)
+          VALUES (?, ?, ?, ?, '${params.batch_ts}', 1)
+        parameters: [customer_id, name, email, address]
+      - id: drain_inserts
+        type: betl.count_rows
+        from: insert_new_version
+
+      - id: close_old_version
+        type: mssql.exec
+        from: changed_fan:for_close
+        connection: warehouse
+        sql: |
+          UPDATE dim.customer
+             SET is_current = 0,
+                 valid_to   = '${params.batch_ts}'
+           WHERE customer_sk = ?
+        parameters: [dim_sk]
+      - id: drain_closes
+        type: betl.count_rows
+        from: close_old_version

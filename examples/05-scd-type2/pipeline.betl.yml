@@ -59,11 +59,16 @@ pipeline:
     steps:
 
       # 1. Source: the new image of the customer list (staging).
+      #    customer_id is cast to BIGINT so it arrives as Arrow int64;
+      #    postgres.exec only binds int64/float64/utf8/bool in v0.1, so
+      #    narrower INTEGER (int32) columns need widening before the
+      #    exec step downstream sees them.
       - id: stage
         type: postgres.read
         connection: warehouse
         query: |
-          SELECT customer_id, name, email, address
+          SELECT customer_id::bigint AS customer_id,
+                 name, email, address
             FROM stg.customer
 
       # 2. Right side of the join: the current dim image. Renamed so
@@ -72,11 +77,11 @@ pipeline:
         type: postgres.read
         connection: warehouse
         query: |
-          SELECT customer_id  AS dim_customer_id,
-                 customer_sk  AS dim_sk,
-                 name         AS dim_name,
-                 email        AS dim_email,
-                 address      AS dim_address
+          SELECT customer_id::bigint  AS dim_customer_id,
+                 customer_sk          AS dim_sk,
+                 name                 AS dim_name,
+                 email                AS dim_email,
+                 address              AS dim_address
             FROM dim.customer_current
 
       # 3. LEFT JOIN — every staging row appears once; dim_* columns
@@ -85,9 +90,21 @@ pipeline:
         type: join
         kind: left
         from: [stage, current_dim]
-        on: { customer_id: dim_customer_id }
+        # `"on"` is quoted to dodge YAML 1.1's bare-keyword → boolean
+        # coercion (yes/no/on/off). betl's libyaml parser doesn't apply
+        # the coercion, but downstream tools (e.g. PyYAML-based linters)
+        # do — keep the key portable.
+        "on": { customer_id: dim_customer_id }
 
-      # 4. Classify each row as NEW / CHANGED / UNCHANGED.
+      # 4. Classify each row as NEW / CHANGED / UNCHANGED. betl's
+      #    `lang: lua` evaluates the source as a single expression
+      #    (the engine wraps it as `return (<expr>) end`), so a
+      #    statement-form if/elseif chain is invalid here — use the
+      #    `a and b or c` ternary idiom instead. Lua's `and`/`or`
+      #    short-circuit and return values, so this reads as:
+      #      if  dim_sk == nil          → "NEW"
+      #      elif tracked cols differ   → "CHANGED"
+      #      else                       → "UNCHANGED"
       - id: classify
         type: map
         from: joined
@@ -95,15 +112,11 @@ pipeline:
           scd_status:
             lang: lua
             expr: |
-              if row.dim_sk == nil then
-                return "NEW"
-              elseif row.name    ~= row.dim_name
-                  or row.email   ~= row.dim_email
-                  or row.address ~= row.dim_address then
-                return "CHANGED"
-              else
-                return "UNCHANGED"
-              end
+              row.dim_sk == nil and "NEW"
+                or (row.name    ~= row.dim_name
+                 or row.email   ~= row.dim_email
+                 or row.address ~= row.dim_address) and "CHANGED"
+                or "UNCHANGED"
 
       # 5. Route into named streams. UNCHANGED falls into the default
       #    bucket which has no downstream consumer — those rows are
@@ -116,11 +129,20 @@ pipeline:
           - { name: changed, where: 'row.scd_status == "CHANGED"' }
         default: unchanged
 
-      # 6. Union the NEW and CHANGED streams — both contribute one
+      # 6. CHANGED rows have two downstream consumers: the union below
+      #    (which feeds the new-version INSERT) AND the
+      #    close_old_version UPDATE step. A single port can have only
+      #    one consumer attached, so we fan it out via multicast first.
+      - id: changed_fan
+        type: multicast
+        from: route:changed
+        taps: [for_insert, for_close]
+
+      # 7. Union the NEW and CHANGED streams — both contribute one
       #    NEW dim row each.
       - id: to_insert
         type: union
-        from: [route:new, route:changed]
+        from: [route:new, changed_fan:for_insert]
 
       # 7. Project to just the dim columns (drop the dim_* lookup
       #    payload and scd_status). The SK is auto-generated; the
@@ -131,7 +153,9 @@ pipeline:
         select: [customer_id, name, email, address]
 
       # 8. INSERT the new dim row. `postgres.exec` runs the SQL once
-      #    per input row with parameter binding.
+      #    per input row with parameter binding. It's a TRANSFORM
+      #    (pass-through), so each branch needs a terminating sink to
+      #    drive the per-row pull — betl.count_rows fills that role.
       - id: insert_new_version
         type: postgres.exec
         from: shape_new
@@ -141,13 +165,16 @@ pipeline:
               (customer_id, name, email, address, valid_from, is_current)
           VALUES ($1, $2, $3, $4, '${params.batch_ts}', TRUE)
         parameters: [customer_id, name, email, address]
+      - id: drain_inserts
+        type: betl.count_rows
+        from: insert_new_version
 
-      # 9. For CHANGED rows only: close the OLD dim_sk. valid_to is
-      #    stamped with batch_ts (same value the new-version row used
-      #    for valid_from — the close + open happen at the same instant).
+      # 10. For CHANGED rows only: close the OLD dim_sk. valid_to is
+      #     stamped with batch_ts (same value the new-version row used
+      #     for valid_from — the close + open happen at the same instant).
       - id: close_old_version
         type: postgres.exec
-        from: route:changed
+        from: changed_fan:for_close
         connection: warehouse
         sql: |
           UPDATE dim.customer
@@ -155,3 +182,6 @@ pipeline:
                  valid_to   = '${params.batch_ts}'
            WHERE customer_sk = $1
         parameters: [dim_sk]
+      - id: drain_closes
+        type: betl.count_rows
+        from: close_old_version

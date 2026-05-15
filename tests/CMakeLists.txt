@@ -478,6 +478,17 @@ if(LIBCURL_FOUND)
     set_tests_properties(smtp_send PROPERTIES
         PASS_REGULAR_EXPRESSION "ok: smtp_send integration test passed"
     )
+
+    # --- http.get / http.post against a local Python http.server -----------
+    # Spawns a python3 process for the duration of the test; skips when
+    # the server fails to come up within 5s.
+    add_executable(test_http_ops test_http_ops.c)
+    target_link_libraries(test_http_ops PRIVATE betl_core)
+    add_test(NAME http_ops COMMAND test_http_ops)
+    set_tests_properties(http_ops PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: http_ops integration test passed"
+    )
 endif()
 
 
@@ -573,6 +584,25 @@ if(ODBC_FOUND)
     set_tests_properties(mssql_exec PROPERTIES
         SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "ok: mssql_exec integration test passed"
+    )
+
+    # --- SCD type-2 recipe on MSSQL (example 06) end-to-end ----------------
+    # Mirrors test_scd_type2.c (Postgres) — same 2-batch flow, MSSQL types,
+    # `?` placeholders, mssql.{read,exec}. Loads betl-lua.so for the
+    # classify step's `lang: lua` engine.
+    add_executable(test_scd_type2_mssql test_scd_type2_mssql.c)
+    target_link_libraries(test_scd_type2_mssql PRIVATE betl_core betl_odbc)
+    set_target_properties(test_scd_type2_mssql PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_scd_type2_mssql PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
+    add_dependencies(test_scd_type2_mssql ${BETL_LUA_TARGET})
+    add_test(NAME scd_type2_mssql
+        COMMAND test_scd_type2_mssql $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
+    set_tests_properties(scd_type2_mssql PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: scd_type2_mssql integration test passed"
     )
 
     # --- mssql.lookup end-to-end integration test ---------------------------
@@ -699,11 +729,18 @@ if(LIBPQ_FOUND)
     # --- SCD type-2 recipe (example 05) end-to-end ------------------------
     # Drives the full recipe (lookup → classify → split → union → insert
     # + close-old) through two batches and verifies dim history is correct.
-    # Depends on the lua plugin for the Lua `add:` block in classify.
+    # Loads the lua plugin explicitly (its `lang: lua` classify step
+    # needs the engine registered — tests don't get the CLI's auto-load).
     add_executable(test_scd_type2 test_scd_type2.c)
     target_link_libraries(test_scd_type2 PRIVATE betl_core betl_libpq)
+    set_target_properties(test_scd_type2 PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(test_scd_type2 PRIVATE
+        BETL_TEST_PLUGIN_PATH="$<TARGET_FILE:${BETL_LUA_TARGET}>"
+    )
     add_dependencies(test_scd_type2 ${BETL_LUA_TARGET})
-    add_test(NAME scd_type2 COMMAND test_scd_type2)
+    add_test(NAME scd_type2
+        COMMAND test_scd_type2 $<TARGET_FILE:${BETL_LUA_TARGET}>
+    )
     set_tests_properties(scd_type2 PROPERTIES
         SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "ok: scd_type2 integration test passed"

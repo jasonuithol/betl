@@ -144,9 +144,22 @@ static void step_incoming(int i, int *out, size_t *out_count, void *user) {
     const StepCtx *c = user;
     const BetlDataflowStep *step = &c->s->steps[i];
     *out_count = 0;
+    /* Deduplicate by step index. A step that consumes multiple output
+     * ports of the same upstream (`from: [route:new, route:changed]`)
+     * still has exactly one *dependency* on that upstream; surfacing
+     * duplicates here would inflate the topo-sort's indeg and the
+     * downstream step would never reach indeg==0 (because the Kahn-
+     * style scan only decrements one match per processed predecessor).
+     * Real-world trigger: SCD recipes feed a union from two ports of
+     * a conditional_split. */
     for (size_t k = 0; k < step->input_count; ++k) {
         int idx = step_index_ref(c->s, step->inputs[k]);
-        if (idx >= 0 && *out_count < 64) out[(*out_count)++] = idx;
+        if (idx < 0) continue;
+        int seen = 0;
+        for (size_t j = 0; j < *out_count; ++j) {
+            if (out[j] == idx) { seen = 1; break; }
+        }
+        if (!seen && *out_count < 64) out[(*out_count)++] = idx;
     }
 }
 

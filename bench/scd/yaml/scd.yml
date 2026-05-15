@@ -1,0 +1,111 @@
+# SCD type-2 bench pipeline. Mirrors examples/05-scd-type2/pipeline.betl.yml
+# but reads/writes scdbench_dim / scdbench_stg.
+
+betl: 1
+name: scd-bench
+
+parameters:
+  batch_ts:
+    type: timestamp
+    required: true
+
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.BETL_TEST_PG_BENCH_DSN}
+
+pipeline:
+  - id: scd_customer
+    type: dataflow
+    steps:
+      # Cast customer_id / surrogate-key columns to BIGINT so they
+      # arrive as Arrow int64 — postgres.exec only binds int64, utf8,
+      # float64, bool in v0.1, so the narrower INTEGER (int32) coming
+      # from the source columns has to be widened before it hits the
+      # exec step downstream.
+      - id: stage
+        type: postgres.read
+        connection: warehouse
+        query: |
+          SELECT customer_id::bigint AS customer_id,
+                 name, email, address
+            FROM scdbench_stg.customer
+        batch_size: 10000
+
+      - id: current_dim
+        type: postgres.read
+        connection: warehouse
+        query: |
+          SELECT customer_id::bigint  AS dim_customer_id,
+                 customer_sk          AS dim_sk,
+                 name                 AS dim_name,
+                 email                AS dim_email,
+                 address              AS dim_address
+            FROM scdbench_dim.customer_current
+        batch_size: 10000
+
+      - id: joined
+        type: join
+        kind: left
+        from: [stage, current_dim]
+        "on": { customer_id: dim_customer_id }
+
+      - id: classify
+        type: map
+        from: joined
+        add:
+          scd_status:
+            lang: lua
+            expr: |
+              row.dim_sk == nil and "NEW"
+                or row.address ~= row.dim_address and "CHANGED"
+                or "UNCHANGED"
+
+      - id: route
+        type: conditional_split
+        from: classify
+        cases:
+          - { name: new,     where: 'row.scd_status == "NEW"' }
+          - { name: changed, where: 'row.scd_status == "CHANGED"' }
+        default: unchanged
+
+      - id: changed_fan
+        type: multicast
+        from: route:changed
+        taps: [for_insert, for_close]
+
+      - id: to_insert
+        type: union
+        from: [route:new, changed_fan:for_insert]
+
+      - id: shape_new
+        type: map
+        from: to_insert
+        select: [customer_id, name, email, address]
+
+      - id: insert_new_version
+        type: postgres.exec
+        from: shape_new
+        connection: warehouse
+        sql: |
+          INSERT INTO scdbench_dim.customer
+              (customer_id, name, email, address, valid_from, is_current)
+          VALUES ($1, $2, $3, $4, '${params.batch_ts}', TRUE)
+        parameters: [customer_id, name, email, address]
+      - id: drain_inserts
+        type: betl.count_rows
+        from: insert_new_version
+
+      - id: close_old_version
+        type: postgres.exec
+        from: changed_fan:for_close
+        connection: warehouse
+        sql: |
+          UPDATE scdbench_dim.customer
+             SET is_current = FALSE,
+                 valid_to   = '${params.batch_ts}'
+           WHERE customer_sk = $1
+        parameters: [dim_sk]
+      - id: drain_closes
+        type: betl.count_rows
+        from: close_old_version

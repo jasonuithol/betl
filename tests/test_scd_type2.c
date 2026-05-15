@@ -54,7 +54,8 @@ static int write_file(const char *path, const char *contents) {
     return rc;
 }
 
-static int run_pipeline(const char *yaml_path, const char *batch_ts) {
+static int run_pipeline(const char *yaml_path, const char *batch_ts,
+                        const char *lua_plugin_path) {
     char err[1024] = {0};
     BetlPipeline *p = betl_pipeline_load(yaml_path, err, sizeof err);
     if (!p) { fprintf(stderr, "pipeline_load: %s\n", err); return -1; }
@@ -62,6 +63,13 @@ static int run_pipeline(const char *yaml_path, const char *batch_ts) {
     BetlRegistry *reg = betl_registry_create();
     int rc = BETL_ERR_INTERNAL;
     if (ctx && reg && betl_register_builtins(reg) == BETL_OK) {
+        /* The recipe uses `lang: lua` in the classify step; load the
+         * plugin so the engine is registered. The CLI auto-loads it
+         * from the build tree but tests have to do it explicitly. */
+        if (lua_plugin_path
+            && betl_registry_load(reg, lua_plugin_path) != BETL_OK) {
+            fprintf(stderr, "load lua: %s\n", betl_registry_last_error(reg));
+        }
         betl_context_set_param(ctx, "batch_ts", batch_ts);
         char conn_err[256];
         rc = betl_apply_connections(ctx, p, conn_err, sizeof conn_err);
@@ -89,7 +97,13 @@ static int count_where(PGconn *c, const char *schema_dim,
     return n;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const char *lua_plugin = (argc >= 2) ? argv[1]
+#ifdef BETL_TEST_PLUGIN_PATH
+        : BETL_TEST_PLUGIN_PATH;
+#else
+        : NULL;
+#endif
     const char *dsn = getenv("BETL_TEST_PG_DSN");
     if (!dsn || !*dsn) {
         dsn = default_dsn();
@@ -163,16 +177,16 @@ int main(void) {
         "      - id: stage\n"
         "        type: postgres.read\n"
         "        connection: warehouse\n"
-        "        query: 'SELECT customer_id, name, email, address FROM %s.customer'\n"
+        "        query: 'SELECT customer_id::bigint AS customer_id, name, email, address FROM %s.customer'\n"
         "      - id: current_dim\n"
         "        type: postgres.read\n"
         "        connection: warehouse\n"
         "        query: |\n"
-        "          SELECT customer_id  AS dim_customer_id,\n"
-        "                 customer_sk  AS dim_sk,\n"
-        "                 name         AS dim_name,\n"
-        "                 email        AS dim_email,\n"
-        "                 address      AS dim_address\n"
+        "          SELECT customer_id::bigint AS dim_customer_id,\n"
+        "                 customer_sk         AS dim_sk,\n"
+        "                 name                AS dim_name,\n"
+        "                 email               AS dim_email,\n"
+        "                 address             AS dim_address\n"
         "            FROM %s.customer_current\n"
         "      - id: joined\n"
         "        type: join\n"
@@ -186,15 +200,11 @@ int main(void) {
         "          scd_status:\n"
         "            lang: lua\n"
         "            expr: |\n"
-        "              if row.dim_sk == nil then\n"
-        "                return \"NEW\"\n"
-        "              elseif row.name ~= row.dim_name "
-                          "or row.email ~= row.dim_email "
-                          "or row.address ~= row.dim_address then\n"
-        "                return \"CHANGED\"\n"
-        "              else\n"
-        "                return \"UNCHANGED\"\n"
-        "              end\n"
+        "              row.dim_sk == nil and \"NEW\"\n"
+        "                or (row.name ~= row.dim_name "
+                              "or row.email ~= row.dim_email "
+                              "or row.address ~= row.dim_address) and \"CHANGED\"\n"
+        "                or \"UNCHANGED\"\n"
         "      - id: route\n"
         "        type: conditional_split\n"
         "        from: classify\n"
@@ -202,9 +212,13 @@ int main(void) {
         "          - { name: new,     where: 'row.scd_status == \"NEW\"' }\n"
         "          - { name: changed, where: 'row.scd_status == \"CHANGED\"' }\n"
         "        default: unchanged\n"
+        "      - id: changed_fan\n"
+        "        type: multicast\n"
+        "        from: route:changed\n"
+        "        taps: [for_insert, for_close]\n"
         "      - id: to_insert\n"
         "        type: union\n"
-        "        from: [route:new, route:changed]\n"
+        "        from: [route:new, changed_fan:for_insert]\n"
         "      - id: shape_new\n"
         "        type: map\n"
         "        from: to_insert\n"
@@ -215,12 +229,18 @@ int main(void) {
         "        connection: warehouse\n"
         "        sql: \"INSERT INTO %s.customer (customer_id, name, email, address, valid_from, is_current) VALUES ($1, $2, $3, $4, '${params.batch_ts}', TRUE)\"\n"
         "        parameters: [customer_id, name, email, address]\n"
+        "      - id: drain_inserts\n"
+        "        type: betl.count_rows\n"
+        "        from: insert_new_version\n"
         "      - id: close_old_version\n"
         "        type: postgres.exec\n"
-        "        from: route:changed\n"
+        "        from: changed_fan:for_close\n"
         "        connection: warehouse\n"
         "        sql: \"UPDATE %s.customer SET is_current = FALSE, valid_to = '${params.batch_ts}' WHERE customer_sk = $1\"\n"
-        "        parameters: [dim_sk]\n",
+        "        parameters: [dim_sk]\n"
+        "      - id: drain_closes\n"
+        "        type: betl.count_rows\n"
+        "        from: close_old_version\n",
         schema_stg, schema_dim, schema_dim, schema_dim);
 
     char yaml_path[128];
@@ -241,7 +261,7 @@ int main(void) {
         schema_stg);
     if (pg_exec(c, seed) != 0) goto teardown;
 
-    CHECK(run_pipeline(yaml_path, "2026-05-01T00:00:00+00") == BETL_OK);
+    CHECK(run_pipeline(yaml_path, "2026-05-01T00:00:00+00", lua_plugin) == BETL_OK);
     CHECK(count_where(c, schema_dim, "is_current = true")  == 3);
     CHECK(count_where(c, schema_dim, "is_current = false") == 0);
     CHECK(count_where(c, schema_dim,
@@ -258,7 +278,7 @@ int main(void) {
         schema_stg, schema_stg);
     if (pg_exec(c, seed) != 0) goto teardown;
 
-    CHECK(run_pipeline(yaml_path, "2026-05-02T00:00:00+00") == BETL_OK);
+    CHECK(run_pipeline(yaml_path, "2026-05-02T00:00:00+00", lua_plugin) == BETL_OK);
 
     /* dim now has:
      *   sk_1: customer 1, current   (no change)

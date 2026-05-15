@@ -246,6 +246,7 @@
       "description": "A pipeline step. The `type` field discriminates between built-in components, tasks, and provider-defined components.",
       "oneOf": [
         { "$ref": "#/$defs/step_dataflow" },
+        { "$ref": "#/$defs/step_foreach" },
         { "$ref": "#/$defs/step_filter" },
         { "$ref": "#/$defs/step_map" },
         { "$ref": "#/$defs/step_lookup" },
@@ -256,11 +257,16 @@
         { "$ref": "#/$defs/step_sql_execute" },
         { "$ref": "#/$defs/step_shell" },
         { "$ref": "#/$defs/step_http" },
+        { "$ref": "#/$defs/step_http_get" },
+        { "$ref": "#/$defs/step_http_post" },
+        { "$ref": "#/$defs/step_smtp_send" },
         { "$ref": "#/$defs/step_file_op" },
         { "$ref": "#/$defs/step_lua_map" },
         { "$ref": "#/$defs/step_python_transform" },
         { "$ref": "#/$defs/step_csv_read" },
         { "$ref": "#/$defs/step_csv_write" },
+        { "$ref": "#/$defs/step_json_read" },
+        { "$ref": "#/$defs/step_json_write" },
         { "$ref": "#/$defs/step_query_convention" },
         { "$ref": "#/$defs/step_upsert_convention" },
         { "$ref": "#/$defs/step_provider_generic" }
@@ -276,6 +282,34 @@
         "steps": {
           "type": "array",
           "description": "Inner data-flow steps wired together by `from:` edges.",
+          "items": { "$ref": "#/$defs/step" }
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_foreach": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Iterates `body:` once per element of `over:`. Binds the current value to `${vars.<as>}` for the duration of each iteration. v1 supports literal-list iteration only; future enumerators (file glob, rowset) will gate on additional keys.",
+      "required": ["over", "as", "body"],
+      "properties": {
+        "type": { "const": "foreach" },
+        "over": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Literal list of values to iterate over. Each iteration binds one element to `${vars.<as>}`.",
+          "items": { "type": "string" }
+        },
+        "as": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "Variable name bound per iteration. Use as `${vars.<name>}` inside `body:` stages."
+        },
+        "body": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Nested stages to run once per `over:` element. Same shape as top-level pipeline stages.",
           "items": { "$ref": "#/$defs/step" }
         }
       },
@@ -564,6 +598,11 @@
           "minItems": 1,
           "items": { "type": "string" }
         },
+        "timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(s|S|m|M)?$",
+          "description": "Optional wall-clock timeout (e.g. \"30s\", \"5m\"). Capped at 24h. On expiry the process group receives SIGTERM, then SIGKILL after a 5s grace."
+        },
         "env": {
           "type": "object",
           "additionalProperties": { "type": "string" }
@@ -594,6 +633,120 @@
             { "type": "array", "items": { "type": "integer" } }
           ]
         }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_http_get": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "HTTP GET that streams the response body to a local file. Designed for fetching JSON/CSV/XML data — chain to json.read / csv.read / xml.read downstream.",
+      "required": ["url", "save_to"],
+      "properties": {
+        "type":    { "const": "http.get" },
+        "url":     { "type": "string" },
+        "save_to": { "type": "string" },
+        "headers": {
+          "type": "array",
+          "description": "Optional list of \"Name: value\" header strings.",
+          "items": { "type": "string" }
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(s|S|m|M)?$",
+          "description": "Optional wall-clock timeout (e.g. \"30s\", \"2m\"). Capped at 1h."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_http_post": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "HTTP POST that streams the response body to a local file. `body:` literal XOR `body_file:` path supplies the request body.",
+      "required": ["url", "save_to"],
+      "properties": {
+        "type":      { "const": "http.post" },
+        "url":       { "type": "string" },
+        "save_to":   { "type": "string" },
+        "body":      { "type": "string" },
+        "body_file": { "type": "string" },
+        "headers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(s|S|m|M)?$"
+        }
+      },
+      "oneOf": [
+        { "required": ["body"],      "not": { "required": ["body_file"] } },
+        { "required": ["body_file"], "not": { "required": ["body"] } },
+        { "not": { "anyOf": [{"required": ["body"]}, {"required": ["body_file"]}] } }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "step_smtp_send": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Send an email via SMTP. libcurl-based; plain text only (no attachments / MIME multipart in v1).",
+      "required": ["url", "from", "to", "subject"],
+      "properties": {
+        "type":     { "const": "smtp.send" },
+        "url":      { "type": "string", "description": "smtp:// (cleartext + opportunistic STARTTLS) or smtps:// (implicit TLS)." },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "from":     { "type": "string" },
+        "to":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "cc":       { "type": "array", "items": { "type": "string" } },
+        "subject":  { "type": "string" },
+        "body":     { "type": "string" },
+        "body_file":{ "type": "string" }
+      },
+      "oneOf": [
+        { "required": ["body"],      "not": { "required": ["body_file"] } },
+        { "required": ["body_file"], "not": { "required": ["body"] } }
+      ],
+      "unevaluatedProperties": false
+    },
+
+    "step_json_read": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Read NDJSON (default) or a JSON array of objects. All columns emitted as utf8; coerce types downstream with `map` + ssisexpr.",
+      "required": ["path", "columns"],
+      "properties": {
+        "type":    { "const": "json.read" },
+        "path":    { "type": "string" },
+        "format":  { "enum": ["ndjson", "array"], "default": "ndjson" },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Output column names. Each row picks these keys out of the JSON object; missing keys become null.",
+          "items": { "type": "string" }
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576,
+          "default": 1024
+        }
+      },
+      "unevaluatedProperties": false
+    },
+
+    "step_json_write": {
+      "allOf": [{ "$ref": "#/$defs/step_common" }],
+      "type": "object",
+      "description": "Write rows as NDJSON (default) or as a single JSON array of objects. Column names become JSON keys.",
+      "required": ["from", "path"],
+      "properties": {
+        "type":   { "const": "json.write" },
+        "from":   { "type": "string" },
+        "path":   { "type": "string" },
+        "format": { "enum": ["ndjson", "array"], "default": "ndjson" }
       },
       "unevaluatedProperties": false
     },
@@ -752,12 +905,14 @@
             "anyOf": [
               {
                 "enum": [
-                  "dataflow", "filter", "map", "lookup", "join",
+                  "dataflow", "foreach", "filter", "map", "lookup", "join",
                   "aggregate", "union", "sort",
-                  "sql.execute", "shell", "http",
+                  "sql.execute", "shell", "http", "http.get", "http.post",
+                  "smtp.send",
                   "file.copy", "file.move", "file.delete",
                   "lua.map", "python.transform",
-                  "csv.read", "csv.write"
+                  "csv.read", "csv.write",
+                  "json.read", "json.write"
                 ]
               },
               { "type": "string", "pattern": "^[a-z][a-z0-9_]*\\.query$" },
