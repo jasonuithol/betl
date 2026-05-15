@@ -1,0 +1,157 @@
+# =============================================================================
+# Example 05 — SCD type-2 dimension load using only the standard transforms.
+#
+# Pattern (no specialised component; entirely composed from existing pieces):
+#
+#       stg                 dim.customer_current
+#        |                          |
+#        '--> join (left) <---------'
+#                  |
+#                  v
+#              classify    [scd_status: NEW | CHANGED | UNCHANGED]
+#                  |
+#                  v
+#         conditional_split (new, changed)
+#               /     \
+#         new ─┘       └─ changed
+#               |             |
+#               '─ union ─────.
+#                             |
+#                             v
+#                       insert_new_version       (INSERTs new dim row)
+#
+#                       (changed) ──> close_old  (UPDATEs valid_to/is_current
+#                                                  on the OLD dim_sk)
+#
+# Setup (one-time):
+#   psql ${WAREHOUSE_DSN} -f sql/dim_setup.sql
+#
+# Run:
+#   export WAREHOUSE_DSN=postgresql://.../warehouse
+#   betl run pipeline.betl.yml --param batch_ts=2026-05-15T00:00:00Z
+#
+# Re-running with the same staging snapshot is a no-op (all rows are
+# UNCHANGED); running again with a changed staging row produces a new
+# dim row and closes the old one.
+# =============================================================================
+
+betl: 1
+name: scd-type2-customer
+
+parameters:
+  batch_ts:
+    type: timestamp
+    required: true
+    doc: |
+      Effective timestamp for this batch. The new-version rows are
+      stamped with this as valid_from, and the closed old-version rows
+      get this as their valid_to. Pass the same value to every
+      retry of a failed batch so history stays consistent.
+
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.WAREHOUSE_DSN}
+
+pipeline:
+  - id: scd_customer
+    type: dataflow
+    steps:
+
+      # 1. Source: the new image of the customer list (staging).
+      - id: stage
+        type: postgres.read
+        connection: warehouse
+        query: |
+          SELECT customer_id, name, email, address
+            FROM stg.customer
+
+      # 2. Right side of the join: the current dim image. Renamed so
+      #    columns don't collide with `stage` when joined.
+      - id: current_dim
+        type: postgres.read
+        connection: warehouse
+        query: |
+          SELECT customer_id  AS dim_customer_id,
+                 customer_sk  AS dim_sk,
+                 name         AS dim_name,
+                 email        AS dim_email,
+                 address      AS dim_address
+            FROM dim.customer_current
+
+      # 3. LEFT JOIN — every staging row appears once; dim_* columns
+      #    are NULL for business keys not yet in the dim.
+      - id: joined
+        type: join
+        kind: left
+        from: [stage, current_dim]
+        on: { customer_id: dim_customer_id }
+
+      # 4. Classify each row as NEW / CHANGED / UNCHANGED.
+      - id: classify
+        type: map
+        from: joined
+        add:
+          scd_status:
+            lang: lua
+            expr: |
+              if row.dim_sk == nil then
+                return "NEW"
+              elseif row.name    ~= row.dim_name
+                  or row.email   ~= row.dim_email
+                  or row.address ~= row.dim_address then
+                return "CHANGED"
+              else
+                return "UNCHANGED"
+              end
+
+      # 5. Route into named streams. UNCHANGED falls into the default
+      #    bucket which has no downstream consumer — those rows are
+      #    silently dropped.
+      - id: route
+        type: conditional_split
+        from: classify
+        cases:
+          - { name: new,     where: 'row.scd_status == "NEW"' }
+          - { name: changed, where: 'row.scd_status == "CHANGED"' }
+        default: unchanged
+
+      # 6. Union the NEW and CHANGED streams — both contribute one
+      #    NEW dim row each.
+      - id: to_insert
+        type: union
+        from: [route:new, route:changed]
+
+      # 7. Project to just the dim columns (drop the dim_* lookup
+      #    payload and scd_status). The SK is auto-generated; the
+      #    valid_from / is_current values come from constants.
+      - id: shape_new
+        type: map
+        from: to_insert
+        select: [customer_id, name, email, address]
+
+      # 8. INSERT the new dim row. `postgres.exec` runs the SQL once
+      #    per input row with parameter binding.
+      - id: insert_new_version
+        type: postgres.exec
+        from: shape_new
+        connection: warehouse
+        sql: |
+          INSERT INTO dim.customer
+              (customer_id, name, email, address, valid_from, is_current)
+          VALUES ($1, $2, $3, $4, '${params.batch_ts}', TRUE)
+        parameters: [customer_id, name, email, address]
+
+      # 9. For CHANGED rows only: close the OLD dim_sk. valid_to is
+      #    stamped with batch_ts (same value the new-version row used
+      #    for valid_from — the close + open happen at the same instant).
+      - id: close_old_version
+        type: postgres.exec
+        from: route:changed
+        connection: warehouse
+        sql: |
+          UPDATE dim.customer
+             SET is_current = FALSE,
+                 valid_to   = '${params.batch_ts}'
+           WHERE customer_sk = $1
+        parameters: [dim_sk]

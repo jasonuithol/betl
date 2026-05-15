@@ -696,6 +696,19 @@ if(LIBPQ_FOUND)
         PASS_REGULAR_EXPRESSION "ok: sql_execute integration test passed"
     )
 
+    # --- SCD type-2 recipe (example 05) end-to-end ------------------------
+    # Drives the full recipe (lookup → classify → split → union → insert
+    # + close-old) through two batches and verifies dim history is correct.
+    # Depends on the lua plugin for the Lua `add:` block in classify.
+    add_executable(test_scd_type2 test_scd_type2.c)
+    target_link_libraries(test_scd_type2 PRIVATE betl_core betl_libpq)
+    add_dependencies(test_scd_type2 ${BETL_LUA_TARGET})
+    add_test(NAME scd_type2 COMMAND test_scd_type2)
+    set_tests_properties(scd_type2 PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: scd_type2 integration test passed"
+    )
+
     # --- postgres.copy end-to-end integration test (binary COPY) -----------
     add_executable(test_pg_copy test_pg_copy.c)
     target_link_libraries(test_pg_copy PRIVATE betl_core betl_libpq)
