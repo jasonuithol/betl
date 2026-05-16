@@ -40,19 +40,10 @@ static void __attribute__((destructor)) fuzz_shutdown(void) {
     unlink(g_path);
 }
 
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    FILE *f = fopen(g_path, "wb");
-    if (!f) return 0;
-    if (size) fwrite(data, 1, size, f);
-    fclose(f);
-
-    char cfg[256];
-    snprintf(cfg, sizeof cfg,
-             "{\"path\": \"%s\", \"batch_size\": 64}", g_path);
-
+static void drive_one(const char *cfg_json) {
     void *state = NULL;
-    if (g_json_def->init(g_ctx, cfg, &state) != BETL_OK || !state) {
-        return 0;
+    if (g_json_def->init(g_ctx, cfg_json, &state) != BETL_OK || !state) {
+        return;
     }
     struct ArrowArrayStream stream = {0};
     if (g_json_def->attach_output(state, 0, &stream) == BETL_OK) {
@@ -66,5 +57,30 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (stream.release) stream.release(&stream);
     }
     g_json_def->destroy(state);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FILE *f = fopen(g_path, "wb");
+    if (!f) return 0;
+    if (size) fwrite(data, 1, size, f);
+    fclose(f);
+
+    /* json.read requires `columns:` in config — without it, init bails
+     * before the parser ever runs. Drive two configs so both the array
+     * (default) and ndjson paths get exercised. */
+    char cfg[512];
+
+    /* Config 1: array format (default). */
+    snprintf(cfg, sizeof cfg,
+             "{\"path\": \"%s\", \"batch_size\": 64,"
+             " \"columns\": [\"id\", \"name\", \"value\"]}", g_path);
+    drive_one(cfg);
+
+    /* Config 2: ndjson format. */
+    snprintf(cfg, sizeof cfg,
+             "{\"path\": \"%s\", \"format\": \"ndjson\", \"batch_size\": 64,"
+             " \"columns\": [\"id\", \"name\", \"value\"]}", g_path);
+    drive_one(cfg);
+
     return 0;
 }
