@@ -20,6 +20,7 @@ versions listed.
 | NativeAOT compiler (`Microsoft.DotNet.ILCompiler`) | 8.0.11 | MIT | MIT (NuGet) | ✓ Redistributable |
 | NativeAOT output binaries | n/a | n/a | MIT (statically linked) | ✓ Redistributable |
 | `ICSharpCode.CodeConverter` (NuGet) | 9.2.7.792 | MIT | MIT (NuGet) | ✓ Redistributable (conversion-time only) |
+| `cJSON` (vendored under `vendor/cjson/`) | 1.7.15 | MIT | MIT (statically compiled into `betl_core`) | ✓ Redistributable |
 
 **Net**: every artifact betl needs to ship or that flows downstream
 into end-user pipelines is permissively licensed (MIT, with some

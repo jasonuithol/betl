@@ -12,6 +12,4 @@ endfunction()
 
 betl_add_fuzz_target(yaml_fuzz)
 betl_add_fuzz_target(csv_fuzz)
-if(CJSON_LIBRARY)
-    betl_add_fuzz_target(json_fuzz)
-endif()
+betl_add_fuzz_target(json_fuzz)

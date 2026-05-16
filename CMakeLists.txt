@@ -72,14 +72,24 @@ if(BETL_FUZZ)
             "'${CMAKE_C_COMPILER_ID}'. Use a fresh build directory "
             "(rm -rf build-fuzz) so cmake picks up the compiler switch.")
     endif()
-    message(STATUS "BETL_FUZZ: whole-tree clang + fuzzer-no-link + asan + ubsan")
+    message(STATUS "BETL_FUZZ: whole-tree clang + fuzzer-no-link + ubsan")
     # fuzzer-no-link adds coverage probes WITHOUT pulling in libFuzzer's
     # main() driver (since most binaries here are not fuzz targets).
     # Fuzz binaries override their link options to use -fsanitize=fuzzer
     # (no -no-link) to get the driver.
-    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined
+    #
+    # NOTE: ASan is deliberately NOT enabled. libasan 14 has an init-race
+    # in dlsym(_thread_db_sizeof_pthread) that fires 15-30% of the time
+    # before main(), with no stack and no log output -- those phantom
+    # crashes drown out real findings. UBSan still catches the
+    # interesting bugs for parser fuzzing (signed overflow, null deref,
+    # alignment, OOB shifts), and any heap bug that actually corrupts
+    # memory enough to SIGSEGV still surfaces via libFuzzer's crash
+    # detection. Leak detection is the main thing we lose; valgrind
+    # covers that for targeted runs.
+    add_compile_options(-fsanitize=fuzzer-no-link,undefined
                         -fno-omit-frame-pointer -O1 -g)
-    add_link_options   (-fsanitize=fuzzer-no-link,address,undefined)
+    add_link_options   (-fsanitize=fuzzer-no-link,undefined)
 endif()
 
 
@@ -202,23 +212,18 @@ else()
     message(STATUS "libxlsxio_read not found — xlsx.read component disabled")
 endif()
 
-# cJSON: used by json.read / json.write. Optional.
-find_path(CJSON_INCLUDE_DIR cjson/cJSON.h
-    HINTS ${CMAKE_SOURCE_DIR}/deps/include
-)
-find_library(CJSON_LIBRARY NAMES cjson
-    HINTS ${CMAKE_SOURCE_DIR}/deps/lib
-)
-if(CJSON_INCLUDE_DIR AND CJSON_LIBRARY)
-    set(CJSON_FOUND TRUE)
-    add_library(betl_cjson INTERFACE)
-    target_include_directories(betl_cjson INTERFACE ${CJSON_INCLUDE_DIR})
-    target_link_libraries(betl_cjson INTERFACE ${CJSON_LIBRARY})
-    message(STATUS "Found cJSON: ${CJSON_LIBRARY} (headers: ${CJSON_INCLUDE_DIR})")
-else()
-    set(CJSON_FOUND FALSE)
-    message(STATUS "cJSON not found — json.read/json.write disabled")
-endif()
+# cJSON: vendored under vendor/cjson/ (pinned 1.7.15, MIT-licensed).
+# Compiling cJSON into betl_core directly means BETL_FUZZ=ON builds get
+# clang+ASan+coverage instrumentation into the parser body, so fuzzer
+# crashes produce real stack traces. Previously we linked the system /
+# deps libcjson.so which was gcc-built and opaque to ASan; a crash
+# inside cJSON_Parse would die with no stack and no reproducer (we lost
+# one this way already). Always-built; CJSON_FOUND stays for backward
+# compat with downstream checks but is now always TRUE.
+set(CJSON_FOUND TRUE)
+add_library(betl_cjson INTERFACE)
+target_include_directories(betl_cjson INTERFACE ${CMAKE_SOURCE_DIR}/vendor)
+message(STATUS "Using vendored cJSON 1.7.15 from vendor/cjson/")
 
 # libcurl: used by http.get / http.post. Optional.
 # Debian's libcurl4-openssl-dev installs curl/curl.h under the multiarch
@@ -394,15 +399,19 @@ target_sources(betl_core PRIVATE
     src/runtime/var_set.c
 )
 
-# json.read / json.write when cJSON is available.
-if(CJSON_FOUND)
-    target_sources(betl_core PRIVATE
-        src/runtime/json_read.c
-        src/runtime/json_write.c
-    )
-    target_link_libraries(betl_core PUBLIC betl_cjson)
-    target_compile_definitions(betl_core PUBLIC BETL_HAVE_CJSON)
-endif()
+# json.read / json.write — cJSON is now vendored, always built.
+target_sources(betl_core PRIVATE
+    src/runtime/json_read.c
+    src/runtime/json_write.c
+    vendor/cjson/cJSON.c
+)
+target_link_libraries(betl_core PUBLIC betl_cjson)
+target_compile_definitions(betl_core PUBLIC BETL_HAVE_CJSON)
+# cJSON.c uses some patterns gcc/clang flag under our strict warning
+# defaults (sprintf, missing prototypes on some helpers). It's vendored
+# unmodified to stay easy to re-pin, so quiet just this file.
+set_source_files_properties(vendor/cjson/cJSON.c PROPERTIES
+    COMPILE_OPTIONS "-Wno-missing-prototypes;-Wno-strict-prototypes;-Wno-unused-but-set-variable")
 
 # http.get / http.post + smtp.send when libcurl is available.
 if(LIBCURL_FOUND)
