@@ -436,6 +436,14 @@ set_tests_properties(csv_write PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: csv.write end-to-end test passed"
 )
 
+# --- csv encoding (cp1252 / BOM / utf-16 / substitution) -----------------
+add_executable(test_csv_encoding test_csv_encoding.c)
+target_link_libraries(test_csv_encoding PRIVATE betl_core)
+add_test(NAME csv_encoding COMMAND test_csv_encoding)
+set_tests_properties(csv_encoding PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: csv encoding tests passed"
+)
+
 # --- shell control-flow task tests (POSIX-only, no DB needed) -------------
 add_executable(test_shell test_shell.c)
 target_link_libraries(test_shell PRIVATE betl_core)

@@ -207,6 +207,11 @@ int main(void) {
     CHECK_CONTAINS(yaml, "value_col: amount");
     CHECK_CONTAINS(yaml, "pivot_keys: [jan, feb]");
 
+    /* RestCsv FlatFile destination declares CodePage=1252 — the mapper
+     * should preserve that as `encoding: 1252` on the csv.write stage,
+     * so the legacy SSIS recipe round-trips with the same byte semantics. */
+    CHECK_CONTAINS(yaml, "encoding: 1252");
+
     free(yaml);
 
     /* --- scripts.dtsx: ScriptTask + ScriptComponent + VB.NET -------- */

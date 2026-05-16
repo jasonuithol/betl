@@ -44,7 +44,7 @@
         DTS:DTSID="{33333333-3333-3333-3333-333333333333}"
         DTS:CreationName="FLATFILE">
       <DTS:ObjectData>
-        <DTS:ConnectionManager DTS:ConnectionString="/tmp/rest.csv"/>
+        <DTS:ConnectionManager DTS:ConnectionString="/tmp/rest.csv" DTS:CodePage="1252" DTS:Unicode="False"/>
       </DTS:ObjectData>
     </DTS:ConnectionManager>
   </DTS:ConnectionManagers>

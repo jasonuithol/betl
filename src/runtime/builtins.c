@@ -11,6 +11,7 @@
 #include "runtime/binary_util.h"
 #include "runtime/date_util.h"
 #include "runtime/decimal_util.h"
+#include "runtime/encoding.h"
 #include "runtime/literal_expr.h"
 #include "runtime/transforms.h"
 #include "runtime/uuid_util.h"
@@ -817,6 +818,12 @@ static const BetlProvider count_provider = {
  *    delimiter   (string, optional, default ",")                   *
  *    header      (bool,   optional, default true)                  *
  *    batch_size  (int,    optional, default 1024)                  *
+ *    encoding    (string, optional, default "utf-8")               *
+ *                  Source codepage. Accepts iconv names ("cp1252", *
+ *                  "shift_jis", "utf-16") or Windows codepage      *
+ *                  numbers ("1252", "932"). Leading UTF-8 BOM is   *
+ *                  consumed automatically. The pipeline always     *
+ *                  sees UTF-8 internally.                          *
  *    schema:                                                       *
  *      columns:                                                    *
  *        - { name: id,    type: int64 }                            *
@@ -857,6 +864,7 @@ typedef struct {
 typedef struct {
     BetlContext *ctx;
     char        *path;
+    char        *encoding;       /* source codepage; NULL/empty/utf-8 = UTF-8 */
     char         delim;
     int          header;
     size_t       batch_size;
@@ -1478,6 +1486,10 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
             s->batch_size = (size_t)bs;
         }
     }
+    /* `encoding` optional — source codepage. UTF-8 / unset is pass-
+     * through; anything else (cp1252, shift_jis, utf-16, etc.) goes
+     * through iconv on the way in. */
+    (void)json_string(cfg, "encoding", &s->encoding);
 
     /* schema: { columns: [...] } — optional. If present, gives names+types
      * directly. If absent and header=true, names come from the header line
@@ -1496,8 +1508,21 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
     if (!s->fp) {
         betl_set_error(ctx, "csv.read: cannot open %s", s->path);
         csv_state_clear_columns(s);
-        free(s->path); free(s);
+        free(s->path); free(s->encoding); free(s);
         return BETL_ERR_IO;
+    }
+    {
+        char enc_err[256];
+        FILE *wrapped = betl_textread_wrap(s->fp, s->encoding,
+                                           enc_err, sizeof enc_err);
+        if (!wrapped) {
+            betl_set_error(ctx, "csv.read: %s for %s", enc_err, s->path);
+            fclose(s->fp); s->fp = NULL;
+            csv_state_clear_columns(s);
+            free(s->path); free(s->encoding); free(s);
+            return BETL_ERR_INVALID;
+        }
+        s->fp = wrapped;  /* may be same pointer for the UTF-8 fast path */
     }
     s->line_no = 1;
 
@@ -1565,6 +1590,7 @@ static void csv_destroy(void *state) {
     if (s->fp) fclose(s->fp);
     free(s->rec_buf);
     free(s->path);
+    free(s->encoding);
     csv_state_clear_columns(s);
     free(s);
 }
@@ -1948,6 +1974,7 @@ static const BetlPortDef csv_outputs[] = {
 typedef struct {
     BetlContext              *ctx;
     char                     *path;
+    char                     *encoding;
     char                      delim;
     int                       header;
     struct ArrowArrayStream   input;
@@ -1978,6 +2005,7 @@ static int csv_write_init(BetlContext *ctx, const char *cfg, void **state) {
             else if (strncmp(v, "true", 4) == 0) s->header = 1;
         }
     }
+    (void)json_string(cfg, "encoding", &s->encoding);
     *state = s;
     return BETL_OK;
 }
@@ -1987,6 +2015,7 @@ static void csv_write_destroy(void *state) {
     if (!s) return;
     if (s->have_input && s->input.release) s->input.release(&s->input);
     free(s->path);
+    free(s->encoding);
     free(s);
 }
 
@@ -2239,6 +2268,18 @@ static int csv_write_sink_run(void *state) {
                        s->path);
         schema.release(&schema);
         return BETL_ERR_IO;
+    }
+    {
+        char enc_err[256];
+        FILE *wrapped = betl_textwrite_wrap(fp, s->encoding,
+                                            enc_err, sizeof enc_err);
+        if (!wrapped) {
+            betl_set_error(s->ctx, "csv.write: %s for %s", enc_err, s->path);
+            fclose(fp);
+            schema.release(&schema);
+            return BETL_ERR_INVALID;
+        }
+        fp = wrapped;
     }
 
     int rc = BETL_OK;
