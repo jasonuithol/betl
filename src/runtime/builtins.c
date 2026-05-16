@@ -1451,6 +1451,8 @@ static int csv_parse_schema(CsvState *s, const char *cfg, CsvSchemaCtx *out) {
     return 0;
 }
 
+static void csv_destroy(void *state);   /* fwd-decl for csv_init's failure paths */
+
 static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
     CsvState *s = calloc(1, sizeof *s);
     if (!s) return BETL_ERR_INTERNAL;
@@ -1495,11 +1497,16 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
      * directly. If absent and header=true, names come from the header line
      * and every column defaults to int64. If absent and header=false, the
      * file has no way to tell us its columns and we error out. */
+    /* All failure paths below funnel through csv_destroy(s) so we don't
+     * leak rec_buf / encoding / fp / etc. The previous open-coded
+     * cleanup forgot rec_buf on the header-parse path — fuzzer found
+     * it (256 bytes leaked on input "0x22 0xd7", an unterminated
+     * quoted field that produces a malformed header and triggers the
+     * error path with rec_buf already grown). */
     CsvSchemaCtx schema_ctx = {0};
     if (csv_parse_schema(s, cfg, &schema_ctx) != 0) {
         betl_set_error(ctx, "csv.read: %s", schema_ctx.err_msg);
-        csv_state_clear_columns(s);
-        free(s->path); free(s);
+        csv_destroy(s);
         return BETL_ERR_INVALID;
     }
     int schema_provided = (s->n_cols > 0);
@@ -1507,8 +1514,7 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
     s->fp = fopen(s->path, "r");
     if (!s->fp) {
         betl_set_error(ctx, "csv.read: cannot open %s", s->path);
-        csv_state_clear_columns(s);
-        free(s->path); free(s->encoding); free(s);
+        csv_destroy(s);
         return BETL_ERR_IO;
     }
     {
@@ -1517,9 +1523,7 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
                                            enc_err, sizeof enc_err);
         if (!wrapped) {
             betl_set_error(ctx, "csv.read: %s for %s", enc_err, s->path);
-            fclose(s->fp); s->fp = NULL;
-            csv_state_clear_columns(s);
-            free(s->path); free(s->encoding); free(s);
+            csv_destroy(s);
             return BETL_ERR_INVALID;
         }
         s->fp = wrapped;  /* may be same pointer for the UTF-8 fast path */
@@ -1532,9 +1536,7 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
         if (rr != 0) {
             betl_set_error(ctx, "csv.read: %s reading header in %s",
                            rr == -1 ? "empty file" : "read error", s->path);
-            fclose(s->fp); s->fp = NULL;
-            csv_state_clear_columns(s);
-            free(s->path); free(s);
+            csv_destroy(s);
             return BETL_ERR_IO;
         }
         if (!schema_provided) {
@@ -1543,17 +1545,14 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
             if (csv_parse_header(s, hlen, &names, &n) != 0 || n == 0) {
                 betl_set_error(ctx, "csv.read: failed to parse header in %s",
                                s->path);
-                fclose(s->fp); s->fp = NULL;
-                csv_state_clear_columns(s);
-                free(s->path); free(s);
+                csv_destroy(s);
                 return BETL_ERR_IO;
             }
             s->cols = calloc(n, sizeof *s->cols);
             if (!s->cols) {
                 for (size_t i = 0; i < n; ++i) free(names[i]);
                 free(names);
-                fclose(s->fp); s->fp = NULL;
-                free(s->path); free(s);
+                csv_destroy(s);
                 return BETL_ERR_INTERNAL;
             }
             s->n_cols = n;
@@ -1566,17 +1565,13 @@ static int csv_init(BetlContext *ctx, const char *cfg, void **state) {
         /* If schema was provided, header was consumed but discarded. */
     } else if (!schema_provided) {
         betl_set_error(ctx, "csv.read: when header=false, a `schema:` is required");
-        fclose(s->fp); s->fp = NULL;
-        csv_state_clear_columns(s);
-        free(s->path); free(s);
+        csv_destroy(s);
         return BETL_ERR_INVALID;
     }
 
     /* Allocate per-column staging once at batch_size capacity. */
     if (csv_alloc_staging(s) != 0) {
-        fclose(s->fp); s->fp = NULL;
-        csv_state_clear_columns(s);
-        free(s->path); free(s);
+        csv_destroy(s);
         return BETL_ERR_INTERNAL;
     }
 

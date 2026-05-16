@@ -35,6 +35,20 @@ if(BETL_SANITIZE)
     add_link_options(-fsanitize=${BETL_SANITIZE})
 endif()
 
+# Opt-in libFuzzer harnesses (clang only — `-fsanitize=fuzzer` is an
+# LLVM feature; GCC has no equivalent). Default OFF so the normal
+# gcc build is unaffected. When ON, the fuzz/ directory adds a set of
+# custom targets that drive clang for the fuzz binaries only; the
+# main build's compiler choice stays untouched.
+option(BETL_FUZZ "Build libFuzzer harnesses (requires clang + compiler-rt)" OFF)
+if(BETL_FUZZ)
+    find_program(BETL_CLANG_BIN NAMES clang REQUIRED)
+    message(STATUS "BETL_FUZZ: using ${BETL_CLANG_BIN}")
+    # add_subdirectory(fuzz) is deferred until after find_library / betl_core
+    # are in scope — see bottom of this file.
+endif()
+
+
 # --- Dependencies ----------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAML REQUIRED IMPORTED_TARGET yaml-0.1)
@@ -399,6 +413,11 @@ add_subdirectory(tests)
 
 # --- Benchmarks ------------------------------------------------------------
 add_subdirectory(bench)
+
+# --- Fuzz harnesses (opt-in, clang only) -----------------------------------
+if(BETL_FUZZ)
+    add_subdirectory(fuzz)
+endif()
 
 # --- Install ---------------------------------------------------------------
 include(GNUInstallDirs)

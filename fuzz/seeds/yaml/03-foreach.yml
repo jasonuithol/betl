@@ -1,0 +1,13 @@
+betl: 1
+name: foreach-sample
+parameters:
+  prefix: { type: string, default: "p" }
+pipeline:
+  - id: loop
+    type: foreach
+    over: ["a", "b", "c"]
+    as: item
+    steps:
+      - id: log
+        type: shell
+        cmd: ["echo", "${vars.item}"]

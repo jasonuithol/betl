@@ -1,0 +1,14 @@
+betl: 1
+name: dataflow-sample
+pipeline:
+  - id: stage
+    type: dataflow
+    steps:
+      - id: src
+        type: betl.gen_int64
+        row_count: 10
+        column: id
+      - id: sink
+        type: betl.count_rows
+        from: src
+        expect: 10
