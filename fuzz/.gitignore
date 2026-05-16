@@ -1,1 +1,9 @@
 findings/
+
+# libFuzzer writes auto-discovered corpus inputs into the seed dirs as
+# SHA-1-named files with no extension. We track only curated seeds
+# (which always have an extension like .csv / .json / .yml). The
+# negation pattern uses *.* which matches any file containing a dot —
+# auto-discovered hex names never have one.
+seeds/*/*
+!seeds/*/*.*
