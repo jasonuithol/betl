@@ -1,0 +1,1 @@
+SUBSTRING([name], 1, LEN([name]) - 1)

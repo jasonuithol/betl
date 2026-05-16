@@ -1,0 +1,5 @@
+id,name,price,when,ev_date,note,flag,uid,amount
+1,alpha,12.50,2026-05-16 10:30:00,2026-05-16,plain,true,550e8400-e29b-41d4-a716-446655440000,100.25
+2,beta,"7.99","2026-05-17 11:00:00.123456",2026-05-17,"with, comma",false,00000000-0000-0000-0000-000000000000,-50.00
+3,"gamma ""x""",0,2024-02-29 23:59:59,2024-02-29,"multi
+line",true,ffffffff-ffff-ffff-ffff-ffffffffffff,0.01

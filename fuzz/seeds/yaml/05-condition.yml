@@ -1,0 +1,13 @@
+betl: 1
+name: condition-sample
+parameters:
+  load_date: { type: string, default: "2026-05-16" }
+pipeline:
+  - id: maybe
+    type: shell
+    cmd: ["true"]
+    condition: { lang: literal, value: "true" }
+  - id: skipped
+    type: shell
+    cmd: ["false"]
+    condition: { lang: literal, value: "false" }

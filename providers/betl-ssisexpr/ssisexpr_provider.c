@@ -1459,6 +1459,26 @@ static void promote_numeric(Value *a, Value *b) {
 
 static int eval_node(Eval *E, Par *P, const Node *n, Value *out);
 
+/* Safe double → int64 cast. Returns 0 on success, -1 if `d` is NaN
+ * or outside [INT64_MIN, INT64_MAX]. The bare cast `(int64_t)d` is
+ * undefined behaviour for out-of-range doubles (UBSan: "X is outside
+ * the range of representable values of type 'long'") — fuzzing
+ * surfaced two real instances of this in the ssisexpr cast path.
+ *
+ * Upper bound is strict (`< 2^63`) because `(double)INT64_MAX` is not
+ * exactly representable: doubles can't represent `INT64_MAX` (2^63-1)
+ * exactly, only `2^63` (which is one past the limit). The largest
+ * double less than 2^63 is `2^63 - 1024`. Lower bound is inclusive
+ * since `-2^63 = INT64_MIN` IS exactly representable in double and
+ * the cast is defined. */
+static int safe_double_to_i64(double d, int64_t *out) {
+    if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) {
+        return -1;
+    }
+    *out = (int64_t)d;
+    return 0;
+}
+
 /* Forward decls for decimal128 helpers (defined further down in the
  * "Date / timestamp / decimal helpers" section). cmp_values needs them
  * before that section. */
@@ -1559,15 +1579,31 @@ static int op_arith(Eval *E, Par *P, Op op, const Node *na, const Node *nb, Valu
     }
 
     if (a.kind == VK_INT64) {
+        /* Compute add/sub/mul in uint64 to get well-defined 2's-
+         * complement wraparound. Signed integer overflow in C is UB
+         * (UBSan: "signed integer overflow ... cannot be represented
+         * in type 'long'") even though gcc/clang's default codegen
+         * produces the wrap we want. SSIS Expression Language matches
+         * 2's-complement DT_I8 wrap behaviour for arithmetic, so this
+         * also keeps semantic parity with SQL Server's interpretation. */
+        uint64_t ua = (uint64_t)a.i64, ub = (uint64_t)b.i64;
         switch (op) {
-            case OP_ADD: out->kind = VK_INT64; out->i64 = a.i64 + b.i64; return 0;
-            case OP_SUB: out->kind = VK_INT64; out->i64 = a.i64 - b.i64; return 0;
-            case OP_MUL: out->kind = VK_INT64; out->i64 = a.i64 * b.i64; return 0;
+            case OP_ADD: out->kind = VK_INT64; out->i64 = (int64_t)(ua + ub); return 0;
+            case OP_SUB: out->kind = VK_INT64; out->i64 = (int64_t)(ua - ub); return 0;
+            case OP_MUL: out->kind = VK_INT64; out->i64 = (int64_t)(ua * ub); return 0;
             case OP_DIV:
                 if (b.i64 == 0) return eval_err(E, "integer division by zero");
+                /* INT64_MIN / -1 is also UB. Detect and wrap explicitly. */
+                if (a.i64 == INT64_MIN && b.i64 == -1) {
+                    out->kind = VK_INT64; out->i64 = INT64_MIN; return 0;
+                }
                 out->kind = VK_INT64; out->i64 = a.i64 / b.i64; return 0;
             case OP_MOD:
                 if (b.i64 == 0) return eval_err(E, "integer modulo by zero");
+                /* INT64_MIN % -1 is also UB; result of the wrap is 0. */
+                if (a.i64 == INT64_MIN && b.i64 == -1) {
+                    out->kind = VK_INT64; out->i64 = 0; return 0;
+                }
                 out->kind = VK_INT64; out->i64 = a.i64 % b.i64; return 0;
             default: return eval_err(E, "internal: bad arith op");
         }
@@ -2165,7 +2201,10 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
     if (to_int) {
         int64_t v;
         if (in->kind == VK_INT64)        v = in->i64;
-        else if (in->kind == VK_FLOAT64) v = (int64_t)in->f64;
+        else if (in->kind == VK_FLOAT64) {
+            if (safe_double_to_i64(in->f64, &v) != 0)
+                return eval_err(E, "cast float -> int: %g out of range", in->f64);
+        }
         else if (in->kind == VK_BOOL)    v = in->b ? 1 : 0;
         else if (in->kind == VK_TIME_US) v = in->i64;  /* raw micros-of-day */
         else if (in->kind == VK_UTF8) {
@@ -2328,7 +2367,10 @@ static int do_cast(Eval *E, SsisDt dt, int has_len, int64_t len,
             if (in->kind == VK_FLOAT64)      days = in->f64;
             else if (in->kind == VK_INT64)   days = (double)in->i64;
             else                             days = decimal_to_double(in->d128, in->dec_scale);
-            out->i64 = (int64_t)((days - 25569.0) * 86400000000.0);
+            double micros = (days - 25569.0) * 86400000000.0;
+            if (safe_double_to_i64(micros, &out->i64) != 0)
+                return eval_err(E, "cast OLE-Auto-Date -> DT_DBTIMESTAMP: %g days out of range",
+                                days);
             return 0;
         }
         return eval_err(E, "cast non-string/non-temporal -> DT_DBTIMESTAMP not supported");
@@ -3181,7 +3223,16 @@ static int eval_node(Eval *E, Par *P, const Node *n, Value *out) {
             if (a.is_null) { out->is_null = 1; return 0; }
             switch (n->unary.op) {
                 case OP_NEG:
-                    if (a.kind == VK_INT64)   { out->kind = VK_INT64;   out->i64 = -a.i64; return 0; }
+                    if (a.kind == VK_INT64) {
+                        out->kind = VK_INT64;
+                        /* Negating INT64_MIN is UB in signed int64 (the
+                         * result -2^63 isn't representable). Compute in
+                         * uint64 where wraparound is well-defined; the
+                         * end result is INT64_MIN itself, matching SSIS's
+                         * 2's-complement boundary behaviour. */
+                        out->i64 = (int64_t)(0u - (uint64_t)a.i64);
+                        return 0;
+                    }
                     if (a.kind == VK_FLOAT64) { out->kind = VK_FLOAT64; out->f64 = -a.f64; return 0; }
                     return eval_err(E, "unary - on non-numeric");
                 case OP_NOT:
@@ -3429,7 +3480,12 @@ static int fmt_time_iso(int64_t us_of_day, char *buf, size_t cap);
  * checking happens at the caller. */
 static int value_to_int64(BetlContext *ctx, const Value *v, int64_t *out) {
     if      (v->kind == VK_INT64)    *out = v->i64;
-    else if (v->kind == VK_FLOAT64)  *out = (int64_t)v->f64;
+    else if (v->kind == VK_FLOAT64) {
+        if (safe_double_to_i64(v->f64, out) != 0) {
+            betl_set_error(ctx, "ssisexpr: float %g out of int64 range", v->f64);
+            return -1;
+        }
+    }
     else if (v->kind == VK_BOOL)     *out = v->b ? 1 : 0;
     else if (v->kind == VK_TIME_US)  *out = v->i64;
     else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to int"); return -1; }
@@ -3441,7 +3497,13 @@ static int store_value(BetlContext *ctx, LmCol *col, size_t row_idx, const Value
     switch (col->type) {
         case LM_T_INT64:
             if (v->kind == VK_INT64)        col->i64_vals[row_idx] = v->i64;
-            else if (v->kind == VK_FLOAT64) col->i64_vals[row_idx] = (int64_t)v->f64;
+            else if (v->kind == VK_FLOAT64) {
+                if (safe_double_to_i64(v->f64, &col->i64_vals[row_idx]) != 0) {
+                    betl_set_error(ctx, "ssisexpr: float %g out of int64 range",
+                                   v->f64);
+                    return -1;
+                }
+            }
             else if (v->kind == VK_BOOL)    col->i64_vals[row_idx] = v->b ? 1 : 0;
             else if (v->kind == VK_TIME_US) col->i64_vals[row_idx] = v->i64;
             else { betl_set_error(ctx, "ssisexpr: cannot coerce date/string to int64"); return -1; }

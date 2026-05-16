@@ -1,0 +1,5 @@
+[
+  {"id": 1, "name": "alpha", "value": 12.5, "meta": {"tags": ["a", "b"], "active": true}},
+  {"id": 2, "name": "beta",  "value": null,  "meta": {"tags": [],         "active": false}},
+  {"id": 9007199254740992, "name": "boundary", "value": -0.0, "meta": null}
+]

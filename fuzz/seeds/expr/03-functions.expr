@@ -1,0 +1,1 @@
+UPPER([name]) + "_" + (DT_WSTR,10)[id]

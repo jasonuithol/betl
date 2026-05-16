@@ -1,0 +1,18 @@
+betl: 1
+name: foreach-glob
+pipeline:
+  - id: walk
+    type: foreach
+    over_glob: "/tmp/*.csv"
+    as: file
+    steps:
+      - id: stage
+        type: dataflow
+        steps:
+          - id: src
+            type: csv.read
+            path: ${vars.file}
+          - id: sink
+            type: betl.count_rows
+            from: src
+            expect: 0

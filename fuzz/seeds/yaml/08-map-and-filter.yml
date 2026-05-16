@@ -1,0 +1,31 @@
+betl: 1
+name: map-filter
+pipeline:
+  - id: stage
+    type: dataflow
+    steps:
+      - id: src
+        type: betl.gen_int64
+        row_count: 100
+        column: id
+      - id: derived
+        type: map
+        from: src
+        add:
+          tag:
+            lang: literal
+            value: "alpha"
+          doubled:
+            lang: lua
+            expr: "row.id * 2"
+            type: l
+      - id: keep
+        type: filter
+        from: derived
+        where:
+          lang: lua
+          expr: "row.id % 3 == 0"
+      - id: sink
+        type: betl.count_rows
+        from: keep
+        expect: 34

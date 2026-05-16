@@ -1,0 +1,28 @@
+betl: 1
+name: multicast-join
+pipeline:
+  - id: stage
+    type: dataflow
+    steps:
+      - id: a
+        type: betl.gen_int64
+        row_count: 10
+        column: id
+      - id: b
+        type: betl.gen_int64
+        row_count: 5
+        start: 3
+        column: rid
+      - id: fan
+        type: multicast
+        from: a
+        taps: [left, also]
+      - id: jn
+        type: join
+        kind: inner
+        from: [fan:left, b]
+        on: { id: rid }
+      - id: sink
+        type: betl.count_rows
+        from: jn
+        expect: 5

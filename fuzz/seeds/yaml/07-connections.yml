@@ -1,0 +1,14 @@
+betl: 1
+name: connections-sample
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${env.WAREHOUSE_DSN}
+  reporting:
+    type: mssql
+    dsn: "Driver={ODBC Driver 18 for SQL Server};Server=db;Database=R"
+pipeline:
+  - id: probe
+    type: sql.execute
+    connection: warehouse
+    sql: "SELECT 1"
