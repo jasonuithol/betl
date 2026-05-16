@@ -8,10 +8,10 @@
 #   fuzz/run-fuzz.sh csv  [seconds]
 #   fuzz/run-fuzz.sh json [seconds]
 #
-# Requires the build to have been configured with -DBETL_FUZZ=ON; the
-# harness binaries live in build/fuzz/<name>_fuzz. Findings are written
-# to fuzz/findings/<name>/ (created on demand). Seeds come from
-# fuzz/seeds/<name>/.
+# The first invocation lazily configures and builds build-fuzz/ with
+# clang + libFuzzer + ASan + UBSan (whole-tree instrumentation, separate
+# from the main gcc build/ tree). Subsequent runs reuse it. Findings
+# land in fuzz/findings/<name>/ (gitignored).
 
 set -uo pipefail
 
@@ -24,9 +24,19 @@ case "$target" in
     *) echo "unknown target '$target' (want yaml|csv|json)" >&2; exit 2 ;;
 esac
 
-bin="$repo_root/build/fuzz/${target}_fuzz"
+build_dir="$repo_root/build-fuzz"
+bin="$build_dir/fuzz/${target}_fuzz"
+
 if [[ ! -x "$bin" ]]; then
-    echo "missing $bin -- did you build with -DBETL_FUZZ=ON?" >&2
+    echo "[run-fuzz] configuring build-fuzz/ with clang + sanitizers..." >&2
+    cmake -S "$repo_root" -B "$build_dir" \
+        -G Ninja -DBETL_FUZZ=ON >&2 || exit $?
+    echo "[run-fuzz] building ${target}_fuzz..." >&2
+    cmake --build "$build_dir" --target "${target}_fuzz" >&2 || exit $?
+fi
+
+if [[ ! -x "$bin" ]]; then
+    echo "[run-fuzz] $bin still missing after build" >&2
     exit 2
 fi
 

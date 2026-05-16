@@ -16,6 +16,8 @@
 
 #include "pipeline/pipeline.h"
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
 /* Reuse a single temp path across invocations to avoid /tmp churn. */
 static char g_path[64];
 

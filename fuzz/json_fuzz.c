@@ -16,6 +16,8 @@
 #include "runtime/builtins.h"
 #include "runtime/context.h"
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
 static char            g_path[64];
 static BetlContext    *g_ctx = NULL;
 static BetlRegistry   *g_reg = NULL;

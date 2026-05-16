@@ -11,18 +11,22 @@ thought of — and during initial wiring it already found a leak in
 
 ## Build
 
-Fuzz binaries are off by default. Opt in via:
+Fuzz binaries live in a parallel build tree (`build-fuzz/`) where the
+WHOLE codebase is rebuilt with clang + libFuzzer + ASan + UBSan. The
+main `build/` (gcc) is untouched.
 
 ```bash
-rm -rf build && cmake -S . -B build -DBETL_FUZZ=ON -G Ninja
-ninja -C build build_yaml_fuzz build_csv_fuzz build_json_fuzz
+cmake -S . -B build-fuzz -DBETL_FUZZ=ON -G Ninja
+ninja -C build-fuzz yaml_fuzz csv_fuzz json_fuzz
 ```
 
-Requires `clang` + `libclang-rt-<N>-dev` (compiler-rt runtime). The main
-gcc build is untouched — `BETL_FUZZ` only adds new custom targets that
-explicitly drive clang. Binaries land at `build/fuzz/<name>_fuzz`.
+Requires `clang` + `libclang-rt-<N>-dev` (compiler-rt: libFuzzer / ASan
+runtime libraries). On bookworm / LLVM 14 that's `libclang-rt-14-dev`.
 
 ## Run
+
+The helper script handles configure + build on first invocation, then
+just runs subsequent times:
 
 ```bash
 fuzz/run-fuzz.sh yaml 60       # 60 seconds
@@ -49,16 +53,22 @@ inspect the bytes.
 
 ## What's instrumented
 
-- The fuzz harness itself: `-fsanitize=fuzzer,address,undefined`
-  (coverage-guided mutation + ASan + UBSan oracle).
-- `libbetl_core.a`: NOT instrumented (gcc-built, no coverage). ASan
-  still catches heap bugs across the boundary because the
-  AddressSanitizer hooks `malloc` / `free` globally.
+The entire build-fuzz/ tree is compiled with:
 
-The practical effect: bugs in parser code that touch the heap (buffer
-overruns, use-after-free, leaks) are caught the moment they happen.
-Pure-logic bugs that don't manifest as memory errors won't surface
-unless they crash or hang.
+- `-fsanitize=fuzzer-no-link` — coverage probes throughout `libbetl_core`
+  so libFuzzer's mutator gets real coverage signal from the parser
+  internals (not just from the harness file).
+- `-fsanitize=address` — heap bug oracle: out-of-bounds, use-after-free,
+  double-free, leaks.
+- `-fsanitize=undefined` — UB oracle: signed overflow, null-deref,
+  alignment violations, OOB shifts.
+
+Fuzz binaries additionally link with `-fsanitize=fuzzer` (no `-no-link`
+suffix) to pull in libFuzzer's `main()` driver.
+
+The practical effect: every branch decision inside csv.read,
+yaml_load, json.read is visible to the mutator, so libFuzzer can
+quickly converge on the input shapes that hit uncovered code paths.
 
 ## Tips
 

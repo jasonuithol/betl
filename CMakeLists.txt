@@ -1,5 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
 
+# BETL_FUZZ is checked BEFORE project() so we can pin the compiler to
+# clang (libFuzzer is LLVM-only). cmake commits to one compiler at
+# project() time — any later CMAKE_C_COMPILER change is ignored. We
+# also have to clear CMakeCache.txt's compiler entry if it was set by
+# a previous gcc configure; the user is expected to use a separate
+# build-fuzz/ directory so this only matters on first-time setup.
+if(BETL_FUZZ)
+    find_program(BETL_CLANG_PRE_PROJECT NAMES clang)
+    if(NOT BETL_CLANG_PRE_PROJECT)
+        message(FATAL_ERROR
+            "BETL_FUZZ=ON requires clang (not on PATH). Install clang and "
+            "libclang-rt-N-dev (the compiler-rt runtime for libFuzzer/ASan).")
+    endif()
+    set(CMAKE_C_COMPILER ${BETL_CLANG_PRE_PROJECT} CACHE FILEPATH "" FORCE)
+endif()
+
 project(betl
     VERSION     0.1.0
     DESCRIPTION "Better ETL — open-source SSIS replacement"
@@ -35,17 +51,35 @@ if(BETL_SANITIZE)
     add_link_options(-fsanitize=${BETL_SANITIZE})
 endif()
 
-# Opt-in libFuzzer harnesses (clang only — `-fsanitize=fuzzer` is an
-# LLVM feature; GCC has no equivalent). Default OFF so the normal
-# gcc build is unaffected. When ON, the fuzz/ directory adds a set of
-# custom targets that drive clang for the fuzz binaries only; the
-# main build's compiler choice stays untouched.
-option(BETL_FUZZ "Build libFuzzer harnesses (requires clang + compiler-rt)" OFF)
+# Opt-in libFuzzer harnesses (clang-only — -fsanitize=fuzzer is an LLVM
+# feature with no GCC equivalent). When ON, the WHOLE tree is rebuilt
+# with clang + coverage + ASan + UBSan so libFuzzer gets real coverage
+# guidance and the bug oracle catches heap / out-of-bounds / undefined-
+# behavior issues. The user is expected to use a separate build-fuzz/
+# directory:
+#
+#   cmake -B build-fuzz -DBETL_FUZZ=ON -G Ninja
+#   ninja -C build-fuzz yaml_fuzz csv_fuzz json_fuzz
+#   build-fuzz/fuzz/yaml_fuzz -max_total_time=300 fuzz/seeds/yaml
+#
+# The compiler switch happens via a pre-project() hook above. Default
+# OFF keeps the normal gcc build identical.
+option(BETL_FUZZ "Build with clang + libFuzzer + ASan + UBSan instrumentation" OFF)
 if(BETL_FUZZ)
-    find_program(BETL_CLANG_BIN NAMES clang REQUIRED)
-    message(STATUS "BETL_FUZZ: using ${BETL_CLANG_BIN}")
-    # add_subdirectory(fuzz) is deferred until after find_library / betl_core
-    # are in scope — see bottom of this file.
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR
+            "BETL_FUZZ requires clang but CMAKE_C_COMPILER_ID is "
+            "'${CMAKE_C_COMPILER_ID}'. Use a fresh build directory "
+            "(rm -rf build-fuzz) so cmake picks up the compiler switch.")
+    endif()
+    message(STATUS "BETL_FUZZ: whole-tree clang + fuzzer-no-link + asan + ubsan")
+    # fuzzer-no-link adds coverage probes WITHOUT pulling in libFuzzer's
+    # main() driver (since most binaries here are not fuzz targets).
+    # Fuzz binaries override their link options to use -fsanitize=fuzzer
+    # (no -no-link) to get the driver.
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined
+                        -fno-omit-frame-pointer -O1 -g)
+    add_link_options   (-fsanitize=fuzzer-no-link,address,undefined)
 endif()
 
 
