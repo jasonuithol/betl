@@ -444,6 +444,59 @@ set_tests_properties(csv_encoding PROPERTIES
     PASS_REGULAR_EXPRESSION "ok: csv encoding tests passed"
 )
 
+# --- Unit tests for utility helpers (date / decimal / uuid / binary /
+#     substitute / utf8 builder guard). No external dependencies; fast. ---
+add_executable(test_date_util test_date_util.c)
+target_link_libraries(test_date_util PRIVATE betl_core)
+add_test(NAME date_util COMMAND test_date_util)
+set_tests_properties(date_util PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: date_util unit tests passed")
+
+add_executable(test_decimal_util test_decimal_util.c)
+target_link_libraries(test_decimal_util PRIVATE betl_core)
+add_test(NAME decimal_util COMMAND test_decimal_util)
+set_tests_properties(decimal_util PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: decimal_util unit tests passed")
+
+add_executable(test_uuid_util test_uuid_util.c)
+target_link_libraries(test_uuid_util PRIVATE betl_core)
+add_test(NAME uuid_util COMMAND test_uuid_util)
+set_tests_properties(uuid_util PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: uuid_util unit tests passed")
+
+add_executable(test_binary_util test_binary_util.c)
+target_link_libraries(test_binary_util PRIVATE betl_core)
+add_test(NAME binary_util COMMAND test_binary_util)
+set_tests_properties(binary_util PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: binary_util unit tests passed")
+
+add_executable(test_substitute test_substitute.c)
+target_link_libraries(test_substitute PRIVATE betl_core)
+add_test(NAME substitute COMMAND test_substitute)
+set_tests_properties(substitute PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: substitute unit tests passed")
+
+add_executable(test_utf8_builder_guard test_utf8_builder_guard.c)
+target_link_libraries(test_utf8_builder_guard PRIVATE betl_core)
+add_test(NAME utf8_builder_guard COMMAND test_utf8_builder_guard)
+set_tests_properties(utf8_builder_guard PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: utf8 builder guard tests passed")
+
+# --- Parser-robustness corpus (malformed YAML / CSV inputs). -------------
+add_executable(test_parser_robustness test_parser_robustness.c)
+target_link_libraries(test_parser_robustness PRIVATE betl_core)
+add_test(NAME parser_robustness COMMAND test_parser_robustness)
+set_tests_properties(parser_robustness PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: parser robustness corpus passed")
+
+# --- Perf-regression gate (10k join / 100k sort / distinct). -------------
+add_executable(test_perf_regression test_perf_regression.c)
+target_link_libraries(test_perf_regression PRIVATE betl_core)
+add_test(NAME perf_regression COMMAND test_perf_regression)
+set_tests_properties(perf_regression PROPERTIES
+    PASS_REGULAR_EXPRESSION "ok: perf regression tests passed"
+    SKIP_RETURN_CODE 77)
+
 # --- shell control-flow task tests (POSIX-only, no DB needed) -------------
 add_executable(test_shell test_shell.c)
 target_link_libraries(test_shell PRIVATE betl_core)
@@ -722,6 +775,16 @@ if(LIBPQ_FOUND)
     set_tests_properties(pg_upsert PROPERTIES
         SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "ok: pg_upsert integration test passed"
+    )
+
+    # --- postgres sink error paths (missing table, NOT NULL, bad DSN,
+    #     SQL syntax, CHECK constraint, empty key). Skips when no DB. ---
+    add_executable(test_pg_writer_errors test_pg_writer_errors.c)
+    target_link_libraries(test_pg_writer_errors PRIVATE betl_core betl_libpq)
+    add_test(NAME pg_writer_errors COMMAND test_pg_writer_errors)
+    set_tests_properties(pg_writer_errors PROPERTIES
+        SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "ok: postgres writer error-path tests passed"
     )
 
     # --- postgres.exec end-to-end integration test (per-row SQL) -----------
