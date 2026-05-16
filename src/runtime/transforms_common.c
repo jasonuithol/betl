@@ -305,7 +305,10 @@ int betl_tx_build_utf8_filtered(struct ArrowArray *out,
     const char    *src_data  = src->buffers[2];
     size_t off = (size_t)src->offset;
 
-    /* First pass: total bytes for kept non-null strings. */
+    /* First pass: total bytes for kept non-null strings. Arrow "u" uses
+     * int32 offsets, so total must fit in INT32_MAX or the cast at line
+     * `offs[w+1] = (int32_t)pos` would silently wrap and corrupt every
+     * subsequent slice. Refuse the build instead. */
     size_t total = 0;
     for (size_t i = 0; i < n_rows; ++i) {
         if (!keep[i]) continue;
@@ -313,6 +316,7 @@ int betl_tx_build_utf8_filtered(struct ArrowArray *out,
         if (src_valid && !betl_tx_bit_at(src_valid, row)) continue;
         total += (size_t)(src_off[row + 1] - src_off[row]);
     }
+    if (total > (size_t)INT32_MAX) return -1;
 
     int32_t *offs = malloc((n_kept + 1) * sizeof *offs);
     char    *data = malloc(total ? total : 1);

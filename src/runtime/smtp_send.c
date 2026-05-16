@@ -200,6 +200,35 @@ static char *slurp_file_(const char *path, size_t *out_len) {
     return buf;
 }
 
+/* snprintf into a growable buffer, doubling on truncation. Returns 0 on
+ * success, -1 on OOM. Replaces the `pos += snprintf(buf+pos, cap-pos,
+ * ...)` chain which silently corrupts the buffer if any single call
+ * truncates: the chain underflows `cap - pos` to a huge size_t on the
+ * next call once pos > cap. The conservative initial cap below makes
+ * truncation unlikely in practice, but this guards against future
+ * additions to the header set that escape the budget. */
+static int append_fmt(char **buf, size_t *cap, size_t *pos,
+                      const char *fmt, ...) {
+    for (;;) {
+        size_t remaining = (*pos < *cap) ? (*cap - *pos) : 0;
+        va_list ap;
+        va_start(ap, fmt);
+        int n = vsnprintf(*buf + *pos, remaining, fmt, ap);
+        va_end(ap);
+        if (n < 0) return -1;
+        if ((size_t)n < remaining) {
+            *pos += (size_t)n;
+            return 0;
+        }
+        size_t new_cap = *cap ? *cap * 2 : 256;
+        while (new_cap < *pos + (size_t)n + 1) new_cap *= 2;
+        char *grow = realloc(*buf, new_cap);
+        if (!grow) return -1;
+        *buf = grow;
+        *cap = new_cap;
+    }
+}
+
 static int build_message(SmState *s, char **out_msg, size_t *out_len) {
     /* Headers. */
     char date_buf[64];
@@ -243,44 +272,40 @@ static int build_message(SmState *s, char **out_msg, size_t *out_len) {
         if (body_owned) free(body);
         return -1;
     }
-    int pos = 0;
-    pos += snprintf(buf + pos, cap - (size_t)pos,
-                    "Date: %s\r\n", date_buf);
-    pos += snprintf(buf + pos, cap - (size_t)pos,
-                    "Message-ID: <betl-%lu-%d@%s>\r\n",
-                    (unsigned long)now, (int)getpid(), host);
-    pos += snprintf(buf + pos, cap - (size_t)pos,
-                    "From: %s\r\n", s->from);
-    pos += snprintf(buf + pos, cap - (size_t)pos, "To: ");
+    size_t pos = 0;
+#define AF(...) do { if (append_fmt(&buf, &cap, &pos, __VA_ARGS__) != 0) { \
+        free(buf); if (body_owned) free(body); return -1; } } while (0)
+    AF("Date: %s\r\n", date_buf);
+    AF("Message-ID: <betl-%lu-%d@%s>\r\n",
+       (unsigned long)now, (int)getpid(), host);
+    AF("From: %s\r\n", s->from);
+    AF("To: ");
     for (size_t i = 0; i < s->n_to; ++i) {
-        pos += snprintf(buf + pos, cap - (size_t)pos,
-                        "%s%s", i ? ", " : "", s->to[i]);
+        AF("%s%s", i ? ", " : "", s->to[i]);
     }
-    pos += snprintf(buf + pos, cap - (size_t)pos, "\r\n");
+    AF("\r\n");
     if (s->n_cc) {
-        pos += snprintf(buf + pos, cap - (size_t)pos, "Cc: ");
+        AF("Cc: ");
         for (size_t i = 0; i < s->n_cc; ++i) {
-            pos += snprintf(buf + pos, cap - (size_t)pos,
-                            "%s%s", i ? ", " : "", s->cc[i]);
+            AF("%s%s", i ? ", " : "", s->cc[i]);
         }
-        pos += snprintf(buf + pos, cap - (size_t)pos, "\r\n");
+        AF("\r\n");
     }
-    pos += snprintf(buf + pos, cap - (size_t)pos,
-                    "Subject: %s\r\n", s->subject);
-    pos += snprintf(buf + pos, cap - (size_t)pos,
-                    "MIME-Version: 1.0\r\n"
-                    "Content-Type: text/plain; charset=utf-8\r\n"
-                    "\r\n");
+    AF("Subject: %s\r\n", s->subject);
+    AF("MIME-Version: 1.0\r\n"
+       "Content-Type: text/plain; charset=utf-8\r\n"
+       "\r\n");
+#undef AF
     /* Body: copy as-is, but rewrite bare LF to CRLF for safety on the
      * wire. (Curl uses CRLF.LF as the end-of-DATA marker; bare LFs in
      * the body are tolerated by most servers but we normalize.) */
     for (size_t i = 0; i < body_len; ++i) {
         if (body[i] == '\n' && (i == 0 || body[i-1] != '\r')) {
-            if ((size_t)(pos + 2) >= cap) goto realloc_;
+            if (pos + 2 >= cap) goto realloc_;
             buf[pos++] = '\r';
             buf[pos++] = '\n';
         } else {
-            if ((size_t)(pos + 1) >= cap) goto realloc_;
+            if (pos + 1 >= cap) goto realloc_;
             buf[pos++] = body[i];
         }
         continue;
@@ -294,7 +319,7 @@ realloc_:
     if (body_owned) free(body);
 
     *out_msg = buf;
-    *out_len = (size_t)pos;
+    *out_len = pos;
     return 0;
 }
 
