@@ -328,10 +328,19 @@ static char *jr_render_cell(const cJSON *cell, int *err) {
         char buf[40];
         /* Integer round-trip: if the number reads as a whole integer
          * within int64 range, render without decimal point. Otherwise
-         * use %.17g for full double precision. */
-        if (d == (double)(int64_t)d
-            && d >= -9007199254740992.0
-            && d <=  9007199254740992.0) {
+         * use %.17g for full double precision.
+         *
+         * The range check MUST come before the `(int64_t)d` cast and
+         * comparison: casting a double outside INT64 range to int64
+         * is undefined behaviour (UBSan: "X is outside the range of
+         * representable values of type 'long'"). Found by fuzzing
+         * json.read with double values like 6.22e+40. The 2^53 bound
+         * (9007199254740992) is also where doubles stop being able
+         * to represent consecutive integers, so anything past it
+         * gets the %g treatment regardless. */
+        if (d >= -9007199254740992.0
+            && d <=  9007199254740992.0
+            && d == (double)(int64_t)d) {
             snprintf(buf, sizeof buf, "%" PRId64, (int64_t)d);
         } else {
             snprintf(buf, sizeof buf, "%.17g", d);
