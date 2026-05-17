@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>betl pipeline viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+<style>
+  :root {
+    --bg:          #fafafa;
+    --panel:       #ffffff;
+    --line:        #e6e6e6;
+    --line-strong: #c8c8c8;
+    --text:        #222;
+    --muted:       #8a8a8a;
+    --head-bg:     #f5f5f7;
+    --hover:       #f3f4f6;
+    --badge-bg:    #eef2ff;
+    --badge-fg:    #4338ca;
+    --overlay:     rgba(0, 0, 0, 0.35);
+    --accent:      #2563eb;
+    --df:          #8b5cf6;
+    --sql:         #14b8a6;
+    --map:         #f59e0b;
+    --script:      #ef4444;
+    --container:   #6b7280;
+    --leaf:        #94a3b8;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  body.dark {
+    --bg:          #0f1115;
+    --panel:       #181b20;
+    --line:        #262a31;
+    --line-strong: #3a3f48;
+    --text:        #e7e7e7;
+    --muted:       #8a8f99;
+    --head-bg:     #1f242c;
+    --hover:       #252a32;
+    --badge-bg:    #1e1b3a;
+    --badge-fg:    #a5b4fc;
+    --overlay:     rgba(0, 0, 0, 0.55);
+    --df:          #a78bfa;
+    --sql:         #2dd4bf;
+    --map:         #fbbf24;
+    --script:      #f87171;
+    --container:   #9ca3af;
+    --leaf:        #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+    flex-wrap: wrap;
+  }
+  header h1 {
+    margin: 0; font-size: 13px; font-weight: 600;
+    font-family: var(--mono);
+    color: var(--muted);
+  }
+  header h1 .name { color: var(--text); }
+  .spacer { flex: 1; }
+  button.btn, label.btn {
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--text);
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+  }
+  button.btn:hover, label.btn:hover { background: var(--hover); }
+  button.btn:disabled, label.btn.disabled {
+    color: var(--muted); cursor: not-allowed; opacity: 0.55;
+  }
+  button.btn:disabled:hover { background: var(--panel); }
+  .btn.server-only, .toggle.server-only { display: none; }
+  body.server-mode .btn.server-only, body.server-mode .toggle.server-only { display: inline-flex; }
+  .toggle { display: flex; border: 1px solid var(--line-strong); border-radius: 6px; overflow: hidden; }
+  .toggle button {
+    border: 0; background: var(--panel); color: var(--text);
+    padding: 5px 11px; cursor: pointer; font-size: 12px; line-height: 1;
+  }
+  .toggle button + button { border-left: 1px solid var(--line-strong); }
+  .toggle button.active { background: var(--accent); color: white; }
+  .toggle button:not(.active):hover { background: var(--hover); }
+  main { padding: 14px; }
+  .drop-hint {
+    position: fixed; inset: 0;
+    background: rgba(37, 99, 235, 0.12);
+    pointer-events: none;
+    display: none;
+    align-items: center; justify-content: center;
+    font-size: 28px;
+    color: var(--accent);
+    z-index: 100;
+  }
+  .drop-hint.show { display: flex; }
+
+  /* ----------- shared: step card ----------- */
+  .step {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 9px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--leaf);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 12px;
+    min-height: 28px;
+  }
+  .step.k-container   { border-left-color: var(--container); }
+  .step.k-dataflow    { border-left-color: var(--df); }
+  .step.k-sql         { border-left-color: var(--sql); }
+  .step.k-map         { border-left-color: var(--map); }
+  .step.k-script      { border-left-color: var(--script); }
+  .step .id { font-weight: 600; }
+  .step .ttype { color: var(--muted); font-size: 11px; }
+  .step .badge {
+    margin-left: auto;
+    background: var(--badge-bg);
+    color: var(--badge-fg);
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .step .after { color: var(--muted); font-size: 11px; }
+  .step .after::before { content: '\2190 '; }
+
+  /* ----------- RIBBON ----------- */
+  .v-ribbon section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .v-ribbon .section-head {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 9px 14px;
+    background: var(--head-bg);
+    border-bottom: 1px solid var(--line);
+  }
+  .v-ribbon .section-head .id {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .v-ribbon .section-head .meta {
+    color: var(--muted);
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+  .v-ribbon .section-head .after-tag {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-left: auto;
+  }
+  .v-ribbon .section-head .after-tag::before { content: '\2190 '; }
+  .v-ribbon .children {
+    padding: 10px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 6px;
+  }
+  .v-ribbon .empty {
+    padding: 10px 14px;
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+  }
+
+  /* ----------- MASTER-DETAIL ----------- */
+  .v-detail {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 12px;
+    min-height: calc(100vh - 80px);
+  }
+  .v-detail .rail {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px;
+    align-self: start;
+    position: sticky;
+    top: 60px;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+  }
+  .v-detail .rail-item {
+    padding: 7px 9px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .v-detail .rail-item + .rail-item { margin-top: 2px; }
+  .v-detail .rail-item:hover:not(.active) { background: var(--hover); }
+  .v-detail .rail-item.active { background: var(--accent); color: white; }
+  .v-detail .rail-item .count {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .v-detail .rail-item.active .count { color: rgba(255,255,255,.85); }
+  .v-detail .pane {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .v-detail .pane-head {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 10px;
+    margin-bottom: 12px;
+  }
+  .v-detail .pane-head .id {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 16px;
+  }
+  .v-detail .pane-head .meta {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    margin-top: 3px;
+  }
+  .v-detail .pane-children {
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .v-detail .dataflow-children {
+    margin: 4px 0 8px 18px;
+    padding: 6px 8px;
+    border-left: 2px dashed var(--df);
+    display: flex; flex-direction: column; gap: 3px;
+  }
+
+  /* ----------- KANBAN ----------- */
+  .v-kanban {
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 10px;
+  }
+  .v-kanban .col {
+    min-width: 260px; max-width: 260px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: flex; flex-direction: column;
+    max-height: calc(100vh - 90px);
+  }
+  .v-kanban .col-head {
+    padding: 9px 11px;
+    background: var(--head-bg);
+    border-bottom: 1px solid var(--line);
+    border-radius: 8px 8px 0 0;
+    font-family: var(--mono);
+  }
+  .v-kanban .col-head .id { font-weight: 600; font-size: 13px; }
+  .v-kanban .col-head .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .v-kanban .col-head .after-tag {
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 2px;
+    font-family: var(--mono);
+  }
+  .v-kanban .col-head .after-tag::before { content: '\2190 '; }
+  .v-kanban .col-children {
+    padding: 8px;
+    display: flex; flex-direction: column; gap: 4px;
+    overflow-y: auto;
+  }
+  .v-kanban .empty {
+    padding: 10px;
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+  }
+
+  /* ----------- path crumb in header ----------- */
+  .pathcrumb {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 40vw;
+  }
+  .pathcrumb .dirty::after { content: ' *'; color: var(--map); }
+
+  /* ----------- modal ----------- */
+  .modal {
+    position: fixed; inset: 0;
+    background: var(--overlay);
+    display: none;
+    align-items: flex-start; justify-content: center;
+    padding-top: 8vh;
+    z-index: 200;
+  }
+  .modal.show { display: flex; }
+  .modal-card {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    width: min(640px, 92vw);
+    max-height: 80vh;
+    display: flex; flex-direction: column;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+  }
+  .modal-head {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .modal-head h3 {
+    margin: 0; font-size: 13px; font-weight: 600;
+    font-family: var(--mono);
+  }
+  .modal-head .close {
+    margin-left: auto;
+    border: 0; background: transparent; cursor: pointer;
+    color: var(--muted); font-size: 18px; line-height: 1;
+    padding: 2px 6px; border-radius: 4px;
+  }
+  .modal-head .close:hover { background: var(--hover); color: var(--text); }
+  .modal-body { padding: 10px 14px; overflow-y: auto; }
+  .modal-foot {
+    padding: 10px 14px;
+    border-top: 1px solid var(--line);
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  .modal-foot .btn.primary {
+    background: var(--accent); color: white; border-color: var(--accent);
+  }
+  .modal-foot .btn.primary:hover { background: var(--accent); filter: brightness(1.1); }
+
+  .bcrumb {
+    font-family: var(--mono); font-size: 12px;
+    padding: 4px 0 8px;
+    color: var(--muted);
+  }
+  .bcrumb .root { color: var(--text); font-weight: 600; }
+  .entries { display: flex; flex-direction: column; gap: 2px; }
+  .entry {
+    padding: 6px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: var(--mono); font-size: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .entry:hover { background: var(--hover); }
+  .entry .icon { width: 16px; text-align: center; color: var(--muted); }
+  .entry.dir .name { font-weight: 500; }
+  .entry .size { margin-left: auto; color: var(--muted); font-size: 11px; }
+
+  .saveform { display: flex; flex-direction: column; gap: 8px; }
+  .saveform label { font-size: 12px; color: var(--muted); }
+  .saveform input {
+    border: 1px solid var(--line-strong);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 7px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+  }
+  .saveform input:focus { border-color: var(--accent); }
+  .saveform .hint { font-size: 11px; color: var(--muted); }
+  .saveform .err { color: var(--script); }
+
+  /* ----------- toast ----------- */
+  .toast {
+    position: fixed;
+    bottom: 22px;
+    left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--text); color: var(--bg);
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 12px;
+    z-index: 300;
+    opacity: 0;
+    transition: opacity 0.2s, transform 0.2s;
+    pointer-events: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+    font-family: var(--mono);
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err { background: var(--script); color: white; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>betl pipeline viewer &middot; <span class="name" id="pkgName">&mdash;</span></h1>
+  <span class="pathcrumb" id="pathCrumb"></span>
+  <div class="spacer"></div>
+  <button class="btn server-only" id="browseBtn" title="Browse server files">browse&hellip;</button>
+  <button class="btn server-only" id="newBtn" title="Create a new YAML">new</button>
+  <button class="btn server-only" id="saveBtn" title="Save (Ctrl+S)">save</button>
+  <label class="btn">
+    open file&hellip;
+    <input type="file" id="fileInput" hidden accept=".yml,.yaml,text/yaml,text/plain">
+  </label>
+  <button class="btn" id="darkBtn" title="Toggle dark mode" aria-label="dark mode">&#9789;</button>
+  <div class="toggle" id="layoutToggle">
+    <button data-layout="ribbon" class="active">Ribbon</button>
+    <button data-layout="detail">Master-detail</button>
+    <button data-layout="kanban">Kanban</button>
+  </div>
+</header>
+
+<main id="stage"></main>
+<div class="drop-hint" id="dropHint">drop YAML file&hellip;</div>
+<div class="modal" id="modal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="modalTitle">&mdash;</h3>
+      <button class="close" id="modalClose" aria-label="close">&times;</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+
+<script>
+'use strict';
+
+/* -------------------------------------------------------------------------
+ * Data model
+ *
+ * Pipeline = { name: string, steps: Step[] }
+ * Step     = { id, type, after?: string[], steps?: Step[], kind, ...rest }
+ *
+ * `kind` is a coarse bucket for styling (container | dataflow | sql | map |
+ * script | leaf), derived from `type`. The original `type` is preserved.
+ * ----------------------------------------------------------------------- */
+
+function classifyType(t) {
+  if (!t) return 'leaf';
+  const s = String(t).toLowerCase();
+  if (s === 'container' || s === 'sequence' || s === 'foreach') return 'container';
+  if (s === 'dataflow') return 'dataflow';
+  if (s.startsWith('mssql') || s.startsWith('postgres') || s.startsWith('sql')) return 'sql';
+  if (s === 'map' || s === 'filter' || s === 'sort' || s === 'union' ||
+      s === 'multicast' || s === 'aggregate' || s === 'join' ||
+      s === 'conditional_split' || s === 'pivot') return 'map';
+  if (s.startsWith('dotnet') || s.includes('script')) return 'script';
+  return 'leaf';
+}
+
+function normalize(doc) {
+  if (!doc || typeof doc !== 'object') return { name: '(empty)', steps: [] };
+  const name = doc.name || '(unnamed)';
+  const raw = Array.isArray(doc.pipeline) ? doc.pipeline : [];
+  const walk = (s) => {
+    if (!s || typeof s !== 'object') return null;
+    const out = { ...s };
+    out.kind = classifyType(s.type);
+    if (Array.isArray(s.steps)) {
+      out.steps = s.steps.map(walk).filter(Boolean);
+    }
+    return out;
+  };
+  return { name, steps: raw.map(walk).filter(Boolean) };
+}
+
+/* -------------------------------------------------------------------------
+ * Tiny HTML helpers
+ * ----------------------------------------------------------------------- */
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function describe(step) {
+  const n = step.steps ? step.steps.length : 0;
+  const after = step.after && step.after.length
+    ? ` &middot; ← ${step.after.map(esc).join(', ')}`
+    : '';
+  return `${n} ${n === 1 ? 'child' : 'children'}${after}`;
+}
+
+function stepCard(step) {
+  const kind = step.kind || 'leaf';
+  const innerCount = step.steps && step.steps.length
+    ? `<span class="badge">${step.steps.length} steps</span>`
+    : '';
+  const after = step.after && step.after.length
+    ? `<span class="after">${step.after.map(esc).join(', ')}</span>`
+    : '';
+  return `<div class="step k-${kind}">
+    <span class="id">${esc(step.id)}</span>
+    <span class="ttype">${esc(step.type || '')}</span>
+    ${after}
+    ${innerCount}
+  </div>`;
+}
+
+/* -------------------------------------------------------------------------
+ * Template sets - three layouts, one data model.
+ *
+ * Each template set exposes a single `render(pipeline, ctx)` entry point.
+ * Templates share `stepCard` for individual rows so leaves look the same
+ * everywhere; the differences are in how containers are composed.
+ * ----------------------------------------------------------------------- */
+
+const templates = {
+
+  /* ---- 1. Ribbon: long page of horizontal sections ---- */
+  ribbon: {
+    name: 'Ribbon',
+    render(pipeline) {
+      return `<div class="v-ribbon">
+        ${pipeline.steps.map(this.section).join('')}
+      </div>`;
+    },
+    section(step) {
+      const children = step.steps && step.steps.length
+        ? `<div class="children">${step.steps.map(stepCard).join('')}</div>`
+        : `<div class="empty">no children</div>`;
+      const after = step.after && step.after.length
+        ? `<span class="after-tag">${step.after.map(esc).join(', ')}</span>`
+        : '';
+      return `<section>
+        <div class="section-head">
+          <span class="id">${esc(step.id)}</span>
+          <span class="meta">${esc(step.type || '')}</span>
+          <span class="meta">${(step.steps || []).length} children</span>
+          ${after}
+        </div>
+        ${children}
+      </section>`;
+    },
+  },
+
+  /* ---- 2. Master-detail: left rail + focused pane ---- */
+  detail: {
+    name: 'Master-detail',
+    render(pipeline, ctx) {
+      const sel = Math.min(ctx.selected || 0, Math.max(0, pipeline.steps.length - 1));
+      const railItems = pipeline.steps.map((s, i) => {
+        const cls = i === sel ? 'rail-item active' : 'rail-item';
+        const n = s.steps ? s.steps.length : 0;
+        return `<div class="${cls}" data-i="${i}">
+          <span>${esc(s.id)}</span>
+          <span class="count">${n}</span>
+        </div>`;
+      }).join('');
+
+      const cur = pipeline.steps[sel];
+      const paneBody = cur ? this.pane(cur) : `<div class="empty">no pipeline</div>`;
+
+      return `<div class="v-detail">
+        <div class="rail">${railItems}</div>
+        <div class="pane">${paneBody}</div>
+      </div>`;
+    },
+    pane(step) {
+      const childRows = (step.steps || []).map((c) => {
+        if (c.kind === 'dataflow' && c.steps && c.steps.length) {
+          const inner = c.steps.map(stepCard).join('');
+          return stepCard(c) + `<div class="dataflow-children">${inner}</div>`;
+        }
+        return stepCard(c);
+      }).join('');
+      const after = step.after && step.after.length
+        ? ` &middot; ← ${step.after.map(esc).join(', ')}`
+        : '';
+      const n = step.steps ? step.steps.length : 0;
+      return `<div class="pane-head">
+          <div class="id">${esc(step.id)}</div>
+          <div class="meta">${esc(step.type || '')} &middot; ${n} children${after}</div>
+        </div>
+        <div class="pane-children">${childRows || '<div class="empty">no children</div>'}</div>`;
+    },
+  },
+
+  /* ---- 3. Kanban: top-level steps as columns ---- */
+  kanban: {
+    name: 'Kanban',
+    render(pipeline) {
+      return `<div class="v-kanban">
+        ${pipeline.steps.map(this.column).join('')}
+      </div>`;
+    },
+    column(step) {
+      const children = step.steps && step.steps.length
+        ? step.steps.map(stepCard).join('')
+        : `<div class="empty">no children</div>`;
+      const after = step.after && step.after.length
+        ? `<div class="after-tag">${step.after.map(esc).join(', ')}</div>`
+        : '';
+      const n = step.steps ? step.steps.length : 0;
+      return `<div class="col">
+        <div class="col-head">
+          <div class="id">${esc(step.id)}</div>
+          <div class="meta">${esc(step.type || '')} &middot; ${n} children</div>
+          ${after}
+        </div>
+        <div class="col-children">${children}</div>
+      </div>`;
+    },
+  },
+};
+
+/* -------------------------------------------------------------------------
+ * App state + wiring
+ * ----------------------------------------------------------------------- */
+
+const state = {
+  pipeline: { name: '(none)', steps: [] },
+  layout: 'ribbon',
+  selected: 0,
+  currentPath: null,    // server-relative path of the loaded file
+  currentText: '',      // raw YAML text of what's loaded (for round-trip save)
+  isServer: location.protocol === 'http:' || location.protocol === 'https:',
+};
+
+const stage     = document.getElementById('stage');
+const pkgName   = document.getElementById('pkgName');
+const pathCrumb = document.getElementById('pathCrumb');
+
+if (state.isServer) document.body.classList.add('server-mode');
+
+function render() {
+  pkgName.textContent = state.pipeline.name;
+  pathCrumb.textContent = state.currentPath ? '@ ' + state.currentPath : '';
+  const tpl = templates[state.layout];
+  stage.innerHTML = tpl.render(state.pipeline, state);
+  if (state.layout === 'detail') {
+    stage.querySelectorAll('.rail-item').forEach((el) => {
+      el.addEventListener('click', () => {
+        state.selected = parseInt(el.dataset.i, 10) || 0;
+        render();
+      });
+    });
+  }
+}
+
+function loadYamlText(text, sourceName, serverPath) {
+  let doc;
+  try {
+    doc = jsyaml.load(text);
+  } catch (e) {
+    toast('YAML parse error: ' + e.message, true);
+    return;
+  }
+  state.pipeline = normalize(doc);
+  state.selected = 0;
+  state.currentText = text;
+  state.currentPath = serverPath || null;
+  if (sourceName && !state.pipeline.name) state.pipeline.name = sourceName;
+  render();
+}
+
+/* ---------- toast ---------- */
+const toastEl = document.getElementById('toast');
+let toastTimer = 0;
+function toast(msg, isErr) {
+  toastEl.textContent = msg;
+  toastEl.classList.toggle('err', !!isErr);
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2600);
+}
+
+/* ---------- modal ---------- */
+const modal     = document.getElementById('modal');
+const modalTitle= document.getElementById('modalTitle');
+const modalBody = document.getElementById('modalBody');
+const modalFoot = document.getElementById('modalFoot');
+function openModal(title, bodyHtml, footHtml) {
+  modalTitle.textContent = title;
+  modalBody.innerHTML = bodyHtml || '';
+  modalFoot.innerHTML = footHtml || '';
+  modal.classList.add('show');
+}
+function closeModal() { modal.classList.remove('show'); }
+document.getElementById('modalClose').addEventListener('click', closeModal);
+modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && modal.classList.contains('show')) closeModal();
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && state.isServer) {
+    e.preventDefault();
+    saveCurrent();
+  }
+});
+
+/* ---------- dark mode ---------- */
+const darkBtn = document.getElementById('darkBtn');
+function setDark(on) {
+  document.body.classList.toggle('dark', on);
+  darkBtn.innerHTML = on ? '&#9728;' : '&#9789;';  /* sun / crescent */
+  try { localStorage.setItem('betl-yaml-ui-dark', on ? '1' : '0'); } catch (_) {}
+}
+setDark(
+  (() => { try { return localStorage.getItem('betl-yaml-ui-dark') === '1'; } catch (_) { return false; } })()
+);
+darkBtn.addEventListener('click', () => setDark(!document.body.classList.contains('dark')));
+
+/* ---------- server: browse / load / save / new ---------- */
+function dirnameOf(p) {
+  if (!p) return '';
+  const i = p.lastIndexOf('/');
+  return i < 0 ? '' : p.slice(0, i);
+}
+
+async function openBrowser(path) {
+  path = path || '';
+  let j;
+  try {
+    const r = await fetch('/api/list?path=' + encodeURIComponent(path));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    j = await r.json();
+  } catch (e) {
+    toast('Browse failed: ' + e.message, true);
+    return;
+  }
+  const upPath = path ? dirnameOf(path) : null;
+  const upRow = upPath !== null
+    ? `<div class="entry" data-kind="dir" data-path="${esc(upPath)}">
+         <span class="icon">&#x21B0;</span><span class="name">..</span>
+       </div>`
+    : '';
+  const dirRows = j.dirs.map((d) =>
+    `<div class="entry" data-kind="dir" data-path="${esc(d.path)}">
+       <span class="icon">&#128193;</span><span class="name">${esc(d.name)}</span>
+     </div>`
+  ).join('');
+  const fileRows = j.files.map((f) =>
+    `<div class="entry" data-kind="file" data-path="${esc(f.path)}">
+       <span class="icon">&#128462;</span><span class="name">${esc(f.name)}</span>
+       <span class="size">${f.size} B</span>
+     </div>`
+  ).join('');
+  const where = j.path ? j.path : '<root>';
+  const body = `
+    <div class="bcrumb"><span class="root">root</span> / ${esc(where)}</div>
+    <div class="entries">${upRow}${dirRows}${fileRows}
+      ${(j.dirs.length + j.files.length === 0) ? '<div class="entry" style="color:var(--muted)">(empty)</div>' : ''}
+    </div>`;
+  openModal('Browse', body, `<button class="btn" onclick="closeModal()">Cancel</button>`);
+  modalBody.querySelectorAll('.entry[data-kind="dir"]').forEach((el) =>
+    el.addEventListener('click', () => openBrowser(el.dataset.path))
+  );
+  modalBody.querySelectorAll('.entry[data-kind="file"]').forEach((el) =>
+    el.addEventListener('click', () => loadServerFile(el.dataset.path))
+  );
+}
+
+async function loadServerFile(path) {
+  try {
+    const r = await fetch('/api/file?path=' + encodeURIComponent(path));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = await r.text();
+    closeModal();
+    loadYamlText(text, path.split('/').pop().replace(/\.[^.]+$/, ''), path);
+    toast('Loaded ' + path);
+  } catch (e) {
+    toast('Load failed: ' + e.message, true);
+  }
+}
+
+async function writeServerFile(path, text) {
+  const r = await fetch('/api/file?path=' + encodeURIComponent(path), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'text/yaml' },
+    body: text,
+  });
+  if (!r.ok) {
+    const err = await r.text().catch(() => '');
+    throw new Error('HTTP ' + r.status + (err ? ': ' + err : ''));
+  }
+  return r.json();
+}
+
+function openSaveAs(prefill) {
+  const initial = prefill || state.currentPath || 'untitled.yml';
+  const body = `
+    <div class="saveform">
+      <label for="savePath">Save to (relative to server root):</label>
+      <input id="savePath" type="text" value="${esc(initial)}" autocomplete="off" spellcheck="false">
+      <div class="hint">Must end in <code>.yml</code> or <code>.yaml</code>. Parent dirs are created.</div>
+      <div class="hint err" id="saveErr" style="display:none"></div>
+    </div>`;
+  openModal('Save as', body, `
+    <button class="btn" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="saveConfirm">Save</button>
+  `);
+  const input = document.getElementById('savePath');
+  const errEl = document.getElementById('saveErr');
+  const doSave = async () => {
+    const p = input.value.trim();
+    if (!/\.(ya?ml)$/i.test(p)) {
+      errEl.style.display = 'block';
+      errEl.textContent = 'path must end in .yml or .yaml';
+      return;
+    }
+    try {
+      await writeServerFile(p, state.currentText);
+      state.currentPath = p;
+      closeModal();
+      render();
+      toast('Saved ' + p);
+    } catch (e) {
+      errEl.style.display = 'block';
+      errEl.textContent = e.message;
+    }
+  };
+  document.getElementById('saveConfirm').addEventListener('click', doSave);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSave(); });
+  input.focus();
+  input.select();
+}
+
+async function saveCurrent() {
+  if (!state.currentText) { toast('Nothing loaded', true); return; }
+  if (!state.currentPath) { openSaveAs(); return; }
+  try {
+    await writeServerFile(state.currentPath, state.currentText);
+    toast('Saved ' + state.currentPath);
+  } catch (e) {
+    toast('Save failed: ' + e.message, true);
+  }
+}
+
+function newPipeline() {
+  const starter = 'betl: 1\nname: untitled\n\npipeline: []\n';
+  loadYamlText(starter, 'untitled', null);
+  toast('New pipeline (unsaved)');
+}
+
+if (state.isServer) {
+  document.getElementById('browseBtn').addEventListener('click', () => openBrowser(''));
+  document.getElementById('saveBtn').addEventListener('click', saveCurrent);
+  document.getElementById('newBtn').addEventListener('click', newPipeline);
+}
+
+/* layout toggle */
+document.getElementById('layoutToggle').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-layout]');
+  if (!b) return;
+  state.layout = b.dataset.layout;
+  document.querySelectorAll('#layoutToggle button').forEach((x) => {
+    x.classList.toggle('active', x === b);
+  });
+  render();
+});
+
+/* file open (local) */
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => loadYamlText(r.result, f.name.replace(/\.[^.]+$/, ''));
+  r.readAsText(f);
+});
+
+/* drag-drop */
+const dropHint = document.getElementById('dropHint');
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => {
+  if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
+  e.preventDefault();
+  dragDepth++;
+  dropHint.classList.add('show');
+});
+window.addEventListener('dragover', (e) => {
+  if (e.dataTransfer && e.dataTransfer.types.includes('Files')) e.preventDefault();
+});
+window.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) dropHint.classList.remove('show');
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropHint.classList.remove('show');
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => loadYamlText(r.result, f.name.replace(/\.[^.]+$/, ''));
+  r.readAsText(f);
+});
+
+/* boot: render the empty state */
+stage.innerHTML = `
+  <div style="text-align:center; color:var(--muted); padding:60px 20px; font-family:var(--mono); font-size:13px;">
+    no pipeline loaded
+    <div style="margin-top:8px; font-size:12px;">use <b>${state.isServer ? 'browse&hellip;' : 'open file&hellip;'}</b> or drag a YAML file onto the page</div>
+  </div>`;
+</script>
+
+</body>
+</html>
