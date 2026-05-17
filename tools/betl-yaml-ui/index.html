@@ -403,6 +403,124 @@
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   .toast.err { background: var(--script); color: white; }
+
+  /* ----------- step click affordances ----------- */
+  [data-path] { cursor: pointer; }
+  [data-path]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .step[data-path]:hover { background: var(--hover); }
+  .step[data-path].selected {
+    background: var(--hover);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .section-head[data-path], .col-head[data-path], .pane-head[data-path] {
+    border-left: 3px solid var(--leaf);
+  }
+  .section-head[data-path].k-container, .col-head[data-path].k-container, .pane-head[data-path].k-container { border-left-color: var(--container); }
+  .section-head[data-path].k-dataflow,  .col-head[data-path].k-dataflow,  .pane-head[data-path].k-dataflow  { border-left-color: var(--df); }
+  .section-head[data-path].k-sql,       .col-head[data-path].k-sql,       .pane-head[data-path].k-sql       { border-left-color: var(--sql); }
+  .section-head[data-path].k-map,       .col-head[data-path].k-map,       .pane-head[data-path].k-map       { border-left-color: var(--map); }
+  .section-head[data-path].k-script,    .col-head[data-path].k-script,    .pane-head[data-path].k-script    { border-left-color: var(--script); }
+  .section-head[data-path]:hover, .col-head[data-path]:hover, .pane-head[data-path]:hover {
+    filter: brightness(0.97);
+  }
+  body.dark .section-head[data-path]:hover, body.dark .col-head[data-path]:hover, body.dark .pane-head[data-path]:hover {
+    filter: brightness(1.15);
+  }
+
+  /* ----------- inspector ----------- */
+  .inspector {
+    position: fixed;
+    top: 50px; right: 0; bottom: 0;
+    width: min(400px, 92vw);
+    background: var(--panel);
+    border-left: 1px solid var(--line);
+    display: flex; flex-direction: column;
+    transform: translateX(100%);
+    transition: transform 0.18s ease-out;
+    z-index: 80;
+    box-shadow: -4px 0 16px rgba(0,0,0,0.08);
+  }
+  .inspector.show { transform: translateX(0); }
+  .inspector .ins-head {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .inspector .ins-head .crumb {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .inspector .ins-head .crumb .arrow { margin: 0 4px; opacity: 0.6; }
+  .inspector .ins-head .crumb .tail  { color: var(--text); font-weight: 600; }
+  .inspector .ins-head button.close {
+    border: 0; background: transparent; cursor: pointer;
+    color: var(--muted); font-size: 18px; line-height: 1;
+    padding: 2px 6px; border-radius: 4px;
+  }
+  .inspector .ins-head button.close:hover { background: var(--hover); color: var(--text); }
+  .inspector .ins-body {
+    padding: 12px;
+    overflow-y: auto;
+    flex: 1;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .inspector .ins-foot {
+    padding: 10px 12px;
+    border-top: 1px solid var(--line);
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field label {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--muted);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .field label .kindtag {
+    background: var(--badge-bg); color: var(--badge-fg);
+    padding: 1px 6px; border-radius: 10px; font-size: 10px;
+    font-weight: 500;
+  }
+  .field input, .field textarea {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line-strong);
+    border-radius: 5px;
+    padding: 6px 8px;
+    font-family: var(--mono); font-size: 12px;
+    outline: none;
+    resize: vertical;
+    width: 100%;
+  }
+  .field input:focus, .field textarea:focus { border-color: var(--accent); }
+  .nested-list {
+    display: flex; flex-direction: column; gap: 3px;
+    border: 1px dashed var(--line-strong);
+    border-radius: 5px;
+    padding: 6px;
+  }
+  .nested-link {
+    padding: 5px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--mono); font-size: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .nested-link:hover { background: var(--hover); }
+  .nested-link .nl-id { font-weight: 600; }
+  .nested-link .nl-type { color: var(--muted); font-size: 11px; }
+  .nested-link::before { content: '\2192'; color: var(--muted); }
+  .ins-empty {
+    color: var(--muted); font-style: italic;
+    padding: 20px 12px; text-align: center; font-size: 12px;
+  }
 </style>
 </head>
 <body>
@@ -439,6 +557,17 @@
   </div>
 </div>
 <div class="toast" id="toast"></div>
+<aside class="inspector" id="inspector">
+  <div class="ins-head">
+    <div class="crumb" id="inspectorCrumb"></div>
+    <button class="close" id="inspectorClose" aria-label="close inspector">&times;</button>
+  </div>
+  <div class="ins-body" id="inspectorBody"></div>
+  <div class="ins-foot">
+    <button class="btn" id="inspectorDiscard">Discard</button>
+    <button class="btn primary" id="inspectorApply">Apply</button>
+  </div>
+</aside>
 
 
 <script>
@@ -467,20 +596,28 @@ function classifyType(t) {
   return 'leaf';
 }
 
-function normalize(doc) {
+/* decorateStep mutates the parsed YAML object in place, adding `kind` for
+ * styling. The returned pipeline view shares object identity with rawDoc,
+ * so edits made through the inspector flow back to the doc for save. */
+function decorateStep(s) {
+  if (!s || typeof s !== 'object') return;
+  s.kind = classifyType(s.type);
+  if (Array.isArray(s.steps)) s.steps.forEach(decorateStep);
+}
+
+function buildPipelineView(doc) {
   if (!doc || typeof doc !== 'object') return { name: '(empty)', steps: [] };
-  const name = doc.name || '(unnamed)';
-  const raw = Array.isArray(doc.pipeline) ? doc.pipeline : [];
-  const walk = (s) => {
-    if (!s || typeof s !== 'object') return null;
-    const out = { ...s };
-    out.kind = classifyType(s.type);
-    if (Array.isArray(s.steps)) {
-      out.steps = s.steps.map(walk).filter(Boolean);
-    }
-    return out;
-  };
-  return { name, steps: raw.map(walk).filter(Boolean) };
+  if (!Array.isArray(doc.pipeline)) doc.pipeline = [];
+  doc.pipeline.forEach(decorateStep);
+  return { name: doc.name || '(unnamed)', steps: doc.pipeline };
+}
+
+/* Recursively strip the UI-only `kind` field before serializing back. */
+function stripKind(node) {
+  if (Array.isArray(node)) { node.forEach(stripKind); return; }
+  if (!node || typeof node !== 'object') return;
+  delete node.kind;
+  for (const k of Object.keys(node)) stripKind(node[k]);
 }
 
 /* -------------------------------------------------------------------------
@@ -501,7 +638,7 @@ function describe(step) {
   return `${n} ${n === 1 ? 'child' : 'children'}${after}`;
 }
 
-function stepCard(step) {
+function stepCard(step, path) {
   const kind = step.kind || 'leaf';
   const innerCount = step.steps && step.steps.length
     ? `<span class="badge">${step.steps.length} steps</span>`
@@ -509,7 +646,8 @@ function stepCard(step) {
   const after = step.after && step.after.length
     ? `<span class="after">${step.after.map(esc).join(', ')}</span>`
     : '';
-  return `<div class="step k-${kind}">
+  const pathAttr = path != null ? ` data-path="${esc(path)}"` : '';
+  return `<div class="step k-${kind}"${pathAttr} role="button" tabindex="0">
     <span class="id">${esc(step.id)}</span>
     <span class="ttype">${esc(step.type || '')}</span>
     ${after}
@@ -532,18 +670,18 @@ const templates = {
     name: 'Ribbon',
     render(pipeline) {
       return `<div class="v-ribbon">
-        ${pipeline.steps.map(this.section).join('')}
+        ${pipeline.steps.map((s, i) => this.section(s, i)).join('')}
       </div>`;
     },
-    section(step) {
+    section(step, i) {
       const children = step.steps && step.steps.length
-        ? `<div class="children">${step.steps.map(stepCard).join('')}</div>`
+        ? `<div class="children">${step.steps.map((c, j) => stepCard(c, `${i},${j}`)).join('')}</div>`
         : `<div class="empty">no children</div>`;
       const after = step.after && step.after.length
         ? `<span class="after-tag">${step.after.map(esc).join(', ')}</span>`
         : '';
       return `<section>
-        <div class="section-head">
+        <div class="section-head k-${step.kind || 'leaf'}" data-path="${i}" role="button" tabindex="0">
           <span class="id">${esc(step.id)}</span>
           <span class="meta">${esc(step.type || '')}</span>
           <span class="meta">${(step.steps || []).length} children</span>
@@ -569,26 +707,26 @@ const templates = {
       }).join('');
 
       const cur = pipeline.steps[sel];
-      const paneBody = cur ? this.pane(cur) : `<div class="empty">no pipeline</div>`;
+      const paneBody = cur ? this.pane(cur, sel) : `<div class="empty">no pipeline</div>`;
 
       return `<div class="v-detail">
         <div class="rail">${railItems}</div>
         <div class="pane">${paneBody}</div>
       </div>`;
     },
-    pane(step) {
-      const childRows = (step.steps || []).map((c) => {
+    pane(step, i) {
+      const childRows = (step.steps || []).map((c, j) => {
         if (c.kind === 'dataflow' && c.steps && c.steps.length) {
-          const inner = c.steps.map(stepCard).join('');
-          return stepCard(c) + `<div class="dataflow-children">${inner}</div>`;
+          const inner = c.steps.map((g, k) => stepCard(g, `${i},${j},${k}`)).join('');
+          return stepCard(c, `${i},${j}`) + `<div class="dataflow-children">${inner}</div>`;
         }
-        return stepCard(c);
+        return stepCard(c, `${i},${j}`);
       }).join('');
       const after = step.after && step.after.length
         ? ` &middot; ← ${step.after.map(esc).join(', ')}`
         : '';
       const n = step.steps ? step.steps.length : 0;
-      return `<div class="pane-head">
+      return `<div class="pane-head k-${step.kind || 'leaf'}" data-path="${i}" role="button" tabindex="0">
           <div class="id">${esc(step.id)}</div>
           <div class="meta">${esc(step.type || '')} &middot; ${n} children${after}</div>
         </div>
@@ -601,19 +739,19 @@ const templates = {
     name: 'Kanban',
     render(pipeline) {
       return `<div class="v-kanban">
-        ${pipeline.steps.map(this.column).join('')}
+        ${pipeline.steps.map((s, i) => this.column(s, i)).join('')}
       </div>`;
     },
-    column(step) {
+    column(step, i) {
       const children = step.steps && step.steps.length
-        ? step.steps.map(stepCard).join('')
+        ? step.steps.map((c, j) => stepCard(c, `${i},${j}`)).join('')
         : `<div class="empty">no children</div>`;
       const after = step.after && step.after.length
         ? `<div class="after-tag">${step.after.map(esc).join(', ')}</div>`
         : '';
       const n = step.steps ? step.steps.length : 0;
       return `<div class="col">
-        <div class="col-head">
+        <div class="col-head k-${step.kind || 'leaf'}" data-path="${i}" role="button" tabindex="0">
           <div class="id">${esc(step.id)}</div>
           <div class="meta">${esc(step.type || '')} &middot; ${n} children</div>
           ${after}
@@ -630,10 +768,14 @@ const templates = {
 
 const state = {
   pipeline: { name: '(none)', steps: [] },
+  rawDoc: null,          // full parsed YAML doc; pipeline.steps share identity
   layout: 'ribbon',
   selected: 0,
-  currentPath: null,    // server-relative path of the loaded file
-  currentText: '',      // raw YAML text of what's loaded (for round-trip save)
+  selectedPath: null,    // comma-joined indices of the inspected step
+  currentPath: null,     // server-relative path of the loaded file
+  currentText: '',       // raw YAML text last loaded/saved
+  dirty: false,          // edits since last save
+  hasComments: false,
   isServer: location.protocol === 'http:' || location.protocol === 'https:',
 };
 
@@ -645,7 +787,8 @@ if (state.isServer) document.body.classList.add('server-mode');
 
 function render() {
   pkgName.textContent = state.pipeline.name;
-  pathCrumb.textContent = state.currentPath ? '@ ' + state.currentPath : '';
+  const tag = state.currentPath ? '@ ' + state.currentPath : '';
+  pathCrumb.innerHTML = tag + (state.dirty ? ' <span class="dirty"></span>' : '');
   const tpl = templates[state.layout];
   stage.innerHTML = tpl.render(state.pipeline, state);
   if (state.layout === 'detail') {
@@ -656,6 +799,37 @@ function render() {
       });
     });
   }
+  if (state.selectedPath != null) {
+    stage.querySelectorAll(`[data-path="${state.selectedPath}"]`)
+      .forEach(el => el.classList.add('selected'));
+  }
+}
+
+/* step click → inspector */
+stage.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-path]');
+  if (!el || !stage.contains(el)) return;
+  openInspector(el.dataset.path);
+});
+stage.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const el = e.target.closest('[data-path]');
+  if (!el) return;
+  e.preventDefault();
+  openInspector(el.dataset.path);
+});
+
+function stepAt(path) {
+  if (path == null || path === '') return null;
+  const parts = String(path).split(',').map(Number);
+  let arr = state.rawDoc && state.rawDoc.pipeline;
+  let cur = null;
+  for (const idx of parts) {
+    if (!Array.isArray(arr) || idx < 0 || idx >= arr.length) return null;
+    cur = arr[idx];
+    arr = cur && cur.steps;
+  }
+  return cur;
 }
 
 function loadYamlText(text, sourceName, serverPath) {
@@ -666,12 +840,23 @@ function loadYamlText(text, sourceName, serverPath) {
     toast('YAML parse error: ' + e.message, true);
     return;
   }
-  state.pipeline = normalize(doc);
+  state.rawDoc = (doc && typeof doc === 'object') ? doc : {};
+  state.pipeline = buildPipelineView(state.rawDoc);
   state.selected = 0;
   state.currentText = text;
   state.currentPath = serverPath || null;
-  if (sourceName && !state.pipeline.name) state.pipeline.name = sourceName;
+  state.dirty = false;
+  state.selectedPath = null;
+  state.hasComments = /^\s*#/m.test(text);
+  if (sourceName && !state.pipeline.name) {
+    state.pipeline.name = sourceName;
+    state.rawDoc.name = sourceName;
+  }
+  closeInspector();
   render();
+  if (state.hasComments) {
+    toast('Note: comments in this file will be lost on save', true);
+  }
 }
 
 /* ---------- toast ---------- */
@@ -700,11 +885,177 @@ function closeModal() { modal.classList.remove('show'); }
 document.getElementById('modalClose').addEventListener('click', closeModal);
 modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && modal.classList.contains('show')) closeModal();
+  if (e.key === 'Escape') {
+    if (modal.classList.contains('show')) { closeModal(); return; }
+    if (document.getElementById('inspector').classList.contains('show')) closeInspector();
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && state.isServer) {
     e.preventDefault();
     saveCurrent();
   }
+});
+
+/* ---------- inspector ---------- */
+const inspectorEl    = document.getElementById('inspector');
+const inspectorBody  = document.getElementById('inspectorBody');
+const inspectorCrumb = document.getElementById('inspectorCrumb');
+
+const RESERVED_KEYS = new Set(['id', 'type', 'after', 'steps', 'kind']);
+
+function openInspector(path) {
+  const step = stepAt(path);
+  if (!step) return;
+  state.selectedPath = String(path);
+  inspectorEl.classList.add('show');
+  renderInspector();
+  render();   /* refresh to highlight the selected card */
+}
+
+function closeInspector() {
+  state.selectedPath = null;
+  inspectorEl.classList.remove('show');
+  inspectorBody.innerHTML = '';
+  inspectorCrumb.innerHTML = '';
+}
+
+function pathCrumbHtml(path) {
+  const parts = String(path).split(',').map(Number);
+  const segs = [];
+  let arr = state.rawDoc && state.rawDoc.pipeline;
+  let cur = null;
+  for (const idx of parts) {
+    if (!Array.isArray(arr)) break;
+    cur = arr[idx];
+    if (!cur) break;
+    segs.push(esc(cur.id || '?'));
+    arr = cur.steps;
+  }
+  const tail = segs.pop() || '?';
+  const head = segs.length ? segs.join('<span class="arrow">/</span>') + '<span class="arrow">/</span>' : '';
+  return head + '<span class="tail">' + tail + '</span>';
+}
+
+function fieldEditor(key, val, opts) {
+  opts = opts || {};
+  const label = esc(key);
+  const id = 'fld_' + key.replace(/[^\w]/g, '_');
+  if (Array.isArray(val) && val.every(v => typeof v === 'string')) {
+    return `<div class="field">
+      <label for="${id}">${label} <span class="kindtag">list</span></label>
+      <input id="${id}" data-key="${esc(key)}" data-kind="strlist" value="${esc(val.join(', '))}" spellcheck="false">
+    </div>`;
+  }
+  if (val == null || typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+    const str = String(val == null ? '' : val);
+    const tag = val == null ? 'unset' : typeof val;
+    if (str.includes('\n') || str.length > 60) {
+      const rows = Math.min(12, Math.max(3, str.split('\n').length + 1));
+      return `<div class="field">
+        <label for="${id}">${label} <span class="kindtag">${tag}</span></label>
+        <textarea id="${id}" data-key="${esc(key)}" data-kind="text" rows="${rows}" spellcheck="false">${esc(str)}</textarea>
+      </div>`;
+    }
+    return `<div class="field">
+      <label for="${id}">${label} <span class="kindtag">${tag}</span></label>
+      <input id="${id}" data-key="${esc(key)}" data-kind="text" value="${esc(str)}" spellcheck="false">
+    </div>`;
+  }
+  /* complex value: YAML textarea */
+  let dumped = '';
+  try { dumped = jsyaml.dump(val, { lineWidth: 100, noRefs: true }).trimEnd(); } catch (_) {}
+  const rows = Math.min(14, Math.max(3, dumped.split('\n').length + 1));
+  return `<div class="field">
+    <label for="${id}">${label} <span class="kindtag">yaml</span></label>
+    <textarea id="${id}" data-key="${esc(key)}" data-kind="yaml" rows="${rows}" spellcheck="false">${esc(dumped)}</textarea>
+  </div>`;
+}
+
+function renderInspector() {
+  const step = stepAt(state.selectedPath);
+  if (!step) { closeInspector(); return; }
+  inspectorCrumb.innerHTML = pathCrumbHtml(state.selectedPath);
+
+  /* Order: id, type, after first, then any extras alphabetical, then steps last. */
+  const all = Object.keys(step).filter(k => k !== 'kind');
+  const front = ['id', 'type', 'after'].filter(k => k in step);
+  const extras = all.filter(k => !RESERVED_KEYS.has(k)).sort();
+  const hasSteps = Array.isArray(step.steps) && step.steps.length > 0;
+
+  const fieldsHtml = [...front, ...extras].map(k => fieldEditor(k, step[k])).join('');
+
+  const nestedHtml = hasSteps
+    ? `<div class="field">
+         <label>steps <span class="kindtag">${step.steps.length} nested</span></label>
+         <div class="nested-list">
+           ${step.steps.map((s, j) => `
+             <div class="nested-link" data-rel="${j}">
+               <span class="nl-id">${esc(s.id || '?')}</span>
+               <span class="nl-type">${esc(s.type || '')}</span>
+             </div>`).join('')}
+         </div>
+       </div>`
+    : '';
+
+  inspectorBody.innerHTML = fieldsHtml + nestedHtml;
+
+  /* drill-down: clicking a nested step opens it in the inspector */
+  inspectorBody.querySelectorAll('.nested-link').forEach((el) => {
+    el.addEventListener('click', () => {
+      const rel = parseInt(el.dataset.rel, 10);
+      openInspector(state.selectedPath + ',' + rel);
+    });
+  });
+}
+
+function applyInspector() {
+  const step = stepAt(state.selectedPath);
+  if (!step) return;
+  const inputs = inspectorBody.querySelectorAll('[data-key]');
+  const updates = [];
+  for (const inp of inputs) {
+    const k = inp.dataset.key;
+    const kind = inp.dataset.kind;
+    const v = inp.value;
+    try {
+      if (kind === 'strlist') {
+        const arr = v.split(',').map(x => x.trim()).filter(Boolean);
+        updates.push([k, arr.length ? arr : undefined]);
+      } else if (kind === 'yaml') {
+        if (v.trim() === '') updates.push([k, undefined]);
+        else updates.push([k, jsyaml.load(v)]);
+      } else {
+        updates.push([k, v === '' ? undefined : v]);
+      }
+    } catch (e) {
+      toast(`Apply failed at ${k}: ${e.message}`, true);
+      return;
+    }
+  }
+  let changed = false;
+  for (const [k, v] of updates) {
+    const prev = step[k];
+    if (v === undefined) {
+      if (k in step) { delete step[k]; changed = true; }
+    } else {
+      if (JSON.stringify(prev) !== JSON.stringify(v)) { step[k] = v; changed = true; }
+    }
+  }
+  if (changed) {
+    decorateStep(step);
+    state.dirty = true;
+    render();
+    renderInspector();
+    toast('Applied');
+  } else {
+    toast('No changes');
+  }
+}
+
+document.getElementById('inspectorClose').addEventListener('click', closeInspector);
+document.getElementById('inspectorApply').addEventListener('click', applyInspector);
+document.getElementById('inspectorDiscard').addEventListener('click', () => {
+  renderInspector();   /* re-render = revert input values to current model */
+  toast('Discarded');
 });
 
 /* ---------- dark mode ---------- */
@@ -796,6 +1147,7 @@ async function writeServerFile(path, text) {
 }
 
 function openSaveAs(prefill) {
+  if (state.dirty) state.currentText = serializeRawDoc();
   const initial = prefill || state.currentPath || 'untitled.yml';
   const body = `
     <div class="saveform">
@@ -820,6 +1172,7 @@ function openSaveAs(prefill) {
     try {
       await writeServerFile(p, state.currentText);
       state.currentPath = p;
+      state.dirty = false;
       closeModal();
       render();
       toast('Saved ' + p);
@@ -834,11 +1187,21 @@ function openSaveAs(prefill) {
   input.select();
 }
 
+function serializeRawDoc() {
+  /* deep-clone so we can strip UI-only `kind` fields without mutating state */
+  const clone = JSON.parse(JSON.stringify(state.rawDoc || {}));
+  stripKind(clone);
+  return jsyaml.dump(clone, { lineWidth: 120, noRefs: true });
+}
+
 async function saveCurrent() {
-  if (!state.currentText) { toast('Nothing loaded', true); return; }
+  if (!state.rawDoc) { toast('Nothing loaded', true); return; }
+  if (state.dirty) state.currentText = serializeRawDoc();
   if (!state.currentPath) { openSaveAs(); return; }
   try {
     await writeServerFile(state.currentPath, state.currentText);
+    state.dirty = false;
+    render();
     toast('Saved ' + state.currentPath);
   } catch (e) {
     toast('Save failed: ' + e.message, true);
