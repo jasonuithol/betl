@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <title>betl pipeline viewer</title>
 <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@dagrejs/dagre@1.1.4/dist/dagre.min.js"></script>
 <style>
   :root {
     --bg:          #fafafa;
@@ -93,6 +94,40 @@
   .toggle button:not(.active):hover { background: var(--hover); }
   main { padding: 14px; }
 
+  /* ----------- connection arrows ----------- */
+  .v-ribbon .children,
+  .v-detail .pane-children,
+  .v-detail .dataflow-children,
+  .v-kanban .col-children { position: relative; }
+  .conns {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    overflow: visible;
+    z-index: 0;
+  }
+  .conns path { fill: none; stroke: var(--muted); stroke-width: 1.5; }
+  .conns .arrow-head { fill: var(--muted); }
+  .conns .edge-label-bg {
+    fill: var(--panel);
+    stroke: var(--line);
+    stroke-width: 1;
+  }
+  .conns .edge-label {
+    fill: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .step { position: relative; z-index: 1; transition: width 0.18s ease; }
+  /* Cards that sit between a link's source and target shrink and
+   * anchor left, freeing a fixed-width right-side lane the arrow can
+   * run straight down. Width is forced (not max-width) so the lane has
+   * a predictable size regardless of content length. */
+  .step.blocker {
+    align-self: flex-start;
+    width: calc(100% - 80px);
+  }
+
   /* ----------- shared: step card ----------- */
   .step {
     display: flex; align-items: center; gap: 8px;
@@ -159,7 +194,7 @@
     padding: 10px;
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 6px;
+    gap: 18px;
   }
   .v-ribbon .empty {
     padding: 10px 14px;
@@ -226,13 +261,13 @@
     margin-top: 3px;
   }
   .v-detail .pane-children {
-    display: flex; flex-direction: column; gap: 4px;
+    display: flex; flex-direction: column; gap: 18px;
   }
   .v-detail .dataflow-children {
     margin: 4px 0 8px 18px;
     padding: 6px 8px;
     border-left: 2px dashed var(--df);
-    display: flex; flex-direction: column; gap: 3px;
+    display: flex; flex-direction: column; gap: 16px;
   }
 
   /* ----------- KANBAN ----------- */
@@ -268,11 +303,48 @@
   .v-kanban .col-head .after-tag::before { content: '\2190 '; }
   .v-kanban .col-children {
     padding: 8px;
-    display: flex; flex-direction: column; gap: 4px;
+    display: flex; flex-direction: column; gap: 18px;
     overflow-y: auto;
   }
   .v-kanban .empty {
     padding: 10px;
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+  }
+
+  /* ----------- FLOW (dagre-laid-out graph per dataflow) ----------- */
+  .v-flow .flow-section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .v-flow .flow-head {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 9px 14px;
+    background: var(--head-bg);
+    border-bottom: 1px solid var(--line);
+  }
+  .v-flow .flow-head .id {
+    font-family: var(--mono); font-weight: 600; font-size: 13px;
+  }
+  .v-flow .flow-head .meta {
+    color: var(--muted); font-family: var(--mono); font-size: 11px;
+  }
+  /* Canvas is a positioning context; dagre fills width/height inline.
+   * Cards measure at their natural inline-flex size before being
+   * absolute-positioned by applyFlowLayout(). */
+  .v-flow .flow-canvas {
+    position: relative;
+    overflow: auto;
+  }
+  .v-flow .flow-canvas .step {
+    display: inline-flex;
+  }
+  .v-flow .empty {
+    padding: 10px 14px;
     color: var(--muted);
     font-style: italic;
     font-size: 12px;
@@ -524,6 +596,7 @@
     <button data-layout="ribbon" class="active">Ribbon</button>
     <button data-layout="detail">Master-detail</button>
     <button data-layout="kanban">Kanban</button>
+    <button data-layout="flow">Flow</button>
   </div>
 </header>
 
@@ -620,6 +693,29 @@ function describe(step) {
   return `${n} ${n === 1 ? 'child' : 'children'}${after}`;
 }
 
+/* Collect the from-specs that feed this step. Each spec is the raw
+ * string from YAML: either a bare step id ("read") or a port ref
+ * ("route:new"). De-duped on the full spec so two refs to the exact
+ * same port collapse, while "route:new" and "route:changed" stay
+ * separate (they're different output streams). */
+function collectFromIds(from) {
+  const items = Array.isArray(from) ? from : (from == null ? [] : [from]);
+  const seen = new Set();
+  const out = [];
+  for (const x of items) {
+    if (typeof x !== 'string' || !x) continue;
+    if (!seen.has(x)) { seen.add(x); out.push(x); }
+  }
+  return out;
+}
+
+function parseFromSpec(spec) {
+  const i = spec.indexOf(':');
+  return i < 0
+    ? { srcId: spec, port: '' }
+    : { srcId: spec.slice(0, i), port: spec.slice(i + 1) };
+}
+
 function stepCard(step, path) {
   const kind = step.kind || 'leaf';
   const innerCount = step.steps && step.steps.length
@@ -629,7 +725,14 @@ function stepCard(step, path) {
     ? `<span class="after">${step.after.map(esc).join(', ')}</span>`
     : '';
   const pathAttr = path != null ? ` data-path="${esc(path)}"` : '';
-  return `<div class="step k-${kind}"${pathAttr} role="button" tabindex="0">
+  const idAttr = step.id != null ? ` data-id="${esc(step.id)}"` : '';
+  // Comma-joined list of plain source ids. Port refs (`a:errors`)
+  // are filtered out — they're handled in a later pass.
+  const fromIds = collectFromIds(step.from);
+  const fromAttr = fromIds.length
+    ? ` data-from="${esc(fromIds.join(','))}"`
+    : '';
+  return `<div class="step k-${kind}"${pathAttr}${idAttr}${fromAttr} role="button" tabindex="0">
     <span class="id">${esc(step.id)}</span>
     <span class="ttype">${esc(step.type || '')}</span>
     ${after}
@@ -742,6 +845,30 @@ const templates = {
       </div>`;
     },
   },
+
+  /* ---- 4. Flow: dagre auto-layout per top-level dataflow ---- */
+  flow: {
+    name: 'Flow',
+    render(pipeline) {
+      return `<div class="v-flow">
+        ${pipeline.steps.map((s, i) => this.section(s, i)).join('')}
+      </div>`;
+    },
+    section(step, i) {
+      const hasChildren = step.steps && step.steps.length;
+      const body = hasChildren
+        ? `<div class="flow-canvas">${step.steps.map((c, j) => stepCard(c, `${i},${j}`)).join('')}</div>`
+        : `<div class="empty">no children</div>`;
+      return `<section class="flow-section">
+        <div class="flow-head k-${step.kind || 'leaf'}" data-path="${i}" role="button" tabindex="0">
+          <span class="id">${esc(step.id)}</span>
+          <span class="meta">${esc(step.type || '')}</span>
+          <span class="meta">${(step.steps || []).length} children</span>
+        </div>
+        ${body}
+      </section>`;
+    },
+  },
 };
 
 /* -------------------------------------------------------------------------
@@ -781,6 +908,291 @@ function render() {
   if (state.selectedPath != null) {
     stage.querySelectorAll(`[data-path="${state.selectedPath}"]`)
       .forEach(el => el.classList.add('selected'));
+  }
+  // Arrows are absolute-positioned inside each child container; layout
+  // must settle first so getBoundingClientRect() returns final geometry.
+  requestAnimationFrame(state.layout === 'flow' ? applyFlowLayout : drawConnections);
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function drawConnections() {
+  const groups = stage.querySelectorAll(
+    '.v-ribbon .children, .v-detail .pane-children, .v-detail .dataflow-children, .v-kanban .col-children'
+  );
+  for (const g of groups) {
+    const old = g.querySelector(':scope > svg.conns');
+    if (old) old.remove();
+    // Clear any previous pass's blocker shifts before recomputing.
+    g.querySelectorAll(':scope > .step.blocker').forEach((c) => c.classList.remove('blocker'));
+
+    const cards = Array.from(g.querySelectorAll(':scope > .step'));
+    if (cards.length < 2) continue;
+    const byId = new Map();
+    cards.forEach((c, i) => {
+      if (c.dataset.id) byId.set(c.dataset.id, { el: c, i });
+    });
+    const links = [];
+    cards.forEach((c, i) => {
+      if (!c.dataset.from) return;
+      for (const spec of c.dataset.from.split(',')) {
+        const { srcId } = parseFromSpec(spec);
+        const src = byId.get(srcId);
+        if (src && src.el !== c) {
+          links.push({ src: src.el, srcIdx: src.i, tgt: c, tgtIdx: i });
+        }
+      }
+    });
+    if (!links.length) continue;
+
+    // Vertical stack (kanban col / detail pane / inner dataflow) =>
+    // bottom→top arrows. Ribbon's CSS grid => right→left arrows.
+    const vertical = !g.classList.contains('children');
+
+    // For vertical containers, every card sitting strictly between a
+    // link's src and tgt indices is a blocker — shift it left so the
+    // arrow's right-bulging curve has a clear lane.
+    if (vertical) {
+      for (const link of links) {
+        const lo = Math.min(link.srcIdx, link.tgtIdx);
+        const hi = Math.max(link.srcIdx, link.tgtIdx);
+        if (hi - lo < 2) continue;
+        for (let j = lo + 1; j < hi; j++) {
+          cards[j].classList.add('blocker');
+        }
+      }
+    }
+
+    const cRect = g.getBoundingClientRect();
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', 'conns');
+    svg.setAttribute('width', String(cRect.width));
+    svg.setAttribute('height', String(cRect.height));
+
+    for (const link of links) {
+      const s = link.src.getBoundingClientRect();
+      const t = link.tgt.getBoundingClientRect();
+      let sx, sy, tx, ty;
+
+      if (vertical) {
+        // Pick the lane x that runs the line straight down. With no
+        // blockers, use the midpoint of source and target centers. With
+        // blockers, route just past the rightmost blocker edge so the
+        // line passes through the cleared lane (.blocker shrinks them).
+        const lo = Math.min(link.srcIdx, link.tgtIdx);
+        const hi = Math.max(link.srcIdx, link.tgtIdx);
+        let laneX;
+        if (hi - lo < 2) {
+          const sc = s.left + s.width / 2 - cRect.left;
+          const tc = t.left + t.width / 2 - cRect.left;
+          laneX = (sc + tc) / 2;
+        } else {
+          let maxRight = 0;
+          for (let j = lo + 1; j < hi; j++) {
+            const r = cards[j].getBoundingClientRect();
+            const right = r.right - cRect.left;
+            if (right > maxRight) maxRight = right;
+          }
+          laneX = maxRight + 10;
+        }
+        // Clamp so the endpoints sit on the source and target faces
+        // (with a small inset from the corners).
+        const sL = s.left - cRect.left, sR = s.right - cRect.left;
+        const tL = t.left - cRect.left, tR = t.right - cRect.left;
+        const pad = 6;
+        const minX = Math.max(sL, tL) + pad;
+        const maxX = Math.min(sR, tR) - pad;
+        if (maxX >= minX) laneX = Math.max(minX, Math.min(maxX, laneX));
+
+        const downward = link.tgtIdx > link.srcIdx;
+        sx = laneX;
+        tx = laneX;
+        sy = (downward ? s.bottom : s.top) - cRect.top;
+        ty = (downward ? t.top : t.bottom) - cRect.top;
+      } else {
+        // Ribbon: straight horizontal lines. Skip cross-row links — a
+        // single horizontal segment can't bridge different rows, and
+        // the user asked for axis-aligned segments only.
+        if (Math.abs(s.top - t.top) > 6) continue;
+        const cy = (s.top + s.bottom) / 2 - cRect.top;
+        const forward = t.left >= s.right - 1;
+        sx = (forward ? s.right : s.left) - cRect.left;
+        tx = (forward ? t.left : t.right) - cRect.left;
+        sy = cy;
+        ty = cy;
+      }
+
+      // Back the line off by `back` px so the arrow head sits just
+      // inside the target face instead of biting into it.
+      const back = 6;
+      const dx = tx - sx, dy = ty - sy;
+      const len = Math.hypot(dx, dy) || 1;
+      const ex = tx - (dx / len) * back;
+      const ey = ty - (dy / len) * back;
+
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', `M ${sx} ${sy} L ${ex} ${ey}`);
+      svg.appendChild(path);
+
+      // Arrow head triangle with tip at (tx, ty).
+      const ang = Math.atan2(dy, dx);
+      const ah = 6, al = 9;
+      const baseX = tx - Math.cos(ang) * al;
+      const baseY = ty - Math.sin(ang) * al;
+      const lx = baseX + Math.cos(ang + Math.PI / 2) * ah;
+      const ly = baseY + Math.sin(ang + Math.PI / 2) * ah;
+      const rx = baseX - Math.cos(ang + Math.PI / 2) * ah;
+      const ry = baseY - Math.sin(ang + Math.PI / 2) * ah;
+      const head = document.createElementNS(SVG_NS, 'path');
+      head.setAttribute('class', 'arrow-head');
+      head.setAttribute('d', `M ${tx} ${ty} L ${lx} ${ly} L ${rx} ${ry} Z`);
+      svg.appendChild(head);
+    }
+    g.appendChild(svg);
+  }
+}
+
+let _redrawTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(_redrawTimer);
+  _redrawTimer = setTimeout(() => {
+    if (state.layout === 'flow') applyFlowLayout();
+    else drawConnections();
+  }, 80);
+});
+
+/* -------------------------------------------------------------------------
+ * Flow layout: dagre computes positions for cards + edge waypoints; we
+ * absolute-position the existing card HTML and draw SVG polylines along
+ * dagre's routed paths. Cards keep their click-to-inspect, kind colors,
+ * and badge content unchanged — dagre only owns geometry, not styling.
+ * ----------------------------------------------------------------------- */
+
+function applyFlowLayout() {
+  if (typeof dagre === 'undefined') {
+    console.warn('dagre not loaded; flow layout unavailable');
+    return;
+  }
+  const canvases = stage.querySelectorAll('.v-flow .flow-canvas');
+  for (const canvas of canvases) {
+    canvas.querySelector(':scope > svg.conns')?.remove();
+
+    const cards = Array.from(canvas.querySelectorAll(':scope > .step'));
+    if (!cards.length) continue;
+
+    // Reset any inline geometry from a previous pass so the cards fall
+    // back to their inline-flex natural size for measurement.
+    for (const c of cards) {
+      c.style.position = '';
+      c.style.left = '';
+      c.style.top = '';
+      c.style.width = '';
+      c.style.height = '';
+    }
+
+    const sizes = cards.map((c) => {
+      const r = c.getBoundingClientRect();
+      return { w: Math.max(160, r.width), h: Math.max(30, r.height) };
+    });
+
+    // multigraph: true lets two ports from the same source land as
+    // distinct edges on the same target (e.g. from: [route:new,
+    // route:changed]) — otherwise the second setEdge would overwrite
+    // the first.
+    const G = new dagre.graphlib.Graph({ multigraph: true });
+    G.setGraph({ rankdir: 'TB', nodesep: 28, ranksep: 44, marginx: 14, marginy: 14 });
+    G.setDefaultEdgeLabel(() => ({}));
+
+    cards.forEach((c, i) => {
+      if (!c.dataset.id) return;
+      G.setNode(c.dataset.id, { width: sizes[i].w, height: sizes[i].h, el: c });
+    });
+    cards.forEach((c) => {
+      if (!c.dataset.id || !c.dataset.from) return;
+      const tgtId = c.dataset.id;
+      for (const spec of c.dataset.from.split(',')) {
+        const { srcId, port } = parseFromSpec(spec);
+        if (!G.hasNode(srcId) || srcId === tgtId) continue;
+        // Reserve space for the port label inline along the edge so
+        // dagre routes around it. width estimate is rough but works
+        // for the 11px mono font the label uses.
+        const labelOpts = port
+          ? { label: port, width: port.length * 7 + 8, height: 16, labelpos: 'c' }
+          : {};
+        G.setEdge(srcId, tgtId, labelOpts, port || '_');
+      }
+    });
+
+    dagre.layout(G);
+
+    const gb = G.graph();
+    canvas.style.width = (gb.width || 100) + 'px';
+    canvas.style.height = (gb.height || 50) + 'px';
+
+    for (const id of G.nodes()) {
+      const n = G.node(id);
+      if (!n.el) continue;
+      n.el.style.position = 'absolute';
+      n.el.style.left = (n.x - n.width / 2) + 'px';
+      n.el.style.top = (n.y - n.height / 2) + 'px';
+      n.el.style.width = n.width + 'px';
+    }
+
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', 'conns');
+    svg.setAttribute('width', String(gb.width || 100));
+    svg.setAttribute('height', String(gb.height || 50));
+
+    for (const e of G.edges()) {
+      const edge = G.edge(e);
+      const pts = edge.points;
+      if (!pts || pts.length < 2) continue;
+      const d = 'M ' + pts.map((p) => `${p.x} ${p.y}`).join(' L ');
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', d);
+      svg.appendChild(path);
+
+      const pE = pts[pts.length - 1];
+      const pP = pts[pts.length - 2];
+      const ang = Math.atan2(pE.y - pP.y, pE.x - pP.x);
+      const ah = 6, al = 9;
+      const baseX = pE.x - Math.cos(ang) * al;
+      const baseY = pE.y - Math.sin(ang) * al;
+      const lx = baseX + Math.cos(ang + Math.PI / 2) * ah;
+      const ly = baseY + Math.sin(ang + Math.PI / 2) * ah;
+      const rx = baseX - Math.cos(ang + Math.PI / 2) * ah;
+      const ry = baseY - Math.sin(ang + Math.PI / 2) * ah;
+      const head = document.createElementNS(SVG_NS, 'path');
+      head.setAttribute('class', 'arrow-head');
+      head.setAttribute('d', `M ${pE.x} ${pE.y} L ${lx} ${ly} L ${rx} ${ry} Z`);
+      svg.appendChild(head);
+
+      // Port label, if this edge came from a port-ref. dagre wrote
+      // x/y onto the edge object (it reserves space for the label
+      // when laying out, so labels don't overlap routed segments).
+      if (edge.label && edge.x != null) {
+        const bgW = edge.width || (edge.label.length * 7 + 8);
+        const bgH = edge.height || 16;
+        const bg = document.createElementNS(SVG_NS, 'rect');
+        bg.setAttribute('class', 'edge-label-bg');
+        bg.setAttribute('x', edge.x - bgW / 2);
+        bg.setAttribute('y', edge.y - bgH / 2);
+        bg.setAttribute('width', bgW);
+        bg.setAttribute('height', bgH);
+        bg.setAttribute('rx', 3);
+        svg.appendChild(bg);
+
+        const text = document.createElementNS(SVG_NS, 'text');
+        text.setAttribute('class', 'edge-label');
+        text.setAttribute('x', edge.x);
+        text.setAttribute('y', edge.y);
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('dominant-baseline', 'central');
+        text.textContent = edge.label;
+        svg.appendChild(text);
+      }
+    }
+    canvas.appendChild(svg);
   }
 }
 
