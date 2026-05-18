@@ -83,8 +83,6 @@
     color: var(--muted); cursor: not-allowed; opacity: 0.55;
   }
   button.btn:disabled:hover { background: var(--panel); }
-  .btn.server-only, .toggle.server-only { display: none; }
-  body.server-mode .btn.server-only, body.server-mode .toggle.server-only { display: inline-flex; }
   .toggle { display: flex; border: 1px solid var(--line-strong); border-radius: 6px; overflow: hidden; }
   .toggle button {
     border: 0; background: var(--panel); color: var(--text);
@@ -94,17 +92,6 @@
   .toggle button.active { background: var(--accent); color: white; }
   .toggle button:not(.active):hover { background: var(--hover); }
   main { padding: 14px; }
-  .drop-hint {
-    position: fixed; inset: 0;
-    background: rgba(37, 99, 235, 0.12);
-    pointer-events: none;
-    display: none;
-    align-items: center; justify-content: center;
-    font-size: 28px;
-    color: var(--accent);
-    z-index: 100;
-  }
-  .drop-hint.show { display: flex; }
 
   /* ----------- shared: step card ----------- */
   .step {
@@ -529,13 +516,9 @@
   <h1>betl pipeline viewer &middot; <span class="name" id="pkgName">&mdash;</span></h1>
   <span class="pathcrumb" id="pathCrumb"></span>
   <div class="spacer"></div>
-  <button class="btn server-only" id="browseBtn" title="Browse server files">browse&hellip;</button>
-  <button class="btn server-only" id="newBtn" title="Create a new YAML">new</button>
-  <button class="btn server-only" id="saveBtn" title="Save (Ctrl+S)">save</button>
-  <label class="btn">
-    open file&hellip;
-    <input type="file" id="fileInput" hidden accept=".yml,.yaml,text/yaml,text/plain">
-  </label>
+  <button class="btn" id="browseBtn" title="Browse server files">browse&hellip;</button>
+  <button class="btn" id="newBtn" title="Create a new YAML">new</button>
+  <button class="btn" id="saveBtn" title="Save (Ctrl+S)">save</button>
   <button class="btn" id="darkBtn" title="Toggle dark mode" aria-label="dark mode">&#9789;</button>
   <div class="toggle" id="layoutToggle">
     <button data-layout="ribbon" class="active">Ribbon</button>
@@ -545,7 +528,6 @@
 </header>
 
 <main id="stage"></main>
-<div class="drop-hint" id="dropHint">drop YAML file&hellip;</div>
 <div class="modal" id="modal">
   <div class="modal-card">
     <div class="modal-head">
@@ -776,14 +758,11 @@ const state = {
   currentText: '',       // raw YAML text last loaded/saved
   dirty: false,          // edits since last save
   hasComments: false,
-  isServer: location.protocol === 'http:' || location.protocol === 'https:',
 };
 
 const stage     = document.getElementById('stage');
 const pkgName   = document.getElementById('pkgName');
 const pathCrumb = document.getElementById('pathCrumb');
-
-if (state.isServer) document.body.classList.add('server-mode');
 
 function render() {
   pkgName.textContent = state.pipeline.name;
@@ -889,7 +868,7 @@ document.addEventListener('keydown', (e) => {
     if (modal.classList.contains('show')) { closeModal(); return; }
     if (document.getElementById('inspector').classList.contains('show')) closeInspector();
   }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && state.isServer) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault();
     saveCurrent();
   }
@@ -1214,11 +1193,9 @@ function newPipeline() {
   toast('New pipeline (unsaved)');
 }
 
-if (state.isServer) {
-  document.getElementById('browseBtn').addEventListener('click', () => openBrowser(''));
-  document.getElementById('saveBtn').addEventListener('click', saveCurrent);
-  document.getElementById('newBtn').addEventListener('click', newPipeline);
-}
+document.getElementById('browseBtn').addEventListener('click', () => openBrowser(''));
+document.getElementById('saveBtn').addEventListener('click', saveCurrent);
+document.getElementById('newBtn').addEventListener('click', newPipeline);
 
 /* layout toggle */
 document.getElementById('layoutToggle').addEventListener('click', (e) => {
@@ -1231,47 +1208,11 @@ document.getElementById('layoutToggle').addEventListener('click', (e) => {
   render();
 });
 
-/* file open (local) */
-document.getElementById('fileInput').addEventListener('change', (e) => {
-  const f = e.target.files && e.target.files[0];
-  if (!f) return;
-  const r = new FileReader();
-  r.onload = () => loadYamlText(r.result, f.name.replace(/\.[^.]+$/, ''));
-  r.readAsText(f);
-});
-
-/* drag-drop */
-const dropHint = document.getElementById('dropHint');
-let dragDepth = 0;
-window.addEventListener('dragenter', (e) => {
-  if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
-  e.preventDefault();
-  dragDepth++;
-  dropHint.classList.add('show');
-});
-window.addEventListener('dragover', (e) => {
-  if (e.dataTransfer && e.dataTransfer.types.includes('Files')) e.preventDefault();
-});
-window.addEventListener('dragleave', () => {
-  dragDepth = Math.max(0, dragDepth - 1);
-  if (dragDepth === 0) dropHint.classList.remove('show');
-});
-window.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dragDepth = 0;
-  dropHint.classList.remove('show');
-  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-  if (!f) return;
-  const r = new FileReader();
-  r.onload = () => loadYamlText(r.result, f.name.replace(/\.[^.]+$/, ''));
-  r.readAsText(f);
-});
-
 /* boot: render the empty state */
 stage.innerHTML = `
   <div style="text-align:center; color:var(--muted); padding:60px 20px; font-family:var(--mono); font-size:13px;">
     no pipeline loaded
-    <div style="margin-top:8px; font-size:12px;">use <b>${state.isServer ? 'browse&hellip;' : 'open file&hellip;'}</b> or drag a YAML file onto the page</div>
+    <div style="margin-top:8px; font-size:12px;">use <b>browse&hellip;</b> to pick a YAML file</div>
   </div>`;
 </script>
 
